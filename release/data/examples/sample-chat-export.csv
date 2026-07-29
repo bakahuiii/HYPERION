@@ -1,0 +1,4 @@
+formattedTime,type,content,senderDisplayName,isSelf
+2026-08-16 18:30:00,text,这周六下午要不要一起去市图书馆？我想借那本设计书。,示例同学,false
+2026-08-16 18:34:00,text,可以，我下午两点在地铁站出口见你。,你,true
+2026-08-16 18:36:00,text,好，周六下午两点见。别忘了带校园卡。,示例同学,false

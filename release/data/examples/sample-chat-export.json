@@ -1,0 +1,26 @@
+[
+  {
+    "session": { "name": "示例同学" },
+    "formattedTime": "2026-08-16 18:30:00",
+    "type": "text",
+    "content": "这周六下午要不要一起去市图书馆？我想借那本设计书。",
+    "senderDisplayName": "示例同学",
+    "isSelf": false
+  },
+  {
+    "session": { "name": "示例同学" },
+    "formattedTime": "2026-08-16 18:34:00",
+    "type": "text",
+    "content": "可以，我下午两点在地铁站出口见你。",
+    "senderDisplayName": "你",
+    "isSelf": true
+  },
+  {
+    "session": { "name": "示例同学" },
+    "formattedTime": "2026-08-16 18:36:00",
+    "type": "text",
+    "content": "好，周六下午两点见。别忘了带校园卡。",
+    "senderDisplayName": "示例同学",
+    "isSelf": false
+  }
+]

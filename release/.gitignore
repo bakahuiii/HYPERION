@@ -1,0 +1,20 @@
+# Mutable local data
+data/state.json
+data/chat-archive.json
+data/settings.ini
+data/legacy-provider.json
+data/electron/
+data/runtime/
+logs/*.jsonl
+logs/tasks/*.jsonl
+assets/img/avatars/*
+assets/img/backgrounds/*
+!assets/img/avatars/.gitkeep
+!assets/img/backgrounds/.gitkeep
+!assets/img/backgrounds/theia-default-background.svg
+!logs/tasks/.gitkeep
+
+# Local installation output
+app/node_modules/
+app/dist/
+app/.env

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMid slice" role="img" aria-labelledby="title desc">
+  <title id="title">THEIA default background</title>
+  <desc id="desc">An abstract night map in green, gold, and coral.</desc>
+  <rect width="1920" height="1080" fill="#112520"/>
+  <path d="M0 720C260 590 472 800 716 688s418-290 684-162 318 64 520-130v684H0z" fill="#1d4b41"/>
+  <path d="M0 852c244-94 422-14 682-126s386-281 688-181 364-12 550-119v654H0z" fill="#2d6c59" opacity=".7"/>
+  <g fill="#e9c46a" opacity=".88"><circle cx="182" cy="176" r="5"/><circle cx="358" cy="270" r="4"/><circle cx="528" cy="142" r="6"/><circle cx="810" cy="226" r="4"/><circle cx="1005" cy="129" r="5"/><circle cx="1258" cy="275" r="6"/><circle cx="1512" cy="162" r="4"/><circle cx="1740" cy="304" r="5"/></g>
+  <g fill="none" stroke="#f08a75" stroke-width="3" opacity=".58"><path d="M115 474c162-122 315 73 486-48s240-54 370 34 284-16 404-148 242-80 390 6"/><path d="M212 602c120 57 226-72 370-36s252 170 398 117 248-139 382-55 251 32 401-98"/></g>
+</svg>

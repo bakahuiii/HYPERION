@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.npm-cache/
+.DS_Store
+.env
+.env.local
+.ai-provider.json
+.theia-ai-debug.log
+.theia-avatar-cache/
+.theia-settings.ini
+.theia-backgrounds/
+.theia-task-logs/
+.theia-user-data/
+.theia-shared-intel.json
+.theia-shared-state.json
+.theia-desktop.pid
