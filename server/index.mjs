@@ -360,8 +360,10 @@ async function randomQuote() {
 
 function allowedOrigin(origin) {
   if (!origin) return true
+  if (origin === 'null') return process.env.THEIA_ALLOW_FILE_ORIGIN === '1'
   try {
     const parsed = new URL(origin)
+    if (parsed.protocol === 'theia:' && parsed.hostname === 'app') return process.env.THEIA_ALLOW_FILE_ORIGIN === '1'
     return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')
   } catch { return false }
 }
@@ -1620,7 +1622,9 @@ export function startAiProxy() {
     server.once('error', onError)
     server.listen(port, '127.0.0.1', () => {
       server.off('error', onError)
-      console.log(`AI proxy listening on http://127.0.0.1:${port}`)
+      const address = server.address()
+      const listeningPort = address && typeof address !== 'string' ? address.port : port
+      console.log(`AI proxy listening on http://127.0.0.1:${listeningPort}`)
       resolve(server)
     })
   })

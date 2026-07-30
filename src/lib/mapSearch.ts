@@ -13,7 +13,7 @@ function validBounds(value: unknown): value is [number, number, number, number] 
 }
 
 export async function searchMapPlaces(query: string) {
-  const endpoint = new URL('/api/map/search', window.location.origin)
+  const endpoint = new URL(apiUrl('/api/map/search'), window.location.href)
   endpoint.searchParams.set('q', query.trim())
   const response = await fetch(endpoint, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(20_000) })
   const payload = await response.json().catch(() => null) as MapSearchResult[] | { error?: string } | null
@@ -50,3 +50,4 @@ export function mapSearchPrecision(result: MapSearchResult) {
   if (/(?:city|town|village|county|district|state|province|region|locality|administrative)/i.test(result.kind ?? '')) return 'approximate' as const
   return 'exact' as const
 }
+import { apiUrl } from './apiUrl'

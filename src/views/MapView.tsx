@@ -3,6 +3,7 @@ import L from 'leaflet'
 import { Crosshair, LocateFixed, MapPin, Move, Navigation, Pencil, Plus, Save, Search, Trash2, X } from 'lucide-react'
 import 'leaflet/dist/leaflet.css'
 import type { Place, Quest } from '../types'
+import { apiUrl } from '../lib/apiUrl'
 import { mapSearchPrecision, mapSearchRadius, searchMapPlaces, type MapSearchResult } from '../lib/mapSearch'
 
 interface MapViewProps {
@@ -211,7 +212,7 @@ export function MapView({ places, quests, selectedPlaceId, onSelect, onUpdatePla
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return
     const map = L.map(containerRef.current, { zoomControl: false, attributionControl: true, preferCanvas: true }).setView([31.2304, 121.4737], 12)
-    L.tileLayer('/api/map/tiles/{z}/{x}/{y}.png', {
+    L.tileLayer(apiUrl('/api/map/tiles/{z}/{x}/{y}.png'), {
       attribution: '&copy; OpenStreetMap contributors, Humanitarian OpenStreetMap Team',
       maxZoom: 19,
     }).addTo(map)

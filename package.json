@@ -1,8 +1,9 @@
 {
   "name": "theia",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
+  "main": "electron/main.mjs",
   "engines": {
     "node": ">=22.12.0",
     "npm": ">=10.0.0"
@@ -16,7 +17,8 @@
     "desktop:release": "node scripts/release-desktop.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "dist:exe": "npm run build && node release-tools/package-portable-exe.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",

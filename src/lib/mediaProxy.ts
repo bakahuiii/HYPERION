@@ -10,7 +10,8 @@ export function avatarImageUrl(value?: string) {
   const source = value?.trim()
   if (!source) return ''
   if (isInlineImage(source)) return source
-  if (/^\/api\/settings\/background\/[a-zA-Z0-9_-]+\.(?:jpg|png|webp|gif|avif)$/i.test(source)) return source
+  if (/^\/api\/settings\/background\/[a-zA-Z0-9_-]+\.(?:jpg|png|webp|gif|avif)$/i.test(source)) return apiUrl(source)
   if (!/^https?:\/\//i.test(source)) return ''
-  return `/api/media/avatar?src=${encodeURIComponent(source)}`
+  return apiUrl(`/api/media/avatar?src=${encodeURIComponent(source)}`)
 }
+import { apiUrl } from './apiUrl'

@@ -1,5 +1,6 @@
 import type { AiSettings, AppearanceSettings, Profile } from '../types'
 import type { AiStatus } from './aiClient'
+import { apiUrl } from './apiUrl'
 
 export interface SharedSettings {
   initialized: boolean
@@ -16,7 +17,7 @@ export interface SharedSettingsInput {
 }
 
 async function request<T>(method: 'GET' | 'POST', body?: unknown): Promise<T> {
-  const response = await fetch('/api/settings', body === undefined ? { method } : {
+  const response = await fetch(apiUrl('/api/settings'), body === undefined ? { method } : {
     method,
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
@@ -39,7 +40,7 @@ export async function uploadBackgroundAsset(file: File) {
   let binary = ''
   const chunkSize = 0x8000
   for (let offset = 0; offset < buffer.length; offset += chunkSize) binary += String.fromCharCode(...buffer.subarray(offset, offset + chunkSize))
-  const response = await fetch('/api/settings/background', {
+  const response = await fetch(apiUrl('/api/settings/background'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ mimeType: file.type, data: `data:${file.type};base64,${btoa(binary)}` }),

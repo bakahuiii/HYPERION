@@ -1,4 +1,5 @@
 import type { AppData } from '../types'
+import { apiUrl } from './apiUrl'
 
 type SharedData = Omit<AppData, 'intel' | 'archive' | 'profile' | 'appearance' | 'aiSettings'>
 
@@ -20,6 +21,8 @@ function withoutLocalSettings(data: AppData): SharedData {
 }
 
 function localSyncUrl(path: '/api/sync/snapshot' | '/api/sync/meta') {
+  const packagedUrl = apiUrl(path)
+  if (packagedUrl !== path) return packagedUrl
   const { protocol, hostname } = window.location
   const isLocalPage = protocol === 'http:' && (hostname === '127.0.0.1' || hostname === 'localhost')
   // Large snapshots bypass Vite's development proxy. The API only listens on

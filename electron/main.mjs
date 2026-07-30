@@ -1,14 +1,35 @@
-import { app, BrowserWindow, Menu } from 'electron'
+import { app, BrowserWindow, Menu, protocol } from 'electron'
 import { createServer } from 'vite'
+import { spawn } from 'node:child_process'
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
-import { server, startAiProxy } from '../server/index.mjs'
-import { runtimePaths } from '../server/runtimePaths.mjs'
+import { readFile } from 'node:fs/promises'
+import { dirname, extname, isAbsolute, relative, resolve } from 'node:path'
+import process from 'node:process'
 
 const root = resolve(import.meta.dirname, '..')
+app.setName('THEIA')
+protocol.registerSchemesAsPrivileged([{
+  scheme: 'theia',
+  privileges: { standard: true, secure: true, supportFetchAPI: true },
+}])
+// A packaged executable cannot persist data inside app.asar or its temporary
+// extraction directory, so resolve mutable paths before loading server code.
+if (app.isPackaged) {
+  process.env.THEIA_RELEASE_LAYOUT ??= '1'
+  process.env.THEIA_RUNTIME_ROOT ??= app.getPath('userData')
+  process.env.AI_PORT ??= '0'
+  process.env.THEIA_ALLOW_FILE_ORIGIN = '1'
+}
+
+const [{ server, startAiProxy }, { runtimePaths }] = await Promise.all([
+  import('../server/index.mjs'),
+  import('../server/runtimePaths.mjs'),
+])
+
 let viteServer
 let mainWindow
 let ownsAiProxy = false
+let packagedServiceProcess
 const { electronUserDataPath: userDataPath, desktopPidPath } = runtimePaths
 
 // Large task maps and Leaflet tiles need Chromium compositing and raster work
@@ -55,6 +76,8 @@ function clearDesktopPid() {
 }
 
 async function startLocalServices() {
+  if (app.isPackaged) return startPackagedService()
+
   try {
     await startAiProxy()
     ownsAiProxy = true
@@ -76,9 +99,87 @@ async function startLocalServices() {
   return viteServer.resolvedUrls?.local?.[0] ?? 'http://127.0.0.1:5173/'
 }
 
-function createWindow(url) {
+function startPackagedService() {
+  const nodeRuntime = resolve(root, 'runtime', 'node.exe')
+  const serverEntry = resolve(root, 'server', 'index.mjs')
+  const serviceEnvironment = { ...process.env, AI_PORT: '0' }
+  delete serviceEnvironment.ELECTRON_RUN_AS_NODE
+  return new Promise((resolvePromise, reject) => {
+    let settled = false
+    let output = ''
+    let errorOutput = ''
+    const settle = (callback) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      callback()
+    }
+    const child = spawn(nodeRuntime, [serverEntry], {
+      cwd: root,
+      env: serviceEnvironment,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    packagedServiceProcess = child
+    const timeout = setTimeout(() => {
+      settle(() => {
+        child.kill('SIGTERM')
+        reject(new Error(`THEIA local service did not become ready. ${errorOutput}`))
+      })
+    }, 15_000)
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', (chunk) => {
+      output += chunk
+      const match = output.match(/AI proxy listening on http:\/\/127\.0\.0\.1:(\d+)/)
+      if (match) settle(() => {
+        resolvePromise(`http://127.0.0.1:${match[1]}/`)
+      })
+    })
+    child.stderr.on('data', (chunk) => {
+      errorOutput = `${errorOutput}${chunk}`.slice(-2_000)
+    })
+    child.once('error', (error) => settle(() => reject(error)))
+    child.once('exit', (code) => {
+      if (!settled) settle(() => reject(new Error(`THEIA local service exited with code ${code ?? 'unknown'}. ${errorOutput}`)))
+    })
+  })
+}
+
+async function registerPackagedProtocol() {
+  if (!app.isPackaged) return
+  const staticRoot = resolve(root, 'dist')
+  const contentTypes = {
+    '.css': 'text/css; charset=utf-8',
+    '.html': 'text/html; charset=utf-8',
+    '.ico': 'image/x-icon',
+    '.js': 'text/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.png': 'image/png',
+    '.svg': 'image/svg+xml',
+    '.webp': 'image/webp',
+  }
+  protocol.handle('theia', async (request) => {
+    try {
+      const url = new URL(request.url)
+      if (url.hostname !== 'app') return new Response('Not found', { status: 404 })
+      const candidate = resolve(staticRoot, decodeURIComponent(url.pathname).replace(/^\/+/, '') || 'index.html')
+      const pathFromRoot = relative(staticRoot, candidate)
+      if (pathFromRoot.startsWith('..') || isAbsolute(pathFromRoot)) return new Response('Not found', { status: 404 })
+      return new Response(await readFile(candidate), {
+        headers: { 'content-type': contentTypes[extname(candidate).toLowerCase()] ?? 'application/octet-stream' },
+      })
+    } catch {
+      return new Response('Not found', { status: 404 })
+    }
+  })
+}
+
+function createWindow(apiBase) {
+  const pageUrl = app.isPackaged ? 'theia://app/index.html' : apiBase
   mainWindow = new BrowserWindow({
     title: 'THEIA',
+    icon: resolve(import.meta.dirname, 'app-icon.png'),
     width: 1600,
     height: 900,
     minWidth: 1280,
@@ -90,6 +191,8 @@ function createWindow(url) {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      preload: resolve(import.meta.dirname, 'preload.mjs'),
+      additionalArguments: app.isPackaged ? [`--theia-api-base=${apiBase}`] : [],
     },
   })
   mainWindow.setMenuBarVisibility(false)
@@ -97,17 +200,18 @@ function createWindow(url) {
   mainWindow.webContents.on('before-input-event', (event, input) => {
     if ((input.key === 'Alt' || input.key === 'F10') && !input.control && !input.meta) event.preventDefault()
   })
-  void mainWindow.loadURL(url)
+  void mainWindow.loadURL(pageUrl)
 }
 
 if (hasSingleInstanceLock) app.whenReady().then(async () => {
   Menu.setApplicationMenu(null)
   app.setName('THEIA')
+  await registerPackagedProtocol()
   writeDesktopPid()
-  const url = await startLocalServices()
-  createWindow(url)
+  const apiBase = await startLocalServices()
+  createWindow(apiBase)
   app.on('activate', () => {
-    if (!BrowserWindow.getAllWindows().length) createWindow(url)
+    if (!BrowserWindow.getAllWindows().length) createWindow(apiBase)
   })
 }).catch((error) => {
   console.error('Desktop startup failed:', error)
@@ -122,4 +226,5 @@ app.on('before-quit', () => {
   clearDesktopPid()
   void viteServer?.close()
   if (ownsAiProxy && server.listening) server.close()
+  if (packagedServiceProcess && !packagedServiceProcess.killed) packagedServiceProcess.kill('SIGTERM')
 })

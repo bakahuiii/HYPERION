@@ -1,5 +1,6 @@
 import type { AiSettings, AiTaskCandidate, IntelItem, Person, Place, Quest } from '../types'
 import { buildConversationAnalysisPlan } from './conversationAnalysis'
+import { apiUrl } from './apiUrl'
 
 export interface AiAttachment {
   name: string
@@ -136,7 +137,7 @@ function wasAborted(error: unknown) {
 
 async function requestJson<T>(url: string, options?: { method?: 'POST' | 'DELETE'; body?: unknown; signal?: AbortSignal }): Promise<T> {
   throwIfAborted(options?.signal)
-  const response = await fetch(url, options ? {
+  const response = await fetch(apiUrl(url), options ? {
     method: options.method ?? 'POST',
     headers: options.body === undefined ? undefined : { 'content-type': 'application/json' },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),

@@ -14,8 +14,9 @@ export interface StorageOverview {
 }
 
 export async function loadStorageOverview(): Promise<StorageOverview> {
-  const response = await fetch('/api/storage/overview')
+  const response = await fetch(apiUrl('/api/storage/overview'))
   const payload = await response.json().catch(() => ({})) as StorageOverview & { error?: string }
   if (!response.ok) throw new Error(payload.error || '无法读取本机存储概览。')
   return payload
 }
+import { apiUrl } from './apiUrl'
