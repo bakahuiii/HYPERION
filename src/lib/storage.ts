@@ -2,6 +2,7 @@ import { seedData } from '../seed'
 import type { AiSettings, AppData } from '../types'
 import { normalizeAppearance } from './appearance'
 import { summarizeArchive } from './archiveSummary'
+import { DEFAULT_AI_CONCURRENCY, normalizeAiConcurrency } from './aiConcurrency'
 
 const STORAGE_KEY = 'theia:v1'
 
@@ -18,6 +19,7 @@ export const defaultAiSettings: AiSettings = {
   autoEnabled: false,
   intervalHours: 24,
   recencyPolicy: 'balanced',
+  concurrency: DEFAULT_AI_CONCURRENCY,
   feedback: [],
   promptInstructions: defaultPromptInstructions,
 }
@@ -46,6 +48,7 @@ export function loadData(): AppData {
         ...(parsed.aiSettings ?? {}),
         intervalHours: Math.max(24, Number(parsed.aiSettings?.intervalHours ?? defaultAiSettings.intervalHours)),
         recencyPolicy: ['strict', 'balanced', 'broad'].includes(parsed.aiSettings?.recencyPolicy) ? parsed.aiSettings.recencyPolicy : 'balanced',
+        concurrency: normalizeAiConcurrency(parsed.aiSettings?.concurrency),
         feedback: Array.isArray(parsed.aiSettings?.feedback) ? parsed.aiSettings.feedback.slice(-80) : [],
         promptInstructions: {
           ...defaultPromptInstructions,

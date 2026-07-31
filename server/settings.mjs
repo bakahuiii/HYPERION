@@ -36,6 +36,7 @@ function defaultBackgrounds() {
 }
 
 function defaultSettings() {
+  const provider = environmentProvider()
   return {
     appSettingsInitialized: false,
     profile: { name: '访客' },
@@ -46,19 +47,27 @@ function defaultSettings() {
       autoEnabled: false,
       intervalHours: 24,
       recencyPolicy: 'balanced',
+      // Client-side parallelism; provider channel capacity is independent.
+      concurrency: 4,
       feedback: [],
     },
-    provider: environmentProvider(),
+    provider,
+    providers: [provider],
+    primaryProviderId: provider.id,
   }
 }
 
 function environmentProvider() {
   return {
+    id: 'primary',
+    name: '主通道',
+    enabled: true,
     apiKey: text(process.env.OPENAI_API_KEY, 1000),
     baseURL: text(process.env.OPENAI_BASE_URL, 1000) || 'https://api.openai.com/v1',
     model: text(process.env.OPENAI_MODEL, 200) || 'gpt-5-mini',
     apiMode: supportedModes.has(process.env.OPENAI_API_MODE) ? process.env.OPENAI_API_MODE : 'auto',
     models: [],
+    maxConcurrency: clamp(process.env.OPENAI_MAX_CONCURRENCY, 1, 8, 4),
   }
 }
 
@@ -133,6 +142,8 @@ function normalizeAppearance(input, fallback) {
 }
 
 function normalizeAiSettings(input, fallback) {
+  // Keep the local review history useful to the user. Request builders apply
+  // their own much smaller model-context limit.
   const feedback = Array.isArray(input?.feedback) ? input.feedback.slice(-80).flatMap((item, index) => {
     const title = text(item?.title, 120)
     const description = text(item?.description, 1000)
@@ -155,33 +166,65 @@ function normalizeAiSettings(input, fallback) {
     autoEnabled: input?.autoEnabled === true,
     intervalHours: clamp(input?.intervalHours, 24, 24 * 30, fallback.intervalHours),
     recencyPolicy: ['strict', 'balanced', 'broad'].includes(input?.recencyPolicy) ? input.recencyPolicy : fallback.recencyPolicy,
+    concurrency: Math.round(clamp(input?.concurrency, 1, 32, Math.round(clamp(fallback?.concurrency, 1, 32, 4)))),
     feedback,
     promptInstructions: Object.fromEntries(Object.entries(defaultPromptInstructions).map(([key, fallbackValue]) => [key, text(input?.promptInstructions?.[key], 6000) || fallbackValue])),
     ...(text(input?.lastRunAt, 80) ? { lastRunAt: text(input.lastRunAt, 80) } : {}),
   }
 }
 
-function normalizeProvider(input, fallback) {
+function normalizeProviderId(value, fallback = 'primary') {
+  const normalized = text(value, 80).replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '')
+  return normalized || fallback
+}
+
+function normalizeProvider(input, fallback, index = 0) {
   const hasKey = typeof input?.apiKey === 'string' || typeof input?.key === 'string'
   const hasBaseUrl = typeof input?.baseURL === 'string' || typeof input?.url === 'string'
   const hasModel = typeof input?.model === 'string'
   const hasModels = Array.isArray(input?.models)
+  const fallbackId = normalizeProviderId(fallback?.id, index === 0 ? 'primary' : `channel-${index + 1}`)
   return {
-    apiKey: hasKey ? text(input?.apiKey ?? input?.key, 1000) : fallback.apiKey,
-    baseURL: hasBaseUrl ? text(input?.baseURL ?? input?.url, 1000) || fallback.baseURL : fallback.baseURL,
-    model: hasModel ? text(input?.model, 200) || fallback.model : fallback.model,
-    apiMode: supportedModes.has(input?.apiMode) ? input.apiMode : fallback.apiMode,
-    models: hasModels ? [...new Set(input.models.map((item) => text(item, 200)).filter(Boolean))].slice(0, 300) : fallback.models,
+    id: normalizeProviderId(input?.id, fallbackId),
+    name: text(input?.name, 80) || text(fallback?.name, 80) || `通道 ${index + 1}`,
+    enabled: typeof input?.enabled === 'boolean' ? input.enabled : fallback?.enabled !== false,
+    apiKey: hasKey ? text(input?.apiKey ?? input?.key, 1000) : text(fallback?.apiKey, 1000),
+    baseURL: hasBaseUrl ? text(input?.baseURL ?? input?.url, 1000) || fallback?.baseURL : fallback?.baseURL,
+    model: hasModel ? text(input?.model, 200) || fallback?.model : fallback?.model,
+    apiMode: supportedModes.has(input?.apiMode) ? input.apiMode : supportedModes.has(fallback?.apiMode) ? fallback.apiMode : 'auto',
+    models: hasModels ? [...new Set(input.models.map((item) => text(item, 200)).filter(Boolean))].slice(0, 300) : Array.isArray(fallback?.models) ? fallback.models : [],
+    maxConcurrency: Math.round(clamp(input?.maxConcurrency, 1, 8, clamp(fallback?.maxConcurrency, 1, 8, 4))),
   }
 }
 
+function normalizeProviders(input, fallbackProvider) {
+  const records = Array.isArray(input) && input.length ? input.slice(0, 32) : [fallbackProvider]
+  const usedIds = new Set()
+  return records.map((record, index) => {
+    const channelFallback = index === 0 ? fallbackProvider : { ...environmentProvider(), id: `channel-${index + 1}`, name: `通道 ${index + 1}` }
+    const normalized = normalizeProvider(record, channelFallback, index)
+    const baseId = normalized.id
+    let id = baseId
+    let suffix = 2
+    while (usedIds.has(id)) id = `${baseId}-${suffix++}`
+    usedIds.add(id)
+    return { ...normalized, id }
+  })
+}
+
 function normalizeSettings(input, fallback = defaultSettings()) {
+  const requestedPrimary = normalizeProvider(input?.provider, fallback.provider)
+  const providers = normalizeProviders(input?.providers, requestedPrimary)
+  const requestedPrimaryId = normalizeProviderId(input?.primaryProviderId, requestedPrimary.id)
+  const provider = providers.find((channel) => channel.id === requestedPrimaryId) ?? providers[0]
   return {
     appSettingsInitialized: input?.appSettingsInitialized === true,
     profile: { name: text(input?.profile?.name, 32) || fallback.profile.name, avatarUrl: safeBackgroundUrl(input?.profile?.avatarUrl) },
     appearance: normalizeAppearance(input?.appearance, fallback.appearance),
     aiSettings: normalizeAiSettings(input?.aiSettings, fallback.aiSettings),
-    provider: normalizeProvider(input?.provider, fallback.provider),
+    provider,
+    providers,
+    primaryProviderId: provider.id,
   }
 }
 
@@ -190,7 +233,7 @@ function serializeSettings(settings) {
   const lines = [
     '; THEIA local shared settings. Values are URL-encoded to preserve newlines and = characters.',
     '[meta]',
-    'version=2',
+    'version=3',
     `appSettingsInitialized=${encode(settings.appSettingsInitialized)}`,
     '',
     '[profile]',
@@ -209,16 +252,25 @@ function serializeSettings(settings) {
     `autoEnabled=${encode(settings.aiSettings.autoEnabled)}`,
     `intervalHours=${encode(settings.aiSettings.intervalHours)}`,
     `recencyPolicy=${encode(settings.aiSettings.recencyPolicy)}`,
+    `concurrency=${encode(settings.aiSettings.concurrency)}`,
     `feedback=${encode(JSON.stringify(settings.aiSettings.feedback))}`,
     `promptInstructions=${encode(JSON.stringify(settings.aiSettings.promptInstructions))}`,
     `lastRunAt=${encode(settings.aiSettings.lastRunAt ?? '')}`,
     '',
     '[provider]',
+    `id=${encode(settings.provider.id)}`,
+    `name=${encode(settings.provider.name)}`,
+    `enabled=${encode(settings.provider.enabled)}`,
     `url=${encode(settings.provider.baseURL)}`,
     `key=${encode(settings.provider.apiKey)}`,
     `model=${encode(settings.provider.model)}`,
     `apiMode=${encode(settings.provider.apiMode)}`,
     `models=${encode(JSON.stringify(settings.provider.models))}`,
+    `maxConcurrency=${encode(settings.provider.maxConcurrency)}`,
+    '',
+    '[providers]',
+    `primaryId=${encode(settings.primaryProviderId)}`,
+    `channels=${encode(JSON.stringify(settings.providers))}`,
     '',
   ]
   return lines.join('\n')
@@ -242,17 +294,24 @@ function fromIni(raw) {
       autoEnabled: value(parsed, 'ai', 'autoEnabled') === 'true',
       intervalHours: value(parsed, 'ai', 'intervalHours'),
       recencyPolicy: value(parsed, 'ai', 'recencyPolicy'),
+      concurrency: value(parsed, 'ai', 'concurrency'),
       feedback: jsonValue(parsed, 'ai', 'feedback', []),
       promptInstructions: jsonValue(parsed, 'ai', 'promptInstructions', {}),
       lastRunAt: value(parsed, 'ai', 'lastRunAt'),
     },
     provider: {
+      id: value(parsed, 'provider', 'id'),
+      name: value(parsed, 'provider', 'name'),
+      enabled: value(parsed, 'provider', 'enabled', '') === '' ? undefined : value(parsed, 'provider', 'enabled') === 'true',
       url: value(parsed, 'provider', 'url'),
       key: value(parsed, 'provider', 'key'),
       model: value(parsed, 'provider', 'model'),
       apiMode: value(parsed, 'provider', 'apiMode'),
       models: jsonValue(parsed, 'provider', 'models', []),
+      maxConcurrency: value(parsed, 'provider', 'maxConcurrency'),
     },
+    providers: jsonValue(parsed, 'providers', 'channels', []),
+    primaryProviderId: value(parsed, 'providers', 'primaryId'),
   }, defaults)
 }
 
@@ -268,6 +327,8 @@ async function migrateLegacyProvider() {
       apiMode: legacy.apiMode,
       models: legacy.models,
     }, next.provider)
+    next.providers = [next.provider]
+    next.primaryProviderId = next.provider.id
     return next
   } catch (error) {
     if (error?.code === 'ENOENT') return null
@@ -315,10 +376,35 @@ export async function loadProviderSettings() {
   return { ...settings.provider, source: initialized ? 'settings-ini' : 'environment' }
 }
 
+export async function loadProviderChannelSettings() {
+  const { settings, initialized } = await loadSettings()
+  const source = initialized ? 'settings-ini' : 'environment'
+  return {
+    primaryProviderId: settings.primaryProviderId,
+    channels: settings.providers.map((channel) => ({ ...channel, source })),
+    source,
+  }
+}
+
 export async function saveProviderSettings(provider) {
   const { settings } = await loadSettings()
-  const next = await writeSettings({ ...settings, provider: { ...settings.provider, ...provider } })
+  const merged = { ...settings.provider, ...provider, id: settings.primaryProviderId }
+  const providers = settings.providers.map((channel) => channel.id === settings.primaryProviderId ? merged : channel)
+  const next = await writeSettings({ ...settings, provider: merged, providers, primaryProviderId: settings.primaryProviderId })
   return { ...next.provider, source: 'settings-ini' }
+}
+
+export async function saveProviderChannelSettings(input) {
+  const { settings } = await loadSettings()
+  const channels = Array.isArray(input?.channels) && input.channels.length ? input.channels : settings.providers
+  const primaryProviderId = text(input?.primaryProviderId, 80) || settings.primaryProviderId
+  const provider = channels.find((channel) => channel?.id === primaryProviderId) ?? channels[0]
+  const next = await writeSettings({ ...settings, provider, providers: channels, primaryProviderId: provider?.id })
+  return {
+    primaryProviderId: next.primaryProviderId,
+    channels: next.providers.map((channel) => ({ ...channel, source: 'settings-ini' })),
+    source: 'settings-ini',
+  }
 }
 
 export async function saveBackgroundAsset({ mimeType, data }) {

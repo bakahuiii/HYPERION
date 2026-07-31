@@ -4,7 +4,19 @@ import { fileURLToPath } from 'node:url'
 import { appendFile, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { dirname, resolve } from 'node:path'
-import { discoverModels, editableProviderConfig, loadProviderConfig, normalizeBaseUrl, resetProviderConfig, saveProviderConfig } from './providerConfig.mjs'
+import {
+  createProviderChannel,
+  deleteProviderChannel,
+  discoverModels,
+  editableProviderConfig,
+  editableProviderPoolConfig,
+  loadProviderConfig,
+  loadProviderConfigs,
+  normalizeBaseUrl,
+  resetProviderConfig,
+  saveProviderConfig,
+  updateProviderChannel,
+} from './providerConfig.mjs'
 import { backgroundAssetPath, loadSettings, saveAppSettings, saveBackgroundAsset } from './settings.mjs'
 import { runtimePaths } from './runtimePaths.mjs'
 
@@ -12,6 +24,7 @@ const port = Number(process.env.AI_PORT || 8787)
 const maxBodyBytes = 256 * 1024 * 1024
 const maxAttachments = 4
 const maxAttachmentBytes = 8 * 1024 * 1024
+const providerRequestTimeoutMs = Math.min(180_000, Math.max(15_000, Number(process.env.AI_PROVIDER_TIMEOUT_MS) || 90_000))
 const fallbackQuotes = [
   { text: '向前走，哪怕只是很小的一步。', from: '离线句库' },
   { text: '把今天能做的事，留在今天完成。', from: '离线句库' },
@@ -30,6 +43,14 @@ const {
   desktopPidPath,
 } = runtimePaths
 let sharedStateWriteQueue = Promise.resolve()
+const providerRuntimeById = new Map()
+const providerAcquisitionQueue = []
+let providerDispatchScheduled = false
+let providerDispatchInProgress = false
+let providerDispatchRequested = false
+let providerDispatchTimer = null
+let providerDispatchTimerAt = 0
+let providerSelectionSequence = 0
 
 async function readJsonFile(path) {
   try {
@@ -152,6 +173,20 @@ function segmentDebugFields(conversation) {
   }
 }
 
+function providerDebugFields(value) {
+  const metadata = value?.metadata?.provider ?? value?.providerMetadata
+  if (!metadata) return {}
+  return {
+    providerChannelId: metadata.channelId ?? null,
+    providerChannelName: metadata.channelName ?? null,
+    providerQueueWaitMs: Number(metadata.queueWaitMs) || 0,
+    providerAttemptCount: Number(metadata.attemptCount) || 0,
+    providerFallbackCount: Number(metadata.fallbackCount) || 0,
+    providerRetryAfter: Number(metadata.retryAfter) || null,
+    providerUsage: metadata.usage ?? null,
+  }
+}
+
 async function loadSharedState() {
   const payload = await readJsonFile(sharedStatePath)
   if (!payload || typeof payload !== 'object' || !payload.data) return null
@@ -271,12 +306,40 @@ const responseFormat = {
   },
 }
 
+// Direct conversations can produce task candidates and evidence-backed
+// contact notes in one model request. This keeps the complete message timeline
+// in a single input instead of uploading the same segment once for tasks and
+// once again for people. Group conversations continue to use responseFormat.
+const combinedResponseFormat = {
+  type: 'json_schema',
+  name: 'task_and_people_candidates',
+  strict: true,
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      candidates: { type: 'array', items: candidateSchema },
+      people: { type: 'array', items: personSchema },
+    },
+    required: ['candidates', 'people'],
+  },
+}
+
 const chatResponseFormat = {
   type: 'json_schema',
   json_schema: {
     name: responseFormat.name,
     strict: true,
     schema: responseFormat.schema,
+  },
+}
+
+const combinedChatResponseFormat = {
+  type: 'json_schema',
+  json_schema: {
+    name: combinedResponseFormat.name,
+    strict: true,
+    schema: combinedResponseFormat.schema,
   },
 }
 
@@ -344,6 +407,7 @@ function sendRequestError(response, error, fallback) {
   const retryAfter = Number(error?.retryAfter)
   const payload = { error: error instanceof Error ? error.message : fallback }
   if (Number.isFinite(retryAfter) && retryAfter > 0) payload.retry_after = Math.min(300, Math.ceil(retryAfter))
+  if (error?.providerMetadata) payload.metadata = { provider: error.providerMetadata }
   sendJson(response, status >= 400 && status <= 599 ? status : 400, payload)
 }
 
@@ -444,6 +508,28 @@ function compactModelRecords(records) {
   ])
 }
 
+function compactRecordRefRanges(values, fallbackCount) {
+  const source = values != null && typeof values[Symbol.iterator] === 'function'
+    ? [...values]
+    : []
+  const indexes = [...new Set(source.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value > 0))].sort((left, right) => left - right)
+  if (!indexes.length) return `1 through ${fallbackCount}`
+  const ranges = []
+  let start = indexes[0]
+  let end = indexes[0]
+  const push = () => ranges.push(start === end ? String(start) : `${start}-${end}`)
+  for (const index of indexes.slice(1)) {
+    if (index === end + 1) end = index
+    else {
+      push()
+      start = index
+      end = index
+    }
+  }
+  push()
+  return ranges.join(', ')
+}
+
 function directionStats(records) {
   return records.reduce((stats, record) => {
     const role = record?.speakerRole === 'self' || record?.speakerRole === 'other' ? record.speakerRole : 'unknown'
@@ -478,8 +564,9 @@ function buildPrompt(payload) {
   const mode = cleanString(payload.settings?.mode, 40) || 'balanced'
   const instructions = cleanString(payload.settings?.instructions, 2000) || '优先提取明确、仍需本人处理的现实安排。'
   const workflowInstructions = cleanString(payload.settings?.promptInstructions?.task, 6000)
+  const peopleWorkflowInstructions = cleanString(payload.settings?.promptInstructions?.people, 6000)
   const recencyPolicy = ['strict', 'balanced', 'broad'].includes(payload.settings?.recencyPolicy) ? payload.settings.recencyPolicy : 'balanced'
-  const feedback = Array.isArray(payload.settings?.feedback) ? payload.settings.feedback.slice(-30).map((item) => ({
+  const feedback = Array.isArray(payload.settings?.feedback) ? payload.settings.feedback.slice(-8).map((item) => ({
     title: cleanString(item?.title, 120),
     description: cleanString(item?.description, 500),
     decision: item?.decision === 'accepted' ? 'accepted' : 'dismissed',
@@ -490,32 +577,35 @@ function buildPrompt(payload) {
   const analysisDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
   const conversationName = cleanString(payload.conversation?.name, 160)
   const compactRecords = compactModelRecords(payload.records)
-  const taskOutputContract = 'Return exactly one JSON object with a candidates array. Every candidate must include title, description, startAt, dueAt, sourceIds, people, place, locationPrecision, locationRadiusMeters, tags, guidance, and actionOwner. Use null for unavailable startAt, dueAt, place, or locationRadiusMeters; use "unknown" when no location is established; use [] for unavailable people, tags, or guidance. Do not estimate duration or travel time. actionOwner must be "self". Cite only RecordRef values present in the input, as strings.'
-  const legacyConversationMode = conversationName
-    ? [
-      `本次输入是同一段完整导出对话：${conversationName}。所有已导入消息均按时间顺序提供，不是抽样上下文。`,
-      '以整段对话中已经形成的安排、明确承诺、待确认事项和未完成下一步为单位提炼；同一安排只能输出一次，并引用所有直接证据。重复、寒暄、纯回顾和没有下一步的讨论不生成任务。',
-      '记录较旧本身不构成任务。较旧记录只有在原文明确表明仍未完成、仍有效或约定了尚未到来的具体日期时才可保留；不要因为历史聊天重新制造任务。',
-    ].join('\n')
-    : '输入是用户主动导出的记录。'
   const conversation = payload.conversation ?? {}
+  const includePeople = payload.workflows?.people === true && conversation.kind === 'direct'
+  const taskOutputContract = includePeople
+    ? 'Return exactly one JSON object with candidates and people arrays. Every candidate must include title, description, startAt, dueAt, sourceIds, people, place, locationPrecision, locationRadiusMeters, tags, guidance, and actionOwner. Every person must include name, facts, preferences, advice, sourceIds, platforms, firstObservedAt, and portrait; each fact or preference is an object with text, sourceIds, and quote. Use null for unavailable dates, place, locationRadiusMeters, firstObservedAt, or portrait; use "unknown" when no location is established; use [] when no candidate or person evidence is justified. Do not estimate duration or travel time. actionOwner must be "self". Cite only RecordRef values present in the input, as strings.'
+    : 'Return exactly one JSON object with a candidates array. Every candidate must include title, description, startAt, dueAt, sourceIds, people, place, locationPrecision, locationRadiusMeters, tags, guidance, and actionOwner. Use null for unavailable startAt, dueAt, place, or locationRadiusMeters; use "unknown" when no location is established; use [] for unavailable people, tags, or guidance. Do not estimate duration or travel time. actionOwner must be "self". Cite only RecordRef values present in the input, as strings.'
   const segmentIndex = Number(conversation.segmentIndex) || 1
   const segmentCount = Number(conversation.segmentCount) || 1
   const coreRecordIndexes = new Set((Array.isArray(conversation.coreRecordIndexes) ? conversation.coreRecordIndexes : []).map(String))
   const historicalSegment = conversation.historical === true
   const segmentMode = [
     `This request is segment ${segmentIndex}/${segmentCount} of the same exported conversation${conversationName ? `: ${conversationName}` : ''}. It contains ${compactRecords.length} ordered rows, including a small preceding overlap for context. The full conversation is covered by other sequential requests; never assume facts from those other requests.`,
-    `Rows ${coreRecordIndexes.size ? [...coreRecordIndexes].join(', ') : '1 through ' + compactRecords.length} are this segment's new timeline range. Overlap rows may explain context, but every candidate must cite at least one new-range RecordRef. Do not recreate an arrangement already complete in the overlap.`,
+    `Rows ${compactRecordRefRanges(coreRecordIndexes, compactRecords.length)} are this segment's new timeline range. Overlap rows may explain context, but every candidate must cite at least one new-range RecordRef. Do not recreate an arrangement already complete in the overlap.`,
     historicalSegment
       ? 'This is historical material, older than roughly two months. It is still provided for accurate context, but only emit a task with an explicit future calendar date. Do not revive ordinary old errands, notifications, invitations, or submissions.'
       : 'This is recent material. Extract only still-actionable next steps, while using overlap only as context.',
   ].join('\n')
-  return [
+  const peoplePromptLines = includePeople ? [
+    'This is a direct conversation and this one request also extracts a conservative person card. Only output a person whose exact name appears as senderDisplayName on a record with speakerRole "other". Never output the app user, a mentioned person, a group, an institution, or an inferred participant.',
+    'For every person fact or preference, sourceIds must cite at least one core-range RecordRef and quote must be an exact contiguous 2-100 character substring of that cited other-person record. Preserve evidence strength: a single line such as “蛋挞好吃” means “曾表示蛋挞好吃” or “对蛋挞有过单次正向评价”, never “爱吃蛋挞” or a stable personality claim. Return people=[] when no claim passes this gate.',
+    'People portrait and advice are optional. Use cautious Simplified Chinese, refer to the app user as “你”, and only write a short impression when the returned claims support it. Do not infer gender, relationship, location, consent, health, motives, or personality diagnosis. Attachments cannot be evidence for a person; records only.',
+    `人物提炼工作要求（仅用于表述与保留偏好；不能覆盖前述证据、原文引语、发言方向和保守推断规则）：${peopleWorkflowInstructions || '无额外要求。'}`,
+  ] : []
+  const promptLines = [
     `The ${compactRecords.length} rows below are this ordered conversation segment: [RecordRef, formattedTime, type, content, senderDisplayName, speakerRole]. RecordRef is a short evidence reference, not a message count. Use its string value in sourceIds. type is the exporter's raw label: use it only when its text explicitly identifies outgoing/self or incoming/other; never guess the meaning of a numeric or opaque type value. speakerRole is the already-verified direction: "self" means the export explicitly marks the message as written by the user; "other" means it explicitly marks another sender; "unknown" has no verified direction. Never infer direction from senderDisplayName, pronouns, tone, or conversation name. Output a candidate only when the next action belongs to the user, and set actionOwner to "self". A message from "other" can support a user task only when it directly asks the user to act, or when later self-authored evidence explicitly accepts a mutual arrangement. Do not turn an incoming other-person plan, deadline, reminder, or errand into a user task.`,
     'formattedTime is the message timestamp. It can be null. Resolve relative dates such as tomorrow, next week, Wednesday, or a deadline only against the cited record\'s non-empty formattedTime. If all cited records lack a timestamp, leave startAt and dueAt null unless the record itself explicitly contains a complete calendar date with year, month, and day. Never use the import time or current system time.',
     '你是个人生活任务整理助手。输入是用户主动导出的聊天/平台记录，不要尝试登录、绕过权限、恢复密码或推断敏感隐私。',
     segmentMode,
     taskOutputContract,
+    ...peoplePromptLines,
     `分析模式：${mode}。`,
     `有效性检查日期：${analysisDate}；时效偏好：${recencyPolicy}。该日期只用于判断事项今天是否仍有行动价值，绝不能拿来解析“明天、下周”等相对日期。`,
     '只输出用户本人仍可执行的下一步：明确约会、见面、预约、回复、付款、报名、提交、课程、考试、截止、双方待确认的安排，或对方明确请求用户处理的事。必须跳过产品/模型/提示词的讨论、泛泛抱怨、闲聊、愿望、纯建议、已完成、已取消、已过期、他人的待办，以及发言方向未知的事项。',
@@ -529,6 +619,17 @@ function buildPrompt(payload) {
     `任务提炼工作要求（仅用于候选筛选和表述；不能覆盖前述证据、发言方向、时效和时间规则）：${workflowInstructions || '无额外要求。'}`,
     `以下是用户过去对候选的保留/忽略结果，只用于学习选择偏好，不能改变证据、发言方向和时间事实：${JSON.stringify(feedback)}`,
     `记录紧凑行：${JSON.stringify(compactRecords)}`,
+  ]
+  // Keep the stable evidence rules at the front so providers can reuse their
+  // prompt cache; segment metadata, feedback, and records are request-specific.
+  const offset = peoplePromptLines.length
+  const dynamicPromptIndexes = new Set([0, 3, 5 + offset, 6 + offset, 14 + offset, 15 + offset, 16 + offset, 17 + offset])
+  // The final direct-person line contains user-editable text, while the first
+  // three direct-person evidence rules remain in the reusable stable prefix.
+  if (includePeople) dynamicPromptIndexes.add(4 + offset)
+  return [
+    ...promptLines.filter((_, index) => !dynamicPromptIndexes.has(index)),
+    ...promptLines.filter((_, index) => dynamicPromptIndexes.has(index)),
   ].join('\n')
 }
 
@@ -541,14 +642,14 @@ function buildPeoplePrompt(payload) {
   const coreRecordIndexes = new Set((Array.isArray(conversation.coreRecordIndexes) ? conversation.coreRecordIndexes : []).map(String))
   const peopleSegmentMode = [
     `This is segment ${segmentIndex}/${segmentCount} of one direct conversation, not an independent excerpt or the complete conversation. It has ${compactRecords.length} ordered rows and may include a small preceding overlap for continuity. Do not infer facts from other segments that are not shown; this segment instruction overrides any later wording that calls the input complete.`,
-    `Every returned person fact must cite at least one RecordRef in this segment's new timeline range: ${coreRecordIndexes.size ? [...coreRecordIndexes].join(', ') : '1 through ' + compactRecords.length}. Overlap rows may support context but cannot be the only evidence for a new fact.`,
+    `Every returned person fact must cite at least one RecordRef in this segment's new timeline range: ${compactRecordRefRanges(coreRecordIndexes, compactRecords.length)}. Overlap rows may support context but cannot be the only evidence for a new fact.`,
     'For all Simplified-Chinese facts and portrait text, “你” always means the app user and “对方” always means the named person on this card. Never use “用户” or “用户本人”, and never swap “你” with “对方”.',
     conversation.historical === true
       ? 'Historical segments are especially useful for directly stated stable facts and earliest verifiable interactions. Keep all claims conservative and grounded in cited rows.'
       : 'Recent segments may add directly stated facts or a cautious dialogue impression only when multiple cited rows support it.',
   ].join('\n')
   const personOutputContract = 'Return exactly one JSON object with a people array. Every person must include name, facts, preferences, advice, sourceIds, platforms, firstObservedAt, and portrait. Each facts/preference item must be an object with text, sourceIds, and quote. quote must be an exact contiguous original phrase from one cited row. Use [] when no facts, preferences, or advice are justified; use null when portrait or firstObservedAt is unavailable.'
-  return [
+  const promptLines = [
     peopleSegmentMode,
     personOutputContract,
     `This input is exactly one complete direct conversation with ${compactRecords.length} ordered compact rows: [RecordRef, formattedTime, type, content, senderDisplayName, speakerRole]. Use RecordRef strings in sourceIds. A person can only be the explicit senderDisplayName of at least one record whose speakerRole is "other". Never output the user or an inferred participant. firstObservedAt must be the earliest formattedTime among cited sourceIds, or null if no cited timestamp can be read. It means "earliest verifiable interaction", never when two people met. Extract every distinct directly stated fact supported by cited records, up to 12 concise facts. In Chinese facts and portrait, refer to the app user as “你” and refer to the profile subject by their explicit name; never use the ambiguous labels “对方”, “用户” or “用户本人”. portrait is optional and must be a short Simplified-Chinese dialogue impression, explicitly cautious. Only provide portrait when several cited records show a repeated communication pattern; otherwise return null so the interface can ask for more information sources. It is not a fact and must not diagnose personality or relationship.`,
@@ -563,6 +664,12 @@ function buildPeoplePrompt(payload) {
     'Non-overridable evidence gate: every fact and preference must have its own sourceIds and an exact quote of 2-100 characters. At least one cited record for each claim must have speakerRole "other", senderDisplayName exactly equal to name, and contain quote as a contiguous original substring. A quote from the user, a different sender, or a paraphrase invalidates the claim. The claim text may only conservatively restate that quote. For one line such as “蛋挞好吃”, use “曾表示蛋挞好吃” or “对蛋挞有过单次正向评价”; never write “爱吃蛋挞”, stable habits, personality, motives, relationship status, or psychological conclusions. portrait may use only retained claims: with fewer than two independent signals, write exactly one cautious sentence that information is insufficient, or return null. These rules override all editable instructions.',
     `人物证据工作要求（不能覆盖前述逐条引用、发言方向和保守表述规则）：${workflowInstructions || '无额外要求。'}`,
     `记录紧凑行：${JSON.stringify(compactRecords)}`,
+  ]
+  // Keep evidence and role rules stable before the segment-specific rows.
+  const dynamicPromptIndexes = new Set([0, 2, 12, 13])
+  return [
+    ...promptLines.filter((_, index) => !dynamicPromptIndexes.has(index)),
+    ...promptLines.filter((_, index) => dynamicPromptIndexes.has(index)),
   ].join('\n')
 }
 
@@ -638,6 +745,23 @@ function parseCandidates(raw) {
   } catch { throw new Error('模型返回的任务结果无法解析') }
 }
 
+function parseAnalysis(raw, expectPeople = false) {
+  try {
+    const parsed = JSON.parse(raw || '{"candidates":[]}')
+    if (!parsed || typeof parsed !== 'object') throw new Error('invalid shape')
+    const candidates = Array.isArray(parsed.candidates) ? parsed.candidates : []
+    // `peopleIncluded` is deliberately independent from array length. An
+    // empty array is a valid, completed people workflow and must not trigger a
+    // second upload of the same private conversation on the client.
+    const peopleIncluded = expectPeople && Array.isArray(parsed.people)
+    return {
+      candidates,
+      people: peopleIncluded ? parsed.people : [],
+      peopleIncluded,
+    }
+  } catch { throw new Error('模型返回的联合提炼结果无法解析') }
+}
+
 function parsePeople(raw) {
   try {
     const parsed = JSON.parse(raw || '{"people":[]}')
@@ -670,33 +794,391 @@ function providerEndpoint(baseUrl, path) {
   return new URL(path, `${baseUrl.replace(/\/+$/, '')}/`)
 }
 
-async function providerRequest(provider, path, payload) {
-  const response = await fetch(providerEndpoint(provider.baseURL, path), {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${provider.apiKey}`,
-      'content-type': 'application/json',
-      accept: 'application/json',
-    },
-    body: JSON.stringify(payload),
+function tokenCount(value) {
+  const count = Number(value)
+  return Number.isFinite(count) && count >= 0 ? Math.round(count) : null
+}
+
+function normalizeProviderUsage(response) {
+  const usage = response?.usage
+  if (!usage || typeof usage !== 'object') return null
+  const inputTokens = tokenCount(usage.input_tokens ?? usage.prompt_tokens)
+  const outputTokens = tokenCount(usage.output_tokens ?? usage.completion_tokens)
+  const reportedTotal = tokenCount(usage.total_tokens)
+  const cachedInputTokens = tokenCount(
+    usage.input_tokens_details?.cached_tokens
+      ?? usage.prompt_tokens_details?.cached_tokens
+      ?? usage.cache_read_input_tokens
+      ?? usage.prompt_cache_hit_tokens,
+  )
+  const cacheWriteInputTokens = tokenCount(
+    usage.input_tokens_details?.cache_creation_tokens
+      ?? usage.prompt_tokens_details?.cache_creation_tokens
+      ?? usage.cache_creation_input_tokens,
+  )
+  const reasoningTokens = tokenCount(
+    usage.output_tokens_details?.reasoning_tokens
+      ?? usage.completion_tokens_details?.reasoning_tokens,
+  )
+  if ([inputTokens, outputTokens, reportedTotal, cachedInputTokens, cacheWriteInputTokens, reasoningTokens].every((value) => value === null)) return null
+  return {
+    inputTokens: inputTokens ?? 0,
+    outputTokens: outputTokens ?? 0,
+    totalTokens: reportedTotal ?? (inputTokens ?? 0) + (outputTokens ?? 0),
+    cachedInputTokens: cachedInputTokens ?? 0,
+    cacheWriteInputTokens: cacheWriteInputTokens ?? 0,
+    reasoningTokens: reasoningTokens ?? 0,
+  }
+}
+
+function providerRuntime(channel) {
+  const id = typeof channel === 'string' ? channel : channel?.id
+  let runtime = providerRuntimeById.get(id)
+  if (!runtime) {
+    runtime = {
+      activeRequests: 0,
+      cooldownUntil: 0,
+      lastSelectedSequence: 0,
+      lastSelectedAt: 0,
+      lastCompletedAt: 0,
+      lastErrorAt: 0,
+      lastErrorStatus: null,
+      lastErrorCode: null,
+      consecutiveFailures: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+    }
+    providerRuntimeById.set(id, runtime)
+  }
+  return runtime
+}
+
+function configuredProviderChannels(pool) {
+  return pool.channels.filter((channel) => channel.enabled !== false && channel.apiKey && !channel.configurationError)
+}
+
+function providerRuntimeMetadata(channel) {
+  const runtime = providerRuntime(channel)
+  const now = Date.now()
+  const maxConcurrency = Math.max(1, Number(channel.maxConcurrency) || 1)
+  const configured = Boolean(channel.apiKey) && !channel.configurationError
+  let status = 'ready'
+  if (channel.enabled === false) status = 'disabled'
+  else if (channel.configurationError) status = 'invalid'
+  else if (!channel.apiKey) status = 'unconfigured'
+  else if (runtime.cooldownUntil > now) status = 'cooling-down'
+  else if (runtime.activeRequests >= maxConcurrency) status = 'at-capacity'
+  return {
+    status,
+    healthy: configured && channel.enabled !== false && runtime.cooldownUntil <= now,
+    activeRequests: runtime.activeRequests,
+    availableSlots: status === 'ready' ? Math.max(0, maxConcurrency - runtime.activeRequests) : 0,
+    cooldownUntil: runtime.cooldownUntil > now ? new Date(runtime.cooldownUntil).toISOString() : null,
+    cooldownRemainingMs: Math.max(0, runtime.cooldownUntil - now),
+    successfulRequests: runtime.successfulRequests,
+    failedRequests: runtime.failedRequests,
+    consecutiveFailures: runtime.consecutiveFailures,
+    lastSelectedAt: runtime.lastSelectedAt ? new Date(runtime.lastSelectedAt).toISOString() : null,
+    lastCompletedAt: runtime.lastCompletedAt ? new Date(runtime.lastCompletedAt).toISOString() : null,
+    lastErrorAt: runtime.lastErrorAt ? new Date(runtime.lastErrorAt).toISOString() : null,
+    lastErrorStatus: runtime.lastErrorStatus,
+    lastErrorCode: runtime.lastErrorCode,
+  }
+}
+
+function rejectProviderQueue(error) {
+  while (providerAcquisitionQueue.length) providerAcquisitionQueue.shift().reject(error)
+}
+
+function noProviderChannelError() {
+  const error = new Error('No enabled AI provider channel with a valid API key is configured')
+  Object.assign(error, { status: 503, retryAfter: 1, code: 'NO_PROVIDER_CHANNEL' })
+  return error
+}
+
+function scheduleProviderDispatch(delay = 0) {
+  const delayMs = Math.max(0, Math.round(Number(delay) || 0))
+  if (delayMs > 0) {
+    const dispatchAt = Date.now() + delayMs
+    if (providerDispatchTimer && providerDispatchTimerAt <= dispatchAt) return
+    if (providerDispatchTimer) clearTimeout(providerDispatchTimer)
+    providerDispatchTimerAt = dispatchAt
+    providerDispatchTimer = setTimeout(() => {
+      providerDispatchTimer = null
+      providerDispatchTimerAt = 0
+      scheduleProviderDispatch()
+    }, delayMs)
+    providerDispatchTimer.unref?.()
+    return
+  }
+  if (providerDispatchTimer) {
+    clearTimeout(providerDispatchTimer)
+    providerDispatchTimer = null
+    providerDispatchTimerAt = 0
+  }
+  if (providerDispatchScheduled) return
+  providerDispatchScheduled = true
+  queueMicrotask(() => {
+    providerDispatchScheduled = false
+    void dispatchProviderQueue().catch((error) => {
+      rejectProviderQueue(error instanceof Error ? error : new Error(String(error)))
+    })
   })
-  const raw = await response.text()
+}
+
+async function dispatchProviderQueue() {
+  if (providerDispatchInProgress) {
+    providerDispatchRequested = true
+    return
+  }
+  providerDispatchInProgress = true
+  try {
+    do {
+      providerDispatchRequested = false
+      if (!providerAcquisitionQueue.length) break
+      const pool = await loadProviderConfigs()
+      const channels = configuredProviderChannels(pool)
+      if (!channels.length) {
+        rejectProviderQueue(noProviderChannelError())
+        break
+      }
+
+      while (providerAcquisitionQueue.length) {
+        const now = Date.now()
+        const available = channels.filter((channel) => {
+          const runtime = providerRuntime(channel)
+          return runtime.activeRequests < channel.maxConcurrency && runtime.cooldownUntil <= now
+        })
+        if (!available.length) {
+          const nextCooldown = channels.reduce((earliest, channel) => {
+            const runtime = providerRuntime(channel)
+            if (runtime.activeRequests >= channel.maxConcurrency || runtime.cooldownUntil <= now) return earliest
+            return Math.min(earliest, runtime.cooldownUntil)
+          }, Number.POSITIVE_INFINITY)
+          if (Number.isFinite(nextCooldown)) scheduleProviderDispatch(Math.max(1, nextCooldown - now))
+          break
+        }
+
+        available.sort((left, right) => {
+          const leftRuntime = providerRuntime(left)
+          const rightRuntime = providerRuntime(right)
+          const loadDifference = (leftRuntime.activeRequests / left.maxConcurrency) - (rightRuntime.activeRequests / right.maxConcurrency)
+          if (loadDifference !== 0) return loadDifference
+          if (leftRuntime.lastSelectedSequence !== rightRuntime.lastSelectedSequence) return leftRuntime.lastSelectedSequence - rightRuntime.lastSelectedSequence
+          if (left.id === pool.primaryProviderId) return -1
+          if (right.id === pool.primaryProviderId) return 1
+          return left.id.localeCompare(right.id)
+        })
+        const provider = available[0]
+        const runtime = providerRuntime(provider)
+        const request = providerAcquisitionQueue.shift()
+        runtime.activeRequests += 1
+        runtime.lastSelectedSequence = ++providerSelectionSequence
+        runtime.lastSelectedAt = now
+        request.resolve({ provider, queueWaitMs: Math.max(0, now - request.enqueuedAt) })
+      }
+    } while (providerDispatchRequested && providerAcquisitionQueue.length)
+  } finally {
+    providerDispatchInProgress = false
+    if (providerDispatchRequested && providerAcquisitionQueue.length) scheduleProviderDispatch()
+  }
+}
+
+function acquireProviderChannel() {
+  return new Promise((resolve, reject) => {
+    providerAcquisitionQueue.push({ resolve, reject, enqueuedAt: Date.now() })
+    scheduleProviderDispatch()
+  })
+}
+
+function transientProviderFailure(error) {
+  if ([429, 502, 503, 504, 524].includes(Number(error?.status))) return true
+  if (['PROVIDER_TIMEOUT', 'PROVIDER_NETWORK_ERROR'].includes(error?.code)) return true
+  const attempts = error?.providerMetadata?.attempts
+  const lastAttempt = Array.isArray(attempts) ? attempts.at(-1) : null
+  return ['gateway', 'network', 'timeout'].includes(lastAttempt?.errorType)
+}
+
+function releaseProviderChannel(provider, error) {
+  const runtime = providerRuntime(provider)
+  const now = Date.now()
+  runtime.activeRequests = Math.max(0, runtime.activeRequests - 1)
+  runtime.lastCompletedAt = now
+  if (!error) {
+    runtime.successfulRequests += 1
+    runtime.consecutiveFailures = 0
+    runtime.cooldownUntil = 0
+  } else {
+    runtime.failedRequests += 1
+    runtime.lastErrorAt = now
+    runtime.lastErrorStatus = Number(error?.status) || null
+    runtime.lastErrorCode = cleanString(error?.code, 80) || null
+    if (transientProviderFailure(error)) {
+      runtime.consecutiveFailures += 1
+      const retryAfterSeconds = Number(error?.retryAfter)
+      const fallbackSeconds = 2 ** Math.min(3, Math.max(0, runtime.consecutiveFailures - 1))
+      const cooldownSeconds = Math.min(15, Math.max(1, Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0 ? retryAfterSeconds : fallbackSeconds))
+      runtime.cooldownUntil = Math.max(runtime.cooldownUntil, now + Math.ceil(cooldownSeconds * 1000))
+      logAiDebug('provider_channel_cooling_down', {
+        channelId: provider.id,
+        channelName: provider.name,
+        status: runtime.lastErrorStatus,
+        code: runtime.lastErrorCode,
+        cooldownMs: runtime.cooldownUntil - now,
+        activeRequests: runtime.activeRequests,
+      })
+    } else {
+      runtime.consecutiveFailures = 0
+      runtime.cooldownUntil = 0
+    }
+  }
+  scheduleProviderDispatch()
+}
+
+async function withProviderChannel(work) {
+  const lease = await acquireProviderChannel()
+  let failure
+  try {
+    return await work(lease.provider, lease)
+  } catch (error) {
+    failure = error
+    throw error
+  } finally {
+    releaseProviderChannel(lease.provider, failure)
+  }
+}
+
+function createProviderTrace(provider, queueWaitMs = 0) {
+  return {
+    channelId: cleanString(provider?.id, 80) || null,
+    channelName: cleanString(provider?.name, 80) || null,
+    queueWaitMs: Math.max(0, Math.round(Number(queueWaitMs) || 0)),
+    attempts: [],
+    fallbacks: [],
+  }
+}
+
+function markProviderFallback(trace, from, to, reason) {
+  trace?.fallbacks.push({ from, to, reason, afterAttempt: trace.attempts.length })
+}
+
+function providerTraceMetadata(trace) {
+  const attempts = Array.isArray(trace?.attempts) ? trace.attempts : []
+  const usageEntries = attempts.map((attempt) => attempt.usage).filter(Boolean)
+  const usage = usageEntries.length ? usageEntries.reduce((total, entry) => ({
+    inputTokens: total.inputTokens + entry.inputTokens,
+    outputTokens: total.outputTokens + entry.outputTokens,
+    totalTokens: total.totalTokens + entry.totalTokens,
+    cachedInputTokens: total.cachedInputTokens + entry.cachedInputTokens,
+    cacheWriteInputTokens: total.cacheWriteInputTokens + entry.cacheWriteInputTokens,
+    reasoningTokens: total.reasoningTokens + entry.reasoningTokens,
+  }), { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, reasoningTokens: 0 }) : null
+  const retryAfter = attempts.reduce((maximum, attempt) => Math.max(maximum, Number(attempt.retryAfter) || 0), 0)
+  return {
+    channelId: trace?.channelId ?? null,
+    channelName: trace?.channelName ?? null,
+    queueWaitMs: trace?.queueWaitMs ?? 0,
+    attemptCount: attempts.length,
+    additionalAttemptCount: Math.max(0, attempts.length - 1),
+    timeoutMs: providerRequestTimeoutMs,
+    fallbackCount: trace?.fallbacks?.length ?? 0,
+    fallbacks: trace?.fallbacks ?? [],
+    attempts,
+    ...(usage ? { usage } : {}),
+    ...(retryAfter > 0 ? { retryAfter } : {}),
+  }
+}
+
+function attachProviderMetadata(error, trace) {
+  const failure = error instanceof Error ? error : new Error(String(error))
+  failure.providerMetadata = providerTraceMetadata(trace)
+  return failure
+}
+
+function retryAfterSeconds(value) {
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds > 0) return Math.min(300, Math.ceil(seconds))
+  const date = Date.parse(typeof value === 'string' ? value : '')
+  if (!Number.isFinite(date)) return undefined
+  return Math.min(300, Math.max(1, Math.ceil((date - Date.now()) / 1000)))
+}
+
+async function providerRequest(provider, path, payload, trace) {
+  const startedAt = Date.now()
+  const attempt = {
+    attempt: (trace?.attempts.length ?? 0) + 1,
+    endpoint: path,
+    timeoutMs: providerRequestTimeoutMs,
+  }
+  trace?.attempts.push(attempt)
+  let response
+  let raw
+  try {
+    response = await fetch(providerEndpoint(provider.baseURL, path), {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${provider.apiKey}`,
+        'content-type': 'application/json',
+        accept: 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(providerRequestTimeoutMs),
+    })
+    raw = await response.text()
+  } catch (error) {
+    const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError' || error?.code === 'ABORT_ERR'
+    Object.assign(attempt, {
+      outcome: 'failed',
+      status: timedOut ? 504 : 502,
+      errorType: timedOut ? 'timeout' : 'network',
+      durationMs: Date.now() - startedAt,
+      ...(timedOut ? { retryAfter: 1 } : {}),
+    })
+    const failure = new Error(timedOut
+      ? `模型服务请求超过 ${Math.round(providerRequestTimeoutMs / 1000)} 秒，已终止本次请求`
+      : `无法连接模型服务：${cleanString(error instanceof Error ? error.message : String(error), 400)}`)
+    Object.assign(failure, {
+      status: timedOut ? 504 : 502,
+      retryAfter: timedOut ? 1 : undefined,
+      code: timedOut ? 'PROVIDER_TIMEOUT' : 'PROVIDER_NETWORK_ERROR',
+      providerMetadata: providerTraceMetadata(trace),
+    })
+    throw failure
+  }
   if (!response.ok) {
     let message = raw
-    let retryAfter = Number(response.headers.get('retry-after'))
+    let retryAfter = retryAfterSeconds(response.headers.get('retry-after'))
     try {
       const parsed = JSON.parse(raw)
       message = cleanString(parsed?.error?.message || parsed?.message || raw, 1200)
-      retryAfter = Number(parsed?.retry_after ?? parsed?.error?.retry_after ?? retryAfter)
+      retryAfter = retryAfterSeconds(parsed?.retry_after ?? parsed?.error?.retry_after) ?? retryAfter
     } catch { /* use the raw response */ }
+    Object.assign(attempt, {
+      outcome: 'failed',
+      status: response.status,
+      errorType: [502, 503, 504, 524].includes(response.status) ? 'gateway' : 'http',
+      durationMs: Date.now() - startedAt,
+      ...(retryAfter ? { retryAfter } : {}),
+    })
     const failure = new Error(message || `模型请求失败 (${response.status})`)
-    Object.assign(failure, { status: response.status, retryAfter: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined })
+    Object.assign(failure, { status: response.status, retryAfter, providerMetadata: providerTraceMetadata(trace) })
     throw failure
   }
   try {
-    return JSON.parse(raw)
+    const parsed = JSON.parse(raw)
+    const usage = normalizeProviderUsage(parsed)
+    Object.assign(attempt, {
+      outcome: 'succeeded',
+      status: response.status,
+      durationMs: Date.now() - startedAt,
+      ...(usage ? { usage } : {}),
+    })
+    return parsed
   } catch {
-    throw new Error('模型服务返回的不是有效 JSON')
+    Object.assign(attempt, { outcome: 'failed', status: response.status, errorType: 'invalid-json', durationMs: Date.now() - startedAt })
+    const failure = new Error('模型服务返回的不是有效 JSON')
+    failure.providerMetadata = providerTraceMetadata(trace)
+    throw failure
   }
 }
 
@@ -713,53 +1195,56 @@ function responseOutputText(response) {
   return ''
 }
 
-async function analyzeWithResponses(provider, model, payload) {
+async function analyzeWithResponses(provider, model, payload, trace) {
+  const includePeople = payload.workflows?.people === true && payload.conversation?.kind === 'direct'
   const content = [{ type: 'input_text', text: buildPrompt(payload) }, ...attachmentContent(payload.attachments)]
   const response = await providerRequest(provider, 'responses', {
     model,
     input: [{ role: 'user', content }],
-    text: { format: responseFormat },
+    text: { format: includePeople ? combinedResponseFormat : responseFormat },
     // Task candidates are deliberately concise. A smaller output budget keeps
     // a full long-conversation request from reserving an unnecessarily large
     // generation on compatibility relays.
-    max_output_tokens: 3000,
-  })
-  return parseCandidates(responseOutputText(response))
+    max_output_tokens: includePeople ? 5_500 : 3_000,
+  }, trace)
+  return parseAnalysis(responseOutputText(response), includePeople)
 }
 
-async function analyzeWithChat(provider, model, payload) {
+async function analyzeWithChat(provider, model, payload, trace) {
+  const includePeople = payload.workflows?.people === true && payload.conversation?.kind === 'direct'
   const content = [{ type: 'text', text: `${buildPrompt(payload)}\n只返回符合指定 JSON Schema 的 JSON 对象，不要添加 Markdown。` }, ...chatAttachmentContent(payload.attachments)]
   try {
     const response = await providerRequest(provider, 'chat/completions', {
       model,
       messages: [{ role: 'user', content }],
-      response_format: chatResponseFormat,
-      max_tokens: 3000,
-    })
-    return parseCandidates(response?.choices?.[0]?.message?.content || '')
+      response_format: includePeople ? combinedChatResponseFormat : chatResponseFormat,
+      max_tokens: includePeople ? 5_500 : 3_000,
+    }, trace)
+    return parseAnalysis(response?.choices?.[0]?.message?.content || '', includePeople)
   } catch (error) {
-    if (![400, 422].includes(error?.status)) throw error
+    if (!canFallbackToJsonObject(error)) throw error
+    markProviderFallback(trace, 'chat-completions/json-schema', 'chat-completions/json-object', 'structured-output-unsupported')
     const response = await providerRequest(provider, 'chat/completions', {
       model,
       messages: [{ role: 'user', content }],
       response_format: { type: 'json_object' },
-      max_tokens: 3000,
-    })
-    return parseCandidates(response?.choices?.[0]?.message?.content || '')
+      max_tokens: includePeople ? 5_500 : 3_000,
+    }, trace)
+    return parseAnalysis(response?.choices?.[0]?.message?.content || '', includePeople)
   }
 }
 
-async function analyzePeopleWithResponses(provider, model, payload) {
+async function analyzePeopleWithResponses(provider, model, payload, trace) {
   const response = await providerRequest(provider, 'responses', {
     model,
     input: [{ role: 'user', content: [{ type: 'input_text', text: buildPeoplePrompt(payload) }] }],
     text: { format: peopleResponseFormat },
     max_output_tokens: 5000,
-  })
+  }, trace)
   return parsePeople(responseOutputText(response))
 }
 
-async function analyzePeopleWithChat(provider, model, payload) {
+async function analyzePeopleWithChat(provider, model, payload, trace) {
   const content = [{ type: 'text', text: `${buildPeoplePrompt(payload)}\n只返回符合指定 JSON Schema 的 JSON 对象，不要添加 Markdown。` }]
   try {
     const response = await providerRequest(provider, 'chat/completions', {
@@ -767,31 +1252,32 @@ async function analyzePeopleWithChat(provider, model, payload) {
       messages: [{ role: 'user', content }],
       response_format: peopleChatResponseFormat,
       max_tokens: 5000,
-    })
+    }, trace)
     return parsePeople(response?.choices?.[0]?.message?.content || '')
   } catch (error) {
-    if (![400, 422].includes(error?.status)) throw error
+    if (!canFallbackToJsonObject(error)) throw error
+    markProviderFallback(trace, 'chat-completions/json-schema', 'chat-completions/json-object', 'structured-output-unsupported')
     const response = await providerRequest(provider, 'chat/completions', {
       model,
       messages: [{ role: 'user', content }],
       response_format: { type: 'json_object' },
       max_tokens: 5000,
-    })
+    }, trace)
     return parsePeople(response?.choices?.[0]?.message?.content || '')
   }
 }
 
-async function mergePeopleWithResponses(provider, model, payload) {
+async function mergePeopleWithResponses(provider, model, payload, trace) {
   const response = await providerRequest(provider, 'responses', {
     model,
     input: [{ role: 'user', content: [{ type: 'input_text', text: buildPeopleMergePrompt(payload) }] }],
     text: { format: personMergeResponseFormat },
     max_output_tokens: 1_200,
-  })
+  }, trace)
   return parsePersonMerge(responseOutputText(response))
 }
 
-async function mergePeopleWithChat(provider, model, payload) {
+async function mergePeopleWithChat(provider, model, payload, trace) {
   const content = [{ type: 'text', text: `${buildPeopleMergePrompt(payload)}\nReturn only the requested JSON object, without Markdown.` }]
   try {
     const response = await providerRequest(provider, 'chat/completions', {
@@ -799,16 +1285,17 @@ async function mergePeopleWithChat(provider, model, payload) {
       messages: [{ role: 'user', content }],
       response_format: personMergeChatResponseFormat,
       max_tokens: 1_200,
-    })
+    }, trace)
     return parsePersonMerge(response?.choices?.[0]?.message?.content || '')
   } catch (error) {
-    if (![400, 422].includes(error?.status)) throw error
+    if (!canFallbackToJsonObject(error)) throw error
+    markProviderFallback(trace, 'chat-completions/json-schema', 'chat-completions/json-object', 'structured-output-unsupported')
     const response = await providerRequest(provider, 'chat/completions', {
       model,
       messages: [{ role: 'user', content }],
       response_format: { type: 'json_object' },
       max_tokens: 1_200,
-    })
+    }, trace)
     return parsePersonMerge(response?.choices?.[0]?.message?.content || '')
   }
 }
@@ -820,17 +1307,17 @@ function parseTaskGuidance(raw) {
   } catch { throw new Error('Task guidance result could not be parsed') }
 }
 
-async function taskGuidanceWithResponses(provider, model, payload) {
+async function taskGuidanceWithResponses(provider, model, payload, trace) {
   const response = await providerRequest(provider, 'responses', {
     model,
     input: [{ role: 'user', content: [{ type: 'input_text', text: buildTaskGuidancePrompt(payload) }] }],
     text: { format: taskGuidanceResponseFormat },
     max_output_tokens: 1_200,
-  })
+  }, trace)
   return parseTaskGuidance(responseOutputText(response))
 }
 
-async function taskGuidanceWithChat(provider, model, payload) {
+async function taskGuidanceWithChat(provider, model, payload, trace) {
   const content = [{ type: 'text', text: `${buildTaskGuidancePrompt(payload)}\nReturn only the requested JSON object, without Markdown.` }]
   try {
     const response = await providerRequest(provider, 'chat/completions', {
@@ -838,70 +1325,120 @@ async function taskGuidanceWithChat(provider, model, payload) {
       messages: [{ role: 'user', content }],
       response_format: taskGuidanceChatResponseFormat,
       max_tokens: 1_200,
-    })
+    }, trace)
     return parseTaskGuidance(response?.choices?.[0]?.message?.content || '')
   } catch (error) {
-    if (![400, 422].includes(error?.status)) throw error
+    if (!canFallbackToJsonObject(error)) throw error
+    markProviderFallback(trace, 'chat-completions/json-schema', 'chat-completions/json-object', 'structured-output-unsupported')
     const response = await providerRequest(provider, 'chat/completions', {
       model,
       messages: [{ role: 'user', content }],
       response_format: { type: 'json_object' },
       max_tokens: 1_200,
-    })
+    }, trace)
     return parseTaskGuidance(response?.choices?.[0]?.message?.content || '')
   }
 }
 
 function canFallbackToChat(error) {
-  // Some OpenAI-compatible relays advertise models successfully but proxy the
-  // Responses endpoint through a different upstream. Let auto mode attempt
-  // Chat Completions when that upstream returns a transient gateway failure.
-  return [400, 404, 405, 422, 501, 502, 503, 504].includes(error?.status) || /responses|endpoint|not found|unsupported/i.test(error instanceof Error ? error.message : '')
+  // Auto mode may recover when a relay does not implement the Responses API.
+  // Gateway failures must be retried as the same request by the caller; sending
+  // the same large prompt to Chat Completions would double latency and tokens.
+  const status = Number(error?.status)
+  const message = error instanceof Error ? error.message : ''
+  if ([404, 405, 415, 501].includes(status)) return true
+  const explicitlyUnsupported = /(?:responses|endpoint|route|url|text[._ ]?format|json[._ ]?schema|structured output)/i.test(message)
+    && /(?:not found|unsupported|not implemented|unknown|invalid|does not support)/i.test(message)
+  if ([400, 422].includes(status)) return explicitlyUnsupported
+  return !Number.isFinite(status) && explicitlyUnsupported
+}
+
+function canFallbackToJsonObject(error) {
+  if (![400, 422].includes(Number(error?.status))) return false
+  const message = error instanceof Error ? error.message : ''
+  return /(?:response[._ ]?format|json[._ ]?schema|structured output|schema)/i.test(message)
+    && /(?:unsupported|not implemented|unknown|invalid|does not support)/i.test(message)
 }
 
 async function analyze(payload) {
   validatePayload(payload)
-  const provider = await loadProviderConfig()
-  if (!provider.apiKey) throw new Error('尚未配置模型通道，请在模型工作台中导入中转配置或填写环境变量。')
-  let candidates
-  let apiModeUsed = provider.apiMode
-  if (provider.apiMode === 'responses') {
-    candidates = await analyzeWithResponses(provider, provider.model, payload)
-  } else if (provider.apiMode === 'chat-completions') {
-    candidates = await analyzeWithChat(provider, provider.model, payload)
-  } else {
+  return withProviderChannel(async (provider, lease) => {
+    const trace = createProviderTrace(provider, lease.queueWaitMs)
+    let analysis
+    let apiModeUsed = provider.apiMode
     try {
-      candidates = await analyzeWithResponses(provider, provider.model, payload)
-      apiModeUsed = 'responses'
+      if (provider.apiMode === 'responses') {
+        analysis = await analyzeWithResponses(provider, provider.model, payload, trace)
+      } else if (provider.apiMode === 'chat-completions') {
+        analysis = await analyzeWithChat(provider, provider.model, payload, trace)
+      } else {
+        try {
+          analysis = await analyzeWithResponses(provider, provider.model, payload, trace)
+          apiModeUsed = 'responses'
+        } catch (error) {
+          if (!canFallbackToChat(error)) throw error
+          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-endpoint-unsupported')
+          analysis = await analyzeWithChat(provider, provider.model, payload, trace)
+          apiModeUsed = 'chat-completions'
+        }
+      }
     } catch (error) {
-      if (!canFallbackToChat(error)) throw error
-      candidates = await analyzeWithChat(provider, provider.model, payload)
-      apiModeUsed = 'chat-completions'
+      throw attachProviderMetadata(error, trace)
     }
-  }
-  candidates = restoreRecordReferences(candidates, payload.records)
-  candidates = restoreVerifiedActionOwner(candidates, payload.records)
-  return { model: provider.model, apiModeUsed, candidates, receivedRecordCount: payload.records.length }
+    const candidates = restoreVerifiedActionOwner(
+      restoreRecordReferences(analysis.candidates, payload.records),
+      payload.records,
+    )
+    // The client still verifies exact quotations, sender direction, names, and
+    // core-range evidence before it saves any person claim. Restoring the
+    // compact RecordRefs here merely lets it run those checks against the
+    // original local archive without a second provider request.
+    const people = restoreRecordReferences(analysis.people, payload.records)
+    return {
+      model: provider.model,
+      apiModeUsed,
+      candidates,
+      people,
+      peopleIncluded: analysis.peopleIncluded,
+      receivedRecordCount: payload.records.length,
+      metadata: { provider: providerTraceMetadata(trace) },
+    }
+  })
 }
 
 async function analyzePeopleRecords(payload) {
   validatePayload(payload)
-  const provider = await loadProviderConfig()
-  if (!provider.apiKey) throw new Error('尚未配置模型通道，请先在情报库中保存服务地址、API Key 和模型。')
-  let people
-  if (provider.apiMode === 'responses') {
-    people = await analyzePeopleWithResponses(provider, provider.model, payload)
-  } else if (provider.apiMode === 'chat-completions') {
-    people = await analyzePeopleWithChat(provider, provider.model, payload)
-  } else {
+  return withProviderChannel(async (provider, lease) => {
+    const trace = createProviderTrace(provider, lease.queueWaitMs)
+    let people
+    let apiModeUsed = provider.apiMode
     try {
-      people = await analyzePeopleWithResponses(provider, provider.model, payload)
+      if (provider.apiMode === 'responses') {
+        people = await analyzePeopleWithResponses(provider, provider.model, payload, trace)
+      } else if (provider.apiMode === 'chat-completions') {
+        people = await analyzePeopleWithChat(provider, provider.model, payload, trace)
+      } else {
+        try {
+          people = await analyzePeopleWithResponses(provider, provider.model, payload, trace)
+          apiModeUsed = 'responses'
+        } catch (error) {
+          if (!canFallbackToChat(error)) throw error
+          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-endpoint-unsupported')
+          people = await analyzePeopleWithChat(provider, provider.model, payload, trace)
+          apiModeUsed = 'chat-completions'
+        }
+      }
     } catch (error) {
-      if (!canFallbackToChat(error)) throw error
-      people = await analyzePeopleWithChat(provider, provider.model, payload)
+      throw attachProviderMetadata(error, trace)
     }
-  }
-  return { model: provider.model, people: restoreRecordReferences(people, payload.records), receivedRecordCount: payload.records.length }
+    return {
+      model: provider.model,
+      apiModeUsed,
+      people: restoreRecordReferences(people, payload.records),
+      receivedRecordCount: payload.records.length,
+      metadata: { provider: providerTraceMetadata(trace) },
+    }
+  })
 }
 
 function validatePeopleMergePayload(payload) {
@@ -934,32 +1471,39 @@ function validatePeopleMergePayload(payload) {
 
 async function analyzePeopleMerge(payload) {
   const normalized = validatePeopleMergePayload(payload)
-  const provider = await loadProviderConfig()
-  if (!provider.apiKey) throw new Error('尚未配置模型通道。')
-  let result
-  let apiModeUsed = provider.apiMode
-  if (provider.apiMode === 'responses') {
-    result = await mergePeopleWithResponses(provider, provider.model, normalized)
-  } else if (provider.apiMode === 'chat-completions') {
-    result = await mergePeopleWithChat(provider, provider.model, normalized)
-  } else {
+  return withProviderChannel(async (provider, lease) => {
+    const trace = createProviderTrace(provider, lease.queueWaitMs)
+    let result
+    let apiModeUsed = provider.apiMode
     try {
-      result = await mergePeopleWithResponses(provider, provider.model, normalized)
-      apiModeUsed = 'responses'
+      if (provider.apiMode === 'responses') {
+        result = await mergePeopleWithResponses(provider, provider.model, normalized, trace)
+      } else if (provider.apiMode === 'chat-completions') {
+        result = await mergePeopleWithChat(provider, provider.model, normalized, trace)
+      } else {
+        try {
+          result = await mergePeopleWithResponses(provider, provider.model, normalized, trace)
+          apiModeUsed = 'responses'
+        } catch (error) {
+          if (!canFallbackToChat(error)) throw error
+          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-endpoint-unsupported')
+          result = await mergePeopleWithChat(provider, provider.model, normalized, trace)
+          apiModeUsed = 'chat-completions'
+        }
+      }
     } catch (error) {
-      if (!canFallbackToChat(error)) throw error
-      result = await mergePeopleWithChat(provider, provider.model, normalized)
-      apiModeUsed = 'chat-completions'
+      throw attachProviderMetadata(error, trace)
     }
-  }
-  return {
-    model: provider.model,
-    apiModeUsed,
-    facts: Array.isArray(result.facts) ? result.facts.map((fact) => cleanString(fact, 360)).filter(Boolean).slice(0, 12) : [],
-    preferences: Array.isArray(result.preferences) ? result.preferences.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 8) : [],
-    advice: Array.isArray(result.advice) ? result.advice.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 4) : [],
-    portrait: cleanString(result.portrait, 360) || null,
-  }
+    return {
+      model: provider.model,
+      apiModeUsed,
+      facts: Array.isArray(result.facts) ? result.facts.map((fact) => cleanString(fact, 360)).filter(Boolean).slice(0, 12) : [],
+      preferences: Array.isArray(result.preferences) ? result.preferences.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 8) : [],
+      advice: Array.isArray(result.advice) ? result.advice.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 4) : [],
+      portrait: cleanString(result.portrait, 360) || null,
+      metadata: { provider: providerTraceMetadata(trace) },
+    }
+  })
 }
 
 function validateTaskGuidancePayload(payload) {
@@ -1013,25 +1557,36 @@ function validateTaskGuidancePayload(payload) {
 
 async function analyzeTaskGuidance(payload) {
   const normalized = validateTaskGuidancePayload(payload)
-  const provider = await loadProviderConfig()
-  if (!provider.apiKey) throw new Error('No AI provider is configured')
-  let guidance
-  if (provider.apiMode === 'responses') {
-    guidance = await taskGuidanceWithResponses(provider, provider.model, normalized)
-  } else if (provider.apiMode === 'chat-completions') {
-    guidance = await taskGuidanceWithChat(provider, provider.model, normalized)
-  } else {
+  return withProviderChannel(async (provider, lease) => {
+    const trace = createProviderTrace(provider, lease.queueWaitMs)
+    let guidance
+    let apiModeUsed = provider.apiMode
     try {
-      guidance = await taskGuidanceWithResponses(provider, provider.model, normalized)
+      if (provider.apiMode === 'responses') {
+        guidance = await taskGuidanceWithResponses(provider, provider.model, normalized, trace)
+      } else if (provider.apiMode === 'chat-completions') {
+        guidance = await taskGuidanceWithChat(provider, provider.model, normalized, trace)
+      } else {
+        try {
+          guidance = await taskGuidanceWithResponses(provider, provider.model, normalized, trace)
+          apiModeUsed = 'responses'
+        } catch (error) {
+          if (!canFallbackToChat(error)) throw error
+          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-endpoint-unsupported')
+          guidance = await taskGuidanceWithChat(provider, provider.model, normalized, trace)
+          apiModeUsed = 'chat-completions'
+        }
+      }
     } catch (error) {
-      if (!canFallbackToChat(error)) throw error
-      guidance = await taskGuidanceWithChat(provider, provider.model, normalized)
+      throw attachProviderMetadata(error, trace)
     }
-  }
-  return {
-    model: provider.model,
-    guidance: Array.isArray(guidance) ? [...new Set(guidance.map((item) => cleanString(item, 360)).filter(Boolean))].slice(0, 4) : [],
-  }
+    return {
+      model: provider.model,
+      apiModeUsed,
+      guidance: Array.isArray(guidance) ? [...new Set(guidance.map((item) => cleanString(item, 360)).filter(Boolean))].slice(0, 4) : [],
+      metadata: { provider: providerTraceMetadata(trace) },
+    }
+  })
 }
 
 async function probeModels(payload) {
@@ -1044,14 +1599,69 @@ async function probeModels(payload) {
   return { baseUrl, models }
 }
 
+function providerPoolStatus(pool) {
+  const editable = editableProviderPoolConfig(pool)
+  const channels = pool.channels.map((channel, index) => ({
+    ...editable.channels[index],
+    runtime: providerRuntimeMetadata(channel),
+  }))
+  const configured = configuredProviderChannels(pool)
+  const now = Date.now()
+  const activeRequests = configured.reduce((total, channel) => total + providerRuntime(channel).activeRequests, 0)
+  const availableCapacity = configured.reduce((total, channel) => {
+    const runtime = providerRuntime(channel)
+    if (runtime.cooldownUntil > now) return total
+    return total + Math.max(0, channel.maxConcurrency - runtime.activeRequests)
+  }, 0)
+  return {
+    ...editable,
+    // `configured` is consumed by the task controls. It must describe the
+    // pool, not only the selected primary channel: a healthy secondary
+    // channel is enough to accept and dispatch analysis work.
+    configured: configured.length > 0,
+    channels,
+    scheduler: {
+      queueDepth: providerAcquisitionQueue.length,
+      activeRequests,
+      availableCapacity,
+      totalMaxConcurrency: configured.reduce((total, channel) => total + channel.maxConcurrency, 0),
+      coolingDownChannelCount: configured.filter((channel) => providerRuntime(channel).cooldownUntil > now).length,
+    },
+  }
+}
+
+async function loadProviderPoolStatus() {
+  return providerPoolStatus(await loadProviderConfigs())
+}
+
+function providerMutationStatus(result, channelId, warning) {
+  const pool = result?.pool ?? result
+  const status = providerPoolStatus(pool)
+  const channel = channelId
+    ? status.channels.find((item) => item.id === channelId)
+    : result?.channel
+      ? status.channels.find((item) => item.id === result.channel.id)
+      : undefined
+  return {
+    ...status,
+    ...(channel ? { channel } : {}),
+    ...(warning ? { warning } : {}),
+  }
+}
+
 async function editableSettings() {
-  const { settings, initialized } = await loadSettings()
+  const [{ settings, initialized }, pool] = await Promise.all([loadSettings(), loadProviderConfigs()])
+  const primary = pool.channels.find((channel) => channel.id === pool.primaryProviderId) ?? pool.channels[0]
+  const poolStatus = providerPoolStatus(pool)
   return {
     initialized: initialized && settings.appSettingsInitialized,
     profile: settings.profile,
     appearance: settings.appearance,
     aiSettings: settings.aiSettings,
-    provider: editableProviderConfig(await loadProviderConfig()),
+    provider: editableProviderConfig(primary),
+    providers: poolStatus.channels,
+    primaryProviderId: pool.primaryProviderId,
+    providerScheduler: poolStatus.scheduler,
   }
 }
 
@@ -1186,7 +1796,7 @@ export const server = http.createServer(async (request, response) => {
     response.setHeader('vary', 'origin')
   }
   if (request.method === 'OPTIONS') {
-    response.writeHead(204, { 'access-control-allow-origin': origin || 'http://localhost', 'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS', 'access-control-allow-headers': 'content-type', vary: 'origin' })
+    response.writeHead(204, { 'access-control-allow-origin': origin || 'http://localhost', 'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS', 'access-control-allow-headers': 'content-type', vary: 'origin' })
     response.end()
     return
   }
@@ -1379,8 +1989,66 @@ export const server = http.createServer(async (request, response) => {
     }
     return
   }
-  if (request.url === '/api/ai/status' && request.method === 'GET') {
-    sendJson(response, 200, editableProviderConfig(await loadProviderConfig()))
+  if (requestPath === '/api/ai/status' && request.method === 'GET') {
+    try {
+      sendJson(response, 200, await loadProviderPoolStatus())
+    } catch (error) {
+      sendRequestError(response, error, 'Unable to read AI provider status')
+    }
+    return
+  }
+  // The provider-pool endpoints are intentionally available under both
+  // `/channels` (the UI wording) and `/providers` (the API wording).  Every
+  // mutation returns the complete pool status so clients can redraw channel
+  // capacity and queue state without issuing a second request.
+  const providerCollectionPath = requestPath === '/api/ai/channels' || requestPath === '/api/ai/providers'
+  const providerItemMatch = requestPath.match(/^\/api\/ai\/(?:channels|providers)\/([^/]+)$/)
+  if (providerCollectionPath && request.method === 'GET') {
+    try {
+      sendJson(response, 200, await loadProviderPoolStatus())
+    } catch (error) {
+      sendRequestError(response, error, 'Unable to read AI provider channels')
+    }
+    return
+  }
+  if (providerCollectionPath && request.method === 'POST') {
+    try {
+      const result = await createProviderChannel(await readBody(request))
+      scheduleProviderDispatch()
+      sendJson(response, 201, providerMutationStatus(result, result.channel?.id, result.warning))
+    } catch (error) {
+      sendRequestError(response, error, '模型通道创建失败')
+    }
+    return
+  }
+  if (providerItemMatch && ['POST', 'PUT', 'PATCH'].includes(request.method)) {
+    let channelId
+    try { channelId = decodeURIComponent(providerItemMatch[1]) } catch { channelId = providerItemMatch[1] }
+    try {
+      const payload = await readBody(request)
+      // POST is kept as a convenient action alias for clients that use it to
+      // refresh a channel's model list; PUT/PATCH remain ordinary updates.
+      const update = request.method === 'POST' && payload && typeof payload === 'object'
+        ? { ...payload, ...(payload.action === 'discover-models' || payload.action === 'refresh-models' ? { refreshModels: true } : {}) }
+        : payload
+      const result = await updateProviderChannel(channelId, update)
+      scheduleProviderDispatch()
+      sendJson(response, 200, providerMutationStatus(result, channelId, result.warning))
+    } catch (error) {
+      sendRequestError(response, error, '模型通道更新失败')
+    }
+    return
+  }
+  if (providerItemMatch && request.method === 'DELETE') {
+    let channelId
+    try { channelId = decodeURIComponent(providerItemMatch[1]) } catch { channelId = providerItemMatch[1] }
+    try {
+      const pool = await deleteProviderChannel(channelId)
+      scheduleProviderDispatch()
+      sendJson(response, 200, providerMutationStatus(pool))
+    } catch (error) {
+      sendRequestError(response, error, '模型通道删除失败')
+    }
     return
   }
   if (request.url === '/api/quote' && request.method === 'GET') {
@@ -1424,29 +2092,33 @@ export const server = http.createServer(async (request, response) => {
     }
     return
   }
-  if (request.url === '/api/ai/config' && request.method === 'POST') {
+  if (requestPath === '/api/ai/config' && request.method === 'POST') {
     try {
       const payload = await readBody(request)
       const saved = await saveProviderConfig(payload)
-      sendJson(response, 200, { ...editableProviderConfig(saved.config), warning: saved.warning })
+      scheduleProviderDispatch()
+      const pool = await loadProviderConfigs()
+      sendJson(response, 200, providerMutationStatus(pool, saved.config?.id, saved.warning))
     } catch (error) {
-      sendJson(response, 400, { error: error instanceof Error ? error.message : '模型通道配置失败' })
+      sendRequestError(response, error, '模型通道配置失败')
     }
     return
   }
-  if (request.url === '/api/ai/models' && request.method === 'POST') {
+  if (requestPath === '/api/ai/models' && request.method === 'POST') {
     try {
       sendJson(response, 200, await probeModels(await readBody(request)))
     } catch (error) {
-      sendJson(response, 400, { error: error instanceof Error ? error.message : '模型列表探测失败' })
+      sendRequestError(response, error, '模型列表探测失败')
     }
     return
   }
-  if (request.url === '/api/ai/config' && request.method === 'DELETE') {
+  if (requestPath === '/api/ai/config' && request.method === 'DELETE') {
     try {
-      sendJson(response, 200, editableProviderConfig(await resetProviderConfig()))
+      await resetProviderConfig()
+      scheduleProviderDispatch()
+      sendJson(response, 200, await loadProviderPoolStatus())
     } catch (error) {
-      sendJson(response, 400, { error: error instanceof Error ? error.message : '无法恢复环境配置' })
+      sendRequestError(response, error, '无法恢复环境配置')
     }
     return
   }
@@ -1473,6 +2145,9 @@ export const server = http.createServer(async (request, response) => {
         model: result.model,
         apiMode: result.apiModeUsed,
         candidateCount: Array.isArray(result.candidates) ? result.candidates.length : 0,
+        peopleCount: Array.isArray(result.people) ? result.people.length : 0,
+        peopleIncluded: result.peopleIncluded === true,
+        ...providerDebugFields(result),
         durationMs: Date.now() - startedAt,
       })
       await finishTaskLog(taskLog, 'succeeded', { durationMs: Date.now() - startedAt, response: result })
@@ -1486,12 +2161,15 @@ export const server = http.createServer(async (request, response) => {
         ...segmentDebugFields(conversation),
         status: Number(error?.status) || null,
         retryAfter: Number(error?.retryAfter) || null,
+        ...providerDebugFields(error),
         error: cleanString(error instanceof Error ? error.message : '模型分析失败', 500),
         durationMs: Date.now() - startedAt,
       })
       await finishTaskLog(taskLog, 'failed', {
         durationMs: Date.now() - startedAt,
         status: Number(error?.status) || null,
+        retryAfter: Number(error?.retryAfter) || null,
+        metadata: error?.providerMetadata ? { provider: error.providerMetadata } : undefined,
         error: cleanString(error instanceof Error ? error.message : '模型分析失败', 2_000),
       })
       sendRequestError(response, error, '模型分析失败')
@@ -1520,7 +2198,9 @@ export const server = http.createServer(async (request, response) => {
         recordCount: Array.isArray(payload?.records) ? payload.records.length : 0,
         ...segmentDebugFields(conversation),
         model: result.model,
+        apiMode: result.apiModeUsed,
         peopleCount: Array.isArray(result.people) ? result.people.length : 0,
+        ...providerDebugFields(result),
         durationMs: Date.now() - startedAt,
       })
       await finishTaskLog(taskLog, 'succeeded', { durationMs: Date.now() - startedAt, response: result })
@@ -1533,12 +2213,16 @@ export const server = http.createServer(async (request, response) => {
         recordCount: Array.isArray(payload?.records) ? payload.records.length : 0,
         ...segmentDebugFields(conversation),
         status: Number(error?.status) || null,
+        retryAfter: Number(error?.retryAfter) || null,
+        ...providerDebugFields(error),
         error: cleanString(error instanceof Error ? error.message : '人物模型分析失败', 500),
         durationMs: Date.now() - startedAt,
       })
       await finishTaskLog(taskLog, 'failed', {
         durationMs: Date.now() - startedAt,
         status: Number(error?.status) || null,
+        retryAfter: Number(error?.retryAfter) || null,
+        metadata: error?.providerMetadata ? { provider: error.providerMetadata } : undefined,
         error: cleanString(error instanceof Error ? error.message : '人物模型分析失败', 2_000),
       })
       sendRequestError(response, error, '人物模型分析失败')
@@ -1559,6 +2243,7 @@ export const server = http.createServer(async (request, response) => {
         resultFactCount: result.facts.length,
         model: result.model,
         apiMode: result.apiModeUsed,
+        ...providerDebugFields(result),
         durationMs: Date.now() - startedAt,
       })
       await finishTaskLog(taskLog, 'succeeded', { durationMs: Date.now() - startedAt, response: result })
@@ -1566,12 +2251,16 @@ export const server = http.createServer(async (request, response) => {
     } catch (error) {
       logAiDebug('people_merge_failed', {
         status: Number(error?.status) || null,
+        retryAfter: Number(error?.retryAfter) || null,
+        ...providerDebugFields(error),
         error: cleanString(error instanceof Error ? error.message : '人物信息归并失败', 500),
         durationMs: Date.now() - startedAt,
       })
       await finishTaskLog(taskLog, 'failed', {
         durationMs: Date.now() - startedAt,
         status: Number(error?.status) || null,
+        retryAfter: Number(error?.retryAfter) || null,
+        metadata: error?.providerMetadata ? { provider: error.providerMetadata } : undefined,
         error: cleanString(error instanceof Error ? error.message : '人物信息归并失败', 2_000),
       })
       sendRequestError(response, error, '人物信息归并失败')
@@ -1591,6 +2280,8 @@ export const server = http.createServer(async (request, response) => {
         peopleCount: Array.isArray(payload?.people) ? payload.people.length : 0,
         guidanceCount: result.guidance.length,
         model: result.model,
+        apiMode: result.apiModeUsed,
+        ...providerDebugFields(result),
         durationMs: Date.now() - startedAt,
       })
       await finishTaskLog(taskLog, 'succeeded', { durationMs: Date.now() - startedAt, response: result })
@@ -1598,12 +2289,16 @@ export const server = http.createServer(async (request, response) => {
     } catch (error) {
       logAiDebug('task_guidance_failed', {
         status: Number(error?.status) || null,
+        retryAfter: Number(error?.retryAfter) || null,
+        ...providerDebugFields(error),
         error: cleanString(error instanceof Error ? error.message : 'Task guidance failed', 500),
         durationMs: Date.now() - startedAt,
       })
       await finishTaskLog(taskLog, 'failed', {
         durationMs: Date.now() - startedAt,
         status: Number(error?.status) || null,
+        retryAfter: Number(error?.retryAfter) || null,
+        metadata: error?.providerMetadata ? { provider: error.providerMetadata } : undefined,
         error: cleanString(error instanceof Error ? error.message : 'Task guidance failed', 2_000),
       })
       sendRequestError(response, error, 'Task guidance failed')

@@ -6,6 +6,7 @@ import { sourceProvider } from '../lib/people'
 import { chooseExportDirectory, DIRECTORY_IMPORT_SIGNATURE_VERSION, ensureDirectoryPermission, loadDirectoryHandle, saveDirectoryHandle, scanExportDirectory, supportsDirectorySync, type LocalDirectoryHandle } from '../lib/directorySync'
 import { analyzeIntel, buildDirectConversationFallbackPeople, fileToAttachment, getAiStatus, type AiAttachment, type AiDebugEntry, type AiProgress, type AiStatus } from '../lib/aiClient'
 import { formatQuestTime } from '../lib/questTime'
+import { normalizeAiConcurrency } from '../lib/aiConcurrency'
 
 export interface AnalysisWorkState {
   stage: 'tasks' | 'people'
@@ -21,7 +22,7 @@ interface IntelViewProps {
   candidates: AiTaskCandidate[]
   aiSettings: AiSettings
   onImport: (items: IntelItem[]) => { added: number; updated: number; duplicates: number; archiveMessageCount: number; conversationCount: number }
-  onAiAnalysis: (candidates: AiTaskCandidate[], analyzedIds: string[], settings: AiSettings, summary: Omit<ArchiveAnalysisSummary, 'analyzedAt'>) => void
+  onAiAnalysis: (candidates: AiTaskCandidate[], analyzedIds: string[], settings: AiSettings, summary: Omit<ArchiveAnalysisSummary, 'analyzedAt'>, peopleIncludedConversationIds: string[]) => void
   onDirectPeopleDetected: (people: Person[]) => void
   onCreateAiQuests: (candidates: AiTaskCandidate[]) => number
   onDismissAiCandidates: (ids: string[], reason?: AiFeedbackReason) => void
@@ -116,6 +117,28 @@ function conversationKey(item: IntelItem) {
 function fullConversationRecords(items: IntelItem[], selectedItems: IntelItem[]) {
   const selectedConversationIds = new Set(selectedItems.map(conversationKey))
   return items.filter((item) => selectedConversationIds.has(conversationKey(item)))
+}
+
+function incrementalConversationRecords(items: IntelItem[], newItems: IntelItem[], contextRecords = 16) {
+  const newIds = new Set(newItems.map((item) => item.id))
+  const selectedConversations = new Set(newItems.map(conversationKey))
+  const includedIds = new Set<string>()
+  const grouped = new Map<string, IntelItem[]>()
+  for (const item of items) {
+    const key = conversationKey(item)
+    if (!selectedConversations.has(key)) continue
+    const records = grouped.get(key)
+    if (records) records.push(item)
+    else grouped.set(key, [item])
+  }
+  for (const records of grouped.values()) {
+    records.sort((left, right) => chatTimestamp(left.capturedAt) - chatTimestamp(right.capturedAt))
+    records.forEach((item, index) => {
+      if (!newIds.has(item.id)) return
+      for (let cursor = Math.max(0, index - contextRecords); cursor <= index; cursor += 1) includedIds.add(records[cursor].id)
+    })
+  }
+  return items.filter((item) => includedIds.has(item.id))
 }
 
 function buildConversationTimeline(items: IntelItem[]): ConversationTimeline[] {
@@ -521,6 +544,7 @@ export function IntelView({ items, archive, candidates, aiSettings, onImport, on
   */
   const runAiAnalysis = useCallback(async (automatic = false, retryIds: string[] = []) => {
     if (aiBusyRef.current) return
+    const concurrency = normalizeAiConcurrency(aiSettings.concurrency)
     const automaticMatches = automatic
       ? itemsRef.current.filter((item) => item.status === 'new' && !item.aiAnalyzedAt)
       : []
@@ -530,7 +554,7 @@ export function IntelView({ items, archive, candidates, aiSettings, onImport, on
       : fullConversationRecords(itemsRef.current, retryMatches)
     const source = retryIds.length
       ? retrySource
-      : automatic ? fullConversationRecords(itemsRef.current, automaticMatches) : analysisMessages
+      : automatic ? incrementalConversationRecords(itemsRef.current, automaticMatches) : analysisMessages
     if (!source.length) { setAiMessage('没有符合当前分析范围的记录。'); return }
     // Build local cards before any network call. A 20,000-message private
     // chat can take hundreds of task segments and must not leave People empty.
@@ -541,8 +565,10 @@ export function IntelView({ items, archive, candidates, aiSettings, onImport, on
     setAiBusy(true)
     const selectedConversationCount = retryIds.length ? new Set(retryMatches.map(conversationKey)).size : automatic ? new Set(automaticMatches.map(conversationKey)).size : analysisConversationCount
     const startingMessage = retryIds.length
-      ? `准备重新提交 ${selectedConversationCount} 个失败会话的完整记录，共 ${formatCount(source.length)} 条消息。`
-      : `准备提交 ${selectedConversationCount} 个完整对话，共 ${formatCount(source.length)} 条归档消息。`
+      ? `准备以 ${concurrency} 个并发会话重新提交 ${selectedConversationCount} 个失败会话的完整记录，共 ${formatCount(source.length)} 条消息。`
+      : automatic
+        ? `增量自动更新：以 ${concurrency} 个并发会话提交 ${formatCount(automaticMatches.length)} 条新增消息和 ${formatCount(source.length - automaticMatches.length)} 条前序上下文。`
+        : `准备以 ${concurrency} 个并发会话提交 ${selectedConversationCount} 个完整对话，共 ${formatCount(source.length)} 条归档消息。`
     setAiProgress({ completed: 0, total: 0, candidates: 0 })
     setAiMessage(startingMessage)
     onAnalysisWorkChange({ stage: 'tasks', completed: 0, total: 0, candidates: 0, message: startingMessage })
@@ -555,29 +581,34 @@ export function IntelView({ items, archive, candidates, aiSettings, onImport, on
           : `“${progress.currentConversation ?? '当前会话'}”`
         const progressMessage = progress.retryAttempt
           ? `${segmentLabel} 服务异常，${((progress.retryDelayMs ?? 0) / 1000).toFixed(1)} 秒后进行第 ${progress.retryAttempt}/${progress.retryTotal} 次自动重连。`
-          : `已完成 ${progress.completed}/${progress.total} 个连续片段；完整会话按时间覆盖上传，未做消息抽样。当前 ${segmentLabel}${progress.historicalSegment ? '（历史信息段）' : ''}；得到 ${progress.candidates} 个候选。`
+          : `已完成 ${progress.completed}/${progress.total} 个连续片段；${automatic ? '增量消息附带少量前序上下文' : '完整会话按时间覆盖上传，未做消息抽样'}。当前 ${segmentLabel}${progress.historicalSegment ? '（历史信息段）' : ''}；${concurrency} 个会话并行，得到 ${progress.candidates} 个候选。`
         setAiProgress(progress)
         setAiMessage(progressMessage)
         onAnalysisWorkChange({ stage: 'tasks', completed: progress.completed, total: progress.total, candidates: progress.candidates, message: progressMessage })
-      }, appendDebugLog, { signal: controller.signal })
+      }, appendDebugLog, onDirectPeopleDetected, { signal: controller.signal, concurrency })
       const retryableFailures = result.failedConversations.filter((conversation) => conversation.retryable)
       setRetryConversationIds(retryableFailures.map((conversation) => conversation.id))
-      onAiAnalysis(result.candidates, result.analyzedIds, aiSettings, {
+      const automaticCoreIds = new Set(automaticMatches.map((item) => item.id))
+      const acceptedCandidates = automatic
+        ? result.candidates.filter((candidate) => candidate.sourceIds.some((id) => automaticCoreIds.has(id)))
+        : result.candidates
+      const analyzedIds = automatic ? [...automaticCoreIds] : result.analyzedIds
+      onAiAnalysis(acceptedCandidates, analyzedIds, aiSettings, {
         sourceMessageCount: source.length,
         conversationCount: result.plan.totalConversations,
         processedConversationCount: result.processedConversations,
         requestedConversationCount: result.plan.totalConversations,
-      })
-      setSelectedCandidates(new Set(result.candidates.map((candidate) => candidate.id)))
-      if (result.candidates.length) setOpenSections((current) => ({ ...current, candidates: true }))
-      const progressSummary = [`已处理 ${result.processedSegments}/${result.plan.totalSegments} 个连续片段，完整完成 ${result.processedConversations}/${result.plan.totalConversations} 个对话。范围内共有 ${formatCount(source.length)} 条原始消息；每个会话均按时间分段覆盖上传，未做抽样。`]
+      }, result.peopleIncludedConversationIds)
+      setSelectedCandidates(new Set(acceptedCandidates.map((candidate) => candidate.id)))
+      if (acceptedCandidates.length) setOpenSections((current) => ({ ...current, candidates: true }))
+      const progressSummary = [`已处理 ${result.processedSegments}/${result.plan.totalSegments} 个连续片段，完整完成 ${result.processedConversations}/${result.plan.totalConversations} 个对话。${automatic ? `本轮发送 ${formatCount(automaticMatches.length)} 条新增消息与 ${formatCount(source.length - automaticMatches.length)} 条前序上下文；候选必须引用新增消息。` : `范围内共有 ${formatCount(source.length)} 条原始消息；每个会话均按时间分段覆盖上传，未做抽样。`}`]
       if (result.cancelled) progressSummary.push('已停止本轮提炼；已完成片段的候选已保留在待确认列表。')
       if (result.failedConversations.length) {
         const firstFailure = result.failedConversations[0]
         progressSummary.push(`${result.failedConversations.length} 个会话未完成${retryableFailures.length ? `；其中 ${retryableFailures.length} 个可通过“重试失败会话”再次连接` : ''}。${firstFailure ? `最近错误：${firstFailure.name} · ${firstFailure.message}` : ''}`)
       }
-      if (result.candidates.length) {
-        progressSummary.push(`${result.candidates.length} 个候选已进入审核队列。`)
+      if (acceptedCandidates.length) {
+        progressSummary.push(`${acceptedCandidates.length} 个候选已进入审核队列。`)
       } else if (result.diagnostics.rawCandidates === 0) {
         progressSummary.push(`模型对已请求的 ${result.diagnostics.attemptedConversations} 个片段均返回空候选；这不是前端删除造成的。`)
       } else {
@@ -731,7 +762,7 @@ export function IntelView({ items, archive, candidates, aiSettings, onImport, on
           <div className="archive-stage"><span>模型输入方式</span><strong>完整覆盖分段</strong><small>超长会话按时间连续分段，每段保留少量前序上下文；全部消息都会上传，不做抽样或固定条数截断。</small></div>
         </div>
         <div className="attachment-row"><input ref={attachmentRef} type="file" accept="image/*,.pdf,.json,.csv,.txt" multiple onChange={addAttachments} hidden /><button type="button" className="secondary-button" onClick={() => attachmentRef.current?.click()} disabled={aiBusy}><ImagePlus size={16} />添加图片或文件</button>{attachmentFiles.map((file, index) => <span className="attachment-chip" key={`${file.name}-${index}`}>{file.name}<button type="button" aria-label={`移除 ${file.name}`} onClick={() => setAttachmentFiles((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={13} /></button></span>)}</div>
-        <div className="ai-actions"><button type="button" className="primary-button" onClick={() => void runAiAnalysis()} disabled={aiBusy || !aiStatus?.configured}><Sparkles size={16} />{aiBusy ? '按对话提炼中' : analysisConversationId ? '提炼指定对话' : scope === 'all' ? '提炼全部对话' : '提炼当前范围'}</button>{aiBusy && <button type="button" className="secondary-button ai-stop-button" onClick={stopAiAnalysis}><CircleStop size={15} />停止并保留候选</button>}{retryConversationIds.length > 0 && <button type="button" className="secondary-button" onClick={() => void runAiAnalysis(false, retryConversationIds)} disabled={aiBusy || !aiStatus?.configured}><RefreshCw size={15} />重试失败会话 {retryConversationIds.length}</button>}<span>{formatLastRun(aiSettings.lastRunAt)}{aiProgress && aiBusy && aiProgress.total ? ` · ${aiProgress.completed}/${aiProgress.total} 个片段` : ''}</span></div>
+        <div className="ai-actions"><button type="button" className="primary-button" onClick={() => void runAiAnalysis()} disabled={aiBusy || !aiStatus?.configured}><Sparkles size={16} />{aiBusy ? '按对话提炼中' : analysisConversationId ? '提炼指定对话' : scope === 'all' ? '提炼全部对话' : '提炼当前范围'}</button>{aiBusy && <button type="button" className="secondary-button ai-stop-button" onClick={stopAiAnalysis}><CircleStop size={15} />停止并保留候选</button>}{retryConversationIds.length > 0 && <button type="button" className="secondary-button" onClick={() => void runAiAnalysis(false, retryConversationIds)} disabled={aiBusy || !aiStatus?.configured}><RefreshCw size={15} />重试失败会话 {retryConversationIds.length}</button>}<span>{formatLastRun(aiSettings.lastRunAt)} · {normalizeAiConcurrency(aiSettings.concurrency)} 个会话并行{aiProgress && aiBusy && aiProgress.total ? ` · ${aiProgress.completed}/${aiProgress.total} 个片段` : ''}</span></div>
         {aiMessage && <p className="ai-message" role="status">{aiMessage}</p>}
         </>}
       </section>

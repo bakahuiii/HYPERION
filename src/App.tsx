@@ -25,6 +25,7 @@ import { mapSearchPrecision, mapSearchRadius, searchMapPlaces } from './lib/mapS
 import { archiveSummaryWithAnalysis, archiveSummaryWithImport, summarizeArchive } from './lib/archiveSummary'
 import { fetchTaskWeather } from './lib/weather'
 import { avatarImageUrl } from './lib/mediaProxy'
+import { normalizeAiConcurrency } from './lib/aiConcurrency'
 
 function sourceDetails(items: IntelItem[]) {
   return {
@@ -898,7 +899,7 @@ function App() {
     window.dispatchEvent(new CustomEvent<AiDebugEntry>('theia:ai-debug', { detail: entry }))
   }
 
-  const saveAiAnalysis = (candidates: AiTaskCandidate[], analyzedIds: string[], settings: AiSettings, analysis: Omit<ArchiveAnalysisSummary, 'analyzedAt'>) => {
+  const saveAiAnalysis = (candidates: AiTaskCandidate[], analyzedIds: string[], settings: AiSettings, analysis: Omit<ArchiveAnalysisSummary, 'analyzedAt'>, peopleIncludedConversationIds: string[] = []) => {
     setData((current) => {
       const existing = new Set(current.aiCandidates.map((candidate) => `${candidate.title}|${candidate.description}`))
       const unique = candidates.filter((candidate) => !existing.has(`${candidate.title}|${candidate.description}`))
@@ -919,6 +920,10 @@ function App() {
     const snapshot = dataRef.current
     const coveredConversationIds = new Set([
       ...snapshot.dismissedPersonConversationIds,
+      // The combined direct workflow is complete even when it correctly
+      // returned people: []. Do not upload that full chat again just because
+      // no portrait claim passed the evidence gate.
+      ...peopleIncludedConversationIds,
       ...snapshot.people
       .filter((person) => !isLocalExportVerifiedPerson(person))
       .flatMap((person) => person.conversationIds ?? []),
@@ -945,9 +950,9 @@ function App() {
         completed: progress.completed,
         total: progress.total,
         candidates: progress.candidates,
-        message: `正在提炼人物：${segment}；已保留 ${progress.candidates} 张人物卡。`,
+        message: `正在并行提炼人物（${normalizeAiConcurrency(dataRef.current.aiSettings.concurrency)} 个会话）：${segment}；已保留 ${progress.candidates} 张人物卡。`,
       })
-    }, mergeIncomingPeople, appendPeopleDebug, dataRef.current.aiSettings, { signal: controller.signal, concurrency: 2 }).then(() => {
+    }, mergeIncomingPeople, appendPeopleDebug, dataRef.current.aiSettings, { signal: controller.signal, concurrency: normalizeAiConcurrency(dataRef.current.aiSettings.concurrency) }).then(() => {
       window.setTimeout(() => consolidatePeopleIfNeeded(), 0)
     }).catch(() => {
       // A failed person pass does not invalidate the task candidates already produced.

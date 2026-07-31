@@ -175,6 +175,8 @@ export interface AiSettings {
   autoEnabled: boolean
   intervalHours: number
   recencyPolicy: AiRecencyPolicy
+  /** Maximum number of independent conversation requests in flight. */
+  concurrency?: number
   feedback: AiTaskFeedback[]
   /** User-editable instructions for each model workflow. Evidence guards remain server-enforced. */
   promptInstructions: AiPromptInstructions

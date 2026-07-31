@@ -5,7 +5,20 @@ import reactRefresh from 'eslint-plugin-react-refresh'
 import tseslint from 'typescript-eslint'
 
 export default tseslint.config(
-  { ignores: ['dist'] },
+  {
+    // Runtime data can contain tens of thousands of JSON/log/image files. It
+    // is not source code and must never make `npm run lint` traverse the data
+    // directory, desktop cache, release smoke fixtures, or build output.
+    ignores: [
+      'dist/**',
+      'node_modules/**',
+      '.theia-*/**',
+      '.exe-*/**',
+      'release/**',
+      'release-bin/**',
+      '.npm-cache/**',
+    ],
+  },
   {
     extends: [js.configs.recommended, ...tseslint.configs.recommended],
     files: ['**/*.{ts,tsx}'],

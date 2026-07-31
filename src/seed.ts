@@ -182,6 +182,7 @@ export const seedData: AppData = {
     autoEnabled: false,
     intervalHours: 24,
     recencyPolicy: 'balanced',
+    concurrency: 4,
     feedback: [],
     promptInstructions: {
       task: '优先保留仍需你处理、具体可执行的安排。约见、返校、报名、缴费、回复、预约和截止事项优先；闲聊、历史通知和已过期事项不输出。',

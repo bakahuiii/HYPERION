@@ -1,6 +1,7 @@
 import type { AiSettings, AiTaskCandidate, IntelItem, Person, Place, Quest } from '../types'
 import { buildConversationAnalysisPlan } from './conversationAnalysis'
 import { apiUrl } from './apiUrl'
+import { normalizeAiConcurrency } from './aiConcurrency'
 
 export interface AiAttachment {
   name: string
@@ -18,15 +19,81 @@ export interface AiStatus {
   keyHint: string
   source: 'settings-ini' | 'local-file' | 'environment'
   models: string[]
+  id?: string
+  name?: string
+  enabled?: boolean
+  maxConcurrency?: number
+  configurationError?: string
+  primaryProviderId?: string
+  channels?: AiProviderChannel[]
+  configuredChannelCount?: number
+  totalMaxConcurrency?: number
+  scheduler?: AiProviderScheduler
   warning?: string
+}
+
+export interface AiProviderRuntime {
+  status: 'ready' | 'disabled' | 'invalid' | 'unconfigured' | 'cooling-down' | 'at-capacity' | string
+  healthy: boolean
+  activeRequests: number
+  availableSlots: number
+  cooldownUntil: string | null
+  cooldownRemainingMs: number
+  successfulRequests: number
+  failedRequests: number
+  consecutiveFailures: number
+  lastSelectedAt: string | null
+  lastCompletedAt: string | null
+  lastErrorAt: string | null
+  lastErrorStatus: number | null
+  lastErrorCode: string | null
+}
+
+export interface AiProviderChannel {
+  id: string
+  name: string
+  enabled: boolean
+  configured: boolean
+  key: string
+  model: string
+  apiMode: AiStatus['apiMode']
+  baseUrl: string
+  provider: string
+  keyHint: string
+  source?: AiStatus['source']
+  models: string[]
+  maxConcurrency: number
+  configurationError?: string
+  runtime?: AiProviderRuntime
+}
+
+export interface AiProviderScheduler {
+  queueDepth: number
+  activeRequests: number
+  availableCapacity: number
+  totalMaxConcurrency: number
+  coolingDownChannelCount: number
 }
 
 export interface AiProviderInput {
   _type?: 'newapi_channel_conn'
   key?: string
-  url: string
+  apiKey?: string
+  url?: string
+  baseURL?: string
+  id?: string
+  name?: string
+  enabled?: boolean
+  maxConcurrency?: number
+  primary?: boolean
   model?: string
   apiMode?: AiStatus['apiMode']
+  models?: string[]
+}
+
+export interface AiChannelMutationResult extends AiStatus {
+  pool?: AiStatus
+  channel?: AiProviderChannel
 }
 
 export interface AiModelsResult {
@@ -72,6 +139,10 @@ export interface AiProgress {
   currentSegment?: number
   totalSegmentsInConversation?: number
   historicalSegment?: boolean
+  /** Number of requests currently in flight across independent conversations. */
+  activeWorkers?: number
+  /** Effective concurrency after clamping to the selected conversation count. */
+  concurrency?: number
 }
 
 export interface AiFailedConversation {
@@ -97,6 +168,8 @@ export interface AiDebugEntry {
   status?: number
   candidateCount?: number
   acceptedCandidateCount?: number
+  peopleCount?: number
+  peopleIncluded?: boolean
   segmentIndex?: number
   segmentCount?: number
   coreRecordCount?: number
@@ -120,6 +193,10 @@ export interface AiAnalysisDiagnostics {
 }
 
 const MAX_SERVICE_ATTEMPTS = 5
+function analysisConcurrency(value: number | undefined, availableQueues: number) {
+  const requested = normalizeAiConcurrency(value)
+  return Math.min(requested, Math.max(1, availableQueues))
+}
 
 function abortError() {
   const error = new Error('提炼已停止')
@@ -206,6 +283,20 @@ export async function getAiStatus() {
 
 export async function saveAiProvider(config: AiProviderInput) {
   return requestJson<AiStatus>('/api/ai/config', { method: 'POST', body: config })
+}
+
+/** Adds a second (or later) independent API channel to the local provider pool. */
+export async function createAiProviderChannel(config: AiProviderInput) {
+  return requestJson<AiChannelMutationResult>('/api/ai/channels', { method: 'POST', body: config })
+}
+
+/** Updates one channel without exposing credentials to the renderer console. */
+export async function updateAiProviderChannel(id: string, config: AiProviderInput) {
+  return requestJson<AiChannelMutationResult>(`/api/ai/channels/${encodeURIComponent(id)}`, { method: 'POST', body: config })
+}
+
+export async function deleteAiProviderChannel(id: string) {
+  return requestJson<AiStatus>(`/api/ai/channels/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
 export async function discoverAiModels(config: AiProviderInput) {
@@ -528,11 +619,18 @@ export async function analyzeIntelLegacy(
           mode: settings.mode,
           instructions: settings.instructions,
           recencyPolicy: settings.recencyPolicy ?? 'balanced',
-          promptInstructions: settings.promptInstructions,
-          feedback: (settings.feedback ?? []).slice(-30).map((item) => ({ title: item.title, description: item.description, decision: item.decision, reason: item.reason, sourceCapturedAt: item.sourceCapturedAt })),
+          promptInstructions: { task: settings.promptInstructions.task },
+          feedback: (settings.feedback ?? []).slice(-8).map((item) => ({ title: item.title, description: item.description, decision: item.decision, reason: item.reason, sourceCapturedAt: item.sourceCapturedAt })),
         },
       }
-      const payload = await requestWithRetry<{ model: string; candidates: unknown[]; apiModeUsed?: string; receivedRecordCount?: number }>('/api/ai/analyze', requestPayload, (notice) => {
+      const payload = await requestWithRetry<{
+        model: string
+        candidates: unknown[]
+        people?: unknown[]
+        peopleIncluded?: boolean
+        apiModeUsed?: string
+        receivedRecordCount?: number
+      }>('/api/ai/analyze', requestPayload, (notice) => {
         log('conversation_retry_scheduled', 'warn', { conversationId: conversation.id, conversationName: conversation.name, recordCount: conversation.records.length, attempt: notice.attempt, attemptTotal: notice.total, retryDelayMs: notice.delayMs, message: `${Math.ceil(notice.delayMs / 1000)} 秒后自动重连` })
         onProgress?.({ completed: index, total: plan.jobs.length, candidates: candidates.length, recordCount: plan.recordCount, failedConversations: failedConversations.length, skippedUnverifiedConversations, currentConversation: conversation.name, retryAttempt: notice.attempt, retryTotal: notice.total, retryDelayMs: notice.delayMs })
       })
@@ -635,14 +733,22 @@ export async function analyzeIntel(
   settings: AiSettings,
   onProgress?: (progress: AiProgress) => void,
   onLog?: (entry: AiDebugEntry) => void,
-  options?: { signal?: AbortSignal },
+  onPeople?: (people: Person[]) => void,
+  options?: { signal?: AbortSignal; concurrency?: number },
 ) {
   const candidates: AiTaskCandidate[] = []
+  const people: Person[] = []
   const seen = new Set<string>()
   const plan = buildConversationAnalysisPlan(items)
+  const candidateBatches = new Map<number, AiTaskCandidate[]>()
+  const peopleBatches = new Map<number, Person[]>()
+  const modelsBySegment = new Map<number, string>()
   const successfulSegments = new Map<string, Set<number>>()
+  const peopleIncludedSegments = new Map<string, Set<number>>()
+  const directConversationIds = new Set<string>()
   const allRecordIds = new Map<string, Set<string>>()
   const segmentCounts = new Map<string, number>()
+  const conversationRecords = new Map<string, IntelItem[]>()
   const failures = new Map<string, AiFailedConversation>()
   const diagnostics: AiAnalysisDiagnostics = {
     attemptedConversations: 0,
@@ -660,22 +766,53 @@ export async function analyzeIntel(
   }
   for (const job of plan.jobs) {
     segmentCounts.set(job.id, job.segmentCount)
+    if (job.kind === 'direct') directConversationIds.add(job.id)
     const recordIds = allRecordIds.get(job.id) ?? new Set<string>()
     job.coreRecordIds.forEach((id) => recordIds.add(id))
     allRecordIds.set(job.id, recordIds)
   }
+  for (const item of items) {
+    if (item.conversationKind !== 'direct' || !item.conversationId) continue
+    const records = conversationRecords.get(item.conversationId)
+    if (records) records.push(item)
+    else conversationRecords.set(item.conversationId, [item])
+  }
 
   log('run_started', 'info', {
     recordCount: items.length,
-    message: `将 ${plan.totalConversations} 个对话拆为 ${plan.totalSegments} 个连续片段；所有消息均会上传。`,
+    message: `将 ${plan.totalConversations} 个对话拆为 ${plan.totalSegments} 个连续片段；所有消息均会上传。不同对话最多并发 ${analysisConcurrency(settings.concurrency, plan.totalConversations)} 个，同一对话按时间顺序处理。`,
   })
-  let model = 'unknown'
+  const segmentsByConversation = new Map<string, Array<{ segment: typeof plan.jobs[number]; index: number }>>()
+  plan.jobs.forEach((segment, index) => {
+    const queue = segmentsByConversation.get(segment.id)
+    if (queue) queue.push({ segment, index })
+    else segmentsByConversation.set(segment.id, [{ segment, index }])
+  })
+  // A conversation owns one queue: workers parallelize conversations, never
+  // segments that depend on the same timeline.
+  const conversationQueues = [...segmentsByConversation.values()]
+    .map((queue) => queue.sort((left, right) =>
+      left.segment.segmentIndex - right.segment.segmentIndex || left.index - right.index))
+    // Start the heaviest conversations first so a single long export does not
+    // remain on the critical path after all short conversations finish.
+    .sort((left, right) => {
+      const leftWeight = left.reduce((total, entry) => total + entry.segment.recordCount, 0)
+      const rightWeight = right.reduce((total, entry) => total + entry.segment.recordCount, 0)
+      return rightWeight - leftWeight || right.length - left.length || (left[0]?.index ?? 0) - (right[0]?.index ?? 0)
+    })
+  const concurrency = analysisConcurrency(options?.concurrency ?? settings.concurrency, conversationQueues.length)
+  // Attachments are global context, so include them in one deterministic
+  // segment only; concurrent workers must never duplicate the upload.
+  const attachmentOwnerIndex = attachments.length ? 0 : -1
+  const progressCandidateKeys = new Set<string>()
   let processedSegments = 0
-  let attachmentsSent = false
   let cancelled = false
+  let activeWorkers = 0
 
-  for (const [index, segment] of plan.jobs.entries()) {
-    if (options?.signal?.aborted) { cancelled = true; break }
+  const processSegment = async (segment: typeof plan.jobs[number], index: number) => {
+    if (options?.signal?.aborted) { cancelled = true; return false }
+    activeWorkers += 1
+    const acceptedCandidates: AiTaskCandidate[] = []
     const sourceById = new Map(segment.records.map((item) => [item.id, item]))
     const coreIds = new Set(segment.coreRecordIds)
     const coreRecordIndexes = segment.records
@@ -685,13 +822,15 @@ export async function analyzeIntel(
       onProgress?.({
         completed: processedSegments,
         total: plan.totalSegments,
-        candidates: candidates.length,
+        candidates: progressCandidateKeys.size,
         recordCount: plan.recordCount,
         failedConversations: failures.size,
         currentConversation: segment.name,
         currentSegment: segment.segmentIndex,
         totalSegmentsInConversation: segment.segmentCount,
         historicalSegment: segment.historical,
+        activeWorkers,
+        concurrency,
         retryAttempt: retry?.attempt,
         retryTotal: retry?.total,
         retryDelayMs: retry?.delayMs,
@@ -724,6 +863,12 @@ export async function analyzeIntel(
           coreRecordIndexes,
           historical: segment.historical,
         },
+        workflows: {
+          tasks: true,
+          // Private conversations can yield a person card from the exact same
+          // evidence request. Group conversations remain task-only.
+          people: segment.kind === 'direct',
+        },
         records: segment.records.map((item) => ({
           id: item.id,
           formattedTime: item.capturedAt || null,
@@ -732,13 +877,16 @@ export async function analyzeIntel(
           senderDisplayName: item.speaker ?? null,
           speakerRole: item.speakerRole ?? 'unknown',
         })),
-        attachments: attachmentsSent ? [] : attachments,
+        // A fixed owner avoids every concurrent worker uploading the same files.
+        attachments: index === attachmentOwnerIndex ? attachments : [],
         settings: {
           mode: settings.mode,
           instructions: settings.instructions,
           recencyPolicy: settings.recencyPolicy ?? 'balanced',
-          promptInstructions: settings.promptInstructions,
-          feedback: (settings.feedback ?? []).slice(-30).map((item) => ({
+          promptInstructions: segment.kind === 'direct'
+            ? { task: settings.promptInstructions.task, people: settings.promptInstructions.people }
+            : { task: settings.promptInstructions.task },
+          feedback: (settings.feedback ?? []).slice(-8).map((item) => ({
             title: item.title,
             description: item.description,
             decision: item.decision,
@@ -747,7 +895,14 @@ export async function analyzeIntel(
           })),
         },
       }
-      const payload = await requestWithRetry<{ model: string; candidates: unknown[]; apiModeUsed?: string; receivedRecordCount?: number }>('/api/ai/analyze', requestPayload, (notice) => {
+      const payload = await requestWithRetry<{
+        model: string
+        candidates: unknown[]
+        people?: unknown[]
+        peopleIncluded?: boolean
+        apiModeUsed?: string
+        receivedRecordCount?: number
+      }>('/api/ai/analyze', requestPayload, (notice) => {
         log('conversation_retry_scheduled', 'warn', {
           conversationId: segment.id,
           conversationName: segment.name,
@@ -764,10 +919,8 @@ export async function analyzeIntel(
       if (payload.receivedRecordCount !== segment.recordCount) {
         throw new Error(`会话“${segment.name}”第 ${segment.segmentIndex}/${segment.segmentCount} 段上传校验失败：本机准备 ${segment.recordCount} 条，服务收到 ${payload.receivedRecordCount ?? 0} 条。`)
       }
-      attachmentsSent = true
-      model = payload.model
+      modelsBySegment.set(index, payload.model)
       const modelCandidates = Array.isArray(payload.candidates) ? payload.candidates : []
-      const acceptedBefore = candidates.length
       diagnostics.rawCandidates += modelCandidates.length
       if (!modelCandidates.length) diagnostics.emptyModelResponses += 1
       modelCandidates.forEach((value, candidateIndex) => {
@@ -786,7 +939,7 @@ export async function analyzeIntel(
           return
         }
         const hasTemporalAnchor = evidence.some((item) => hasMessageTimestamp(item) || hasAbsoluteCalendarDate(item))
-        const candidate = normalizeCandidate(raw, model, index * 1_000 + candidateIndex, hasTemporalAnchor, latestEvidenceTime(evidence))
+        const candidate = normalizeCandidate(raw, payload.model, index * 1_000 + candidateIndex, hasTemporalAnchor, latestEvidenceTime(evidence))
         if (!candidate) {
           diagnostics.rejectedInvalid += 1
           return
@@ -806,14 +959,58 @@ export async function analyzeIntel(
           diagnostics.rejectedDirection += 1
           return
         }
-        const key = `${candidate.title.replace(/\s+/g, '').toLowerCase()}|${candidate.description.replace(/\s+/g, '').toLowerCase()}`
-        if (seen.has(key)) {
-          diagnostics.rejectedDuplicate += 1
-          return
-        }
-        seen.add(key)
-        candidates.push(candidate)
+        acceptedCandidates.push(candidate)
       })
+      candidateBatches.set(index, acceptedCandidates)
+      acceptedCandidates.forEach((candidate) => {
+        progressCandidateKeys.add(`${candidate.title.replace(/\s+/g, '').toLowerCase()}|${candidate.description.replace(/\s+/g, '').toLowerCase()}`)
+      })
+      const acceptedPeople: Person[] = []
+      if (segment.kind === 'direct' && payload.peopleIncluded === true) {
+        const included = peopleIncludedSegments.get(segment.id) ?? new Set<number>()
+        included.add(segment.segmentIndex)
+        peopleIncludedSegments.set(segment.id, included)
+        const allConversationRecords = conversationRecords.get(segment.id) ?? segment.records
+        const allowedIds = new Set(segment.records.map((item) => item.id))
+        const allowedPlatforms = new Set(segment.records.map((item) => item.source))
+        const modelPeople = Array.isArray(payload.people) ? payload.people : []
+        modelPeople.forEach((value, personIndex) => {
+          const person = normalizePerson(value as Partial<Person>, payload.model, index * 1_000 + personIndex, allowedIds, allowedPlatforms, sourceById)
+          // A preceding overlap is context only. A new card claim must anchor
+          // itself in this segment's new timeline range.
+          if (!person || !person.sourceIds.some((id) => coreIds.has(id))) return
+          const fullCounterpartRecords = counterpartRecords(allConversationRecords, person.name)
+          const chronologicalCounterpartRecords = [...fullCounterpartRecords].sort((left, right) => {
+            const leftTime = new Date(left.capturedAt).getTime()
+            const rightTime = new Date(right.capturedAt).getTime()
+            if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) return leftTime - rightTime
+            if (Number.isFinite(leftTime)) return -1
+            if (Number.isFinite(rightTime)) return 1
+            return left.capturedAt.localeCompare(right.capturedAt)
+          })
+          acceptedPeople.push({
+            ...person,
+            avatarUrl: fullCounterpartRecords.find((item) => item.avatarUrl)?.avatarUrl ?? person.avatarUrl,
+            sourceIds: [...new Set([
+              ...person.sourceIds,
+              chronologicalCounterpartRecords[0]?.id,
+              chronologicalCounterpartRecords.at(-1)?.id,
+            ].filter((id): id is string => Boolean(id)))].slice(0, 60),
+            conversationIds: [...new Set([
+              ...(person.conversationIds ?? []),
+              ...fullCounterpartRecords.map((item) => item.conversationId).filter((id): id is string => Boolean(id)),
+            ])].slice(0, 30),
+            firstObservedAt: observedTime(fullCounterpartRecords) ?? person.firstObservedAt,
+            lastObservedAt: observedTime(fullCounterpartRecords, true) ?? person.lastObservedAt,
+            platforms: [...new Set([
+              ...person.platforms,
+              ...fullCounterpartRecords.map((item) => item.source),
+            ])],
+          })
+        })
+        peopleBatches.set(index, acceptedPeople)
+        if (acceptedPeople.length) onPeople?.(acceptedPeople)
+      }
       const completed = successfulSegments.get(segment.id) ?? new Set<number>()
       completed.add(segment.segmentIndex)
       successfulSegments.set(segment.id, completed)
@@ -827,14 +1024,16 @@ export async function analyzeIntel(
         overlapRecordCount: segment.overlapRecordCount,
         historical: segment.historical,
         candidateCount: modelCandidates.length,
-        acceptedCandidateCount: candidates.length - acceptedBefore,
+        acceptedCandidateCount: acceptedCandidates.length,
+        peopleCount: acceptedPeople.length,
+        peopleIncluded: segment.kind === 'direct' && payload.peopleIncluded === true,
         message: `模型 ${payload.model}${payload.apiModeUsed ? ` · ${payload.apiModeUsed}` : ''}`,
       })
     } catch (error) {
       if (wasAborted(error) || options?.signal?.aborted) {
         cancelled = true
         log('run_cancelled', 'warn', { conversationId: segment.id, conversationName: segment.name, recordCount: segment.recordCount, segmentIndex: segment.segmentIndex, segmentCount: segment.segmentCount, message: '用户停止了本轮提炼；已完成片段的候选将保留。' })
-        break
+        return false
       }
       const canRetry = retryable(error)
       const message = (error instanceof Error ? error.message : '模型请求失败').slice(0, 280)
@@ -859,17 +1058,58 @@ export async function analyzeIntel(
         status: Number((error as { status?: number })?.status) || undefined,
         message,
       })
+    } finally {
+      activeWorkers = Math.max(0, activeWorkers - 1)
     }
-    processedSegments = index + 1
+    processedSegments += 1
     progress()
+    return true
   }
 
+  let nextConversationIndex = 0
+  const worker = async () => {
+    while (nextConversationIndex < conversationQueues.length) {
+      if (options?.signal?.aborted) { cancelled = true; return }
+      const queue = conversationQueues[nextConversationIndex]
+      nextConversationIndex += 1
+      for (const { segment, index } of queue) {
+        if (!await processSegment(segment, index)) return
+      }
+    }
+  }
+  onProgress?.({ completed: 0, total: plan.totalSegments, candidates: 0, recordCount: plan.recordCount, activeWorkers: 0, concurrency })
+  await Promise.all(Array.from({ length: concurrency }, () => worker()))
+
+  // Requests may finish in any order. Reduce in the original plan order so
+  // deduplication and the returned candidate order remain reproducible.
+  for (let index = 0; index < plan.jobs.length; index += 1) {
+    for (const candidate of candidateBatches.get(index) ?? []) {
+      const key = `${candidate.title.replace(/\s+/g, '').toLowerCase()}|${candidate.description.replace(/\s+/g, '').toLowerCase()}`
+      if (seen.has(key)) {
+        diagnostics.rejectedDuplicate += 1
+        continue
+      }
+      seen.add(key)
+      candidates.push(candidate)
+    }
+    for (const person of peopleBatches.get(index) ?? []) {
+      mergePersonResult(people, person)
+    }
+  }
+  const model = [...modelsBySegment.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, value]) => value)[0] ?? 'unknown'
+
   const analyzedIds: string[] = []
+  const peopleIncludedConversationIds: string[] = []
   let processedConversations = 0
   for (const [conversationId, segmentCount] of segmentCounts) {
     if (successfulSegments.get(conversationId)?.size !== segmentCount) continue
     processedConversations += 1
     analyzedIds.push(...allRecordIds.get(conversationId) ?? [])
+    if (directConversationIds.has(conversationId) && peopleIncludedSegments.get(conversationId)?.size === segmentCount) {
+      peopleIncludedConversationIds.push(conversationId)
+    }
   }
   const failedConversations = [...failures.values()]
   log('run_completed', cancelled || failedConversations.length ? 'warn' : 'info', {
@@ -880,6 +1120,8 @@ export async function analyzeIntel(
   })
   return {
     candidates,
+    people,
+    peopleIncludedConversationIds,
     analyzedIds,
     model,
     plan,
@@ -1140,7 +1382,7 @@ export async function analyzePeople(
 
   log('people_run_started', 'info', {
     recordCount: items.length,
-    message: `人物处理收到 ${items.length} 条记录；可处理私聊片段 ${directSegments.length} 个，对应完整私聊 ${recordsByConversation.size} 个。不同私聊最多并发 ${Math.min(2, Math.max(1, Math.floor(options?.concurrency ?? 2)))} 个，同一私聊保持时间顺序。`,
+    message: `人物处理收到 ${items.length} 条记录；可处理私聊片段 ${directSegments.length} 个，对应完整私聊 ${recordsByConversation.size} 个。不同私聊最多并发 ${analysisConcurrency(options?.concurrency, recordsByConversation.size)} 个，同一私聊保持时间顺序。`,
   })
   if (!directSegments.length) {
     log('people_run_no_direct_conversation', 'warn', {
@@ -1156,13 +1398,22 @@ export async function analyzePeople(
     else segmentsByConversation.set(segment.id, [{ segment, offset }])
   })
   const conversationQueues = [...segmentsByConversation.values()]
-  const concurrency = Math.min(2, Math.max(1, Math.floor(options?.concurrency ?? 2)), conversationQueues.length || 1)
+    .map((queue) => queue.sort((left, right) =>
+      left.segment.segmentIndex - right.segment.segmentIndex || left.offset - right.offset))
+    .sort((left, right) => {
+      const leftWeight = left.reduce((total, entry) => total + entry.segment.recordCount, 0)
+      const rightWeight = right.reduce((total, entry) => total + entry.segment.recordCount, 0)
+      return rightWeight - leftWeight || right.length - left.length || (left[0]?.offset ?? 0) - (right[0]?.offset ?? 0)
+    })
+  const concurrency = analysisConcurrency(options?.concurrency, conversationQueues.length)
   let completedSegments = 0
+  let activeWorkers = 0
 
-  onProgress?.({ completed: 0, total: directSegments.length, candidates: 0, currentConversation: conversationQueues[0]?.[0]?.segment.name })
+  onProgress?.({ completed: 0, total: directSegments.length, candidates: 0, currentConversation: conversationQueues[0]?.[0]?.segment.name, activeWorkers: 0, concurrency })
 
   const processSegment = async (segment: typeof directSegments[number], offset: number) => {
     throwIfAborted(options?.signal)
+    activeWorkers += 1
     const additions: Person[] = []
     const sourceById = new Map(segment.records.map((item) => [item.id, item]))
     const coreIds = new Set(segment.coreRecordIds)
@@ -1272,6 +1523,8 @@ export async function analyzePeople(
         status: Number((error as { status?: number })?.status) || undefined,
         message: (error instanceof Error ? error.message : '人物模型请求失败').slice(0, 280),
       })
+    } finally {
+      activeWorkers = Math.max(0, activeWorkers - 1)
     }
     throwIfAborted(options?.signal)
     if (additions.length) onPeople?.(additions)
@@ -1285,6 +1538,8 @@ export async function analyzePeople(
       currentSegment: segment.segmentIndex,
       totalSegmentsInConversation: segment.segmentCount,
       historicalSegment: segment.historical,
+      activeWorkers,
+      concurrency,
     })
   }
 
