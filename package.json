@@ -18,7 +18,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "dist:exe": "npm run build && node release-tools/package-portable-exe.mjs"
+    "dist:exe": "npm run build && node release-tools/package-portable-exe.mjs",
+    "release:index": "node release-tools/update-release-index.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",

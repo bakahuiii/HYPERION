@@ -520,7 +520,7 @@ node --check electron/main.mjs
 ### 18.2 打包器
 
 ```powershell
-node release-tools/package-release.mjs G:\work\THEIA-release-0.1.0
+node release-tools/package-release.mjs ..\staging\v0.1.2\THEIA-release-0.1.2
 ```
 
 打包器要求目标在源码目录之外且不存在，避免误覆盖。它复制必要源码、锁文件、发布文档、默认资源和虚构示例，并生成 `RELEASE_MANIFEST.json`。明确排除：

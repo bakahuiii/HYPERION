@@ -4,7 +4,7 @@ THEIA 是一个本地优先的个人现实任务图工具。它把你主动导�
 
 它不是聊天软件插件，也不会绕过登录或解密应用数据库。THEIA 只读取你明确选择的导出文件；只有在你启动模型提炼后，选中的记录才会发送到你配置的模型服务。
 
-> 当前版本：`0.1.0`，源码预览版。已经具备完整的本地运行、桌面壳、聊天导入、模型候选、人物卡、任务图、行程、地图和分层持久化能力；尚未提供签名安装包、自动更新器和稳定的数据迁移承诺。重要数据请定期备份。
+> 当前版本：`0.1.1`，提供源码与 Windows x64 便携版。便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js；任务、设置、聊天归档和日志保存在 `%APPDATA%\\THEIA`。重要数据请定期备份。
 
 ## 界面预览
 
@@ -163,11 +163,14 @@ THEIA-release/
 | `npm run preview` | 预览 Vite 构建产物；涉及 API 的功能仍需本地服务 |
 | `npm run dev:release` | 在发布布局中启动浏览器版 |
 | `npm run desktop:release` | 在发布布局中启动桌面版 |
+| `npm run release:index` | 扫描工作根目录中的版本产物，更新发布索引与 SHA-256 清单 |
 
 发布工具：
 
 ```powershell
-node release-tools/package-release.mjs G:\work\THEIA-release-new
+node release-tools/package-release.mjs ..\staging\v0.1.2\THEIA-release-0.1.2
+npm run dist:exe -- ..\staging\v0.1.2\THEIA-0.1.2-portable
+npm run release:index
 ```
 
 打包器拒绝覆盖已有目录，也不会复制聊天、设置、密钥、日志、头像缓存、背景历史、浏览器资料、`node_modules`、`dist` 或 Git 元数据。
@@ -179,6 +182,7 @@ node release-tools/package-release.mjs G:\work\THEIA-release-new
 - [聊天导出格式](docs/CHAT_EXPORT_FORMAT.md)：推荐 JSON/CSV/TXT 字段、目录结构、发言方向和头像规则。
 - [故障排查](docs/TROUBLESHOOTING.md)：启动、端口、GPU、导入、0 候选、502/403、地图和数据恢复。
 - [隐私与数据](docs/PRIVACY_AND_DATA.md)：文件敏感等级、模型传输、备份、迁移和问题报告脱敏。
+- [版本管理](docs/VERSIONING.md)：工作目录布局、语义化版本、发布步骤、校验、标签和回滚规范。
 
 ## 重要边界
 

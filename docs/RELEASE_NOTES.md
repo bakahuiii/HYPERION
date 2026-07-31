@@ -1,5 +1,12 @@
 # Release Notes
 
+## 0.1.1 Windows portable package
+
+- 提供 Windows x64 便携版，解压后运行 `THEIA.exe`，无需安装 Node.js 或 npm。
+- 内置本地 API 服务和静态资源加载，桌面包可在独立目录中直接启动。
+- 运行数据统一写入 `%APPDATA%\\THEIA`，发布包不携带开发机的聊天记录、设置、密钥、缓存或日志。
+- 提供 ZIP 分发包与 SHA-256 校验文件。
+
 ## 0.1.0 source release
 
 - 提供 Windows 桌面版和浏览器版源码启动器，桌面模式默认启用 Chromium GPU 加速。
