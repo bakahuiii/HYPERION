@@ -5,6 +5,7 @@ import 'leaflet/dist/leaflet.css'
 import type { Place, Quest } from '../types'
 import { apiUrl } from '../lib/apiUrl'
 import { mapSearchPrecision, mapSearchRadius, searchMapPlaces, type MapSearchResult } from '../lib/mapSearch'
+import { currentMapConfig, loadMapConfig, MAP_CONFIG_CHANGED_EVENT, type MapConfig } from '../lib/mapConfig'
 
 interface MapViewProps {
   places: Place[]
@@ -183,6 +184,7 @@ function PlaceDraftEditor({ draft, onCancel, onSave }: { draft: PlaceDraft; onCa
 export function MapView({ places, quests, selectedPlaceId, onSelect, onUpdatePlace, onCreatePlace, onDeletePlace }: MapViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
+  const tileLayerRef = useRef<L.TileLayer | null>(null)
   const markerLayerRef = useRef<L.LayerGroup | null>(null)
   const fittedRef = useRef(false)
   const invalidateFrameRef = useRef(0)
@@ -218,10 +220,16 @@ export function MapView({ places, quests, selectedPlaceId, onSelect, onUpdatePla
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return
     const map = L.map(containerRef.current, { zoomControl: false, attributionControl: true, preferCanvas: true }).setView([31.2304, 121.4737], 12)
-    L.tileLayer(apiUrl('/api/map/tiles/{z}/{x}/{y}.png'), {
-      attribution: '&copy; OpenStreetMap contributors, Humanitarian OpenStreetMap Team',
-      maxZoom: 19,
-    }).addTo(map)
+    const applyMapConfig = (config: MapConfig) => {
+      tileLayerRef.current?.removeFrom(map)
+      const endpoint = `${apiUrl('/api/map/tiles/{z}/{x}/{y}.png')}?provider=${encodeURIComponent(config.tileProvider)}&cacheMaxMb=${config.cacheMaxMb}`
+      tileLayerRef.current = L.tileLayer(endpoint, { attribution: config.attribution, maxZoom: 19 }).addTo(map)
+    }
+    applyMapConfig(currentMapConfig())
+    let active = true
+    void loadMapConfig().then((config) => { if (active) applyMapConfig(config) })
+    const handleMapConfig = (event: Event) => applyMapConfig((event as CustomEvent<MapConfig>).detail)
+    window.addEventListener(MAP_CONFIG_CHANGED_EVENT, handleMapConfig)
     L.control.zoom({ position: 'bottomright' }).addTo(map)
     markerLayerRef.current = L.layerGroup().addTo(map)
     mapRef.current = map
@@ -230,11 +238,14 @@ export function MapView({ places, quests, selectedPlaceId, onSelect, onUpdatePla
       if (mapRef.current === map) map.invalidateSize({ pan: false })
     })
     return () => {
+      active = false
+      window.removeEventListener(MAP_CONFIG_CHANGED_EVENT, handleMapConfig)
       if (invalidateFrameRef.current) window.cancelAnimationFrame(invalidateFrameRef.current)
       invalidateFrameRef.current = 0
       searchControllerRef.current?.abort()
       map.remove()
       mapRef.current = null
+      tileLayerRef.current = null
       markerLayerRef.current = null
     }
   }, [])

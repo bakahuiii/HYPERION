@@ -29,6 +29,17 @@ function sameValue(left: unknown, right: unknown) {
   return JSON.stringify(left) === JSON.stringify(right)
 }
 
+export function sharedDataEqual(left: SharedData, right: SharedData) {
+  return sameValue(left.quests, right.quests)
+    && sameValue(left.places, right.places)
+    && sameValue(left.people, right.people)
+    && sameValue(left.aiCandidates, right.aiCandidates)
+    && sameValue(left.dismissedPersonConversationIds, right.dismissedPersonConversationIds)
+    && left.peopleDismissalVersion === right.peopleDismissalVersion
+    && left.peopleModelVersion === right.peopleModelVersion
+    && sameValue(left.atlas, right.atlas)
+}
+
 function mergeEntities<T extends { id: string }>(base: T[], local: T[], remote: T[]) {
   const baseById = new Map(base.map((item) => [item.id, item]))
   const localById = new Map(local.map((item) => [item.id, item]))

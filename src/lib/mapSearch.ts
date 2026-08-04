@@ -13,8 +13,11 @@ function validBounds(value: unknown): value is [number, number, number, number] 
 }
 
 export async function searchMapPlaces(query: string, signal?: AbortSignal) {
+  const { loadMapConfig } = await import('./mapConfig')
+  const config = await loadMapConfig()
   const endpoint = new URL(apiUrl('/api/map/search'), window.location.href)
   endpoint.searchParams.set('q', query.trim())
+  endpoint.searchParams.set('provider', config.searchProvider)
   const timeout = AbortSignal.timeout(20_000)
   const response = await fetch(endpoint, { headers: { accept: 'application/json' }, signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
   const payload = await response.json().catch(() => null) as MapSearchResult[] | { error?: string } | null

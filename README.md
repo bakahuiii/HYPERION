@@ -4,7 +4,20 @@ THEIA 是一个本地优先的个人现实任务图工具。它把你主动导�
 
 它不是聊天软件插件，也不会绕过登录或解密应用数据库。THEIA 只读取你明确选择的导出文件；只有在你启动模型提炼后，选中的记录才会发送到你配置的模型服务。
 
-> 当前源码版本：`0.3.0`。Windows x64 便携版与源码发布包分别生成；便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js，任务、设置、聊天归档和日志保存在 `%APPDATA%\\THEIA`。重要数据请定期备份。
+> 当前源码版本：`0.4.0`。Windows x64 NSIS 安装器、便携版与源码发布包分别生成；安装器和便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js，任务、设置、聊天归档和日志保存在 `%APPDATA%\\THEIA`。重要数据请定期备份。
+
+## 0.3.0 至 0.4.0 更新简介
+
+- 原始聊天归档升级为 append-only gzip JSONL 分段；首次迁移保留旧归档作为回滚源，后续目录更新只向本机代理提交变更记录和删除 ID，不再每次上传整份百万级数组。
+- 浏览器 IndexedDB 升级为逐消息 `intelRecords` + `intelMeta`，共享状态和聊天归档分离；设置、共享状态和运行日志都有 schema 版本、迁移备份与恢复入口。
+- 提取 `useSettingsSync`、`useSharedSync`、`useIntelAnalysisSelection`，并将会话时间线、候选虚拟队列拆为独立模块；共享写入使用版本冲突重试，避免多端覆盖新数据。
+- 增加导入、分段、候选校验、归档、迁移、崩溃恢复、日志轮转和增量提交测试；保留原有通道并发、短退避和 502 稳定策略。
+- Electron 可用系统凭据存储保护 API Key；无法使用系统凭据的纯 Node 开发模式仍保留兼容回退，并在文档中明确风险。
+- 大于 1 MB 的 JSON/CSV/TXT 在 Web Worker 中解析；附件在上传前显示队列、体积、文本 token 粗估和图片/文档计费边界。
+- 情报库拆为导入、分析控制器、候选队列和会话浏览组件，长时间任务/人物流程由 `useAiWorkflow` 管理暂停、恢复和重试。
+- 自动人物更新以会话内容指纹为水位，只发送新增消息及每条新增消息之前最多 16 条上下文；未变化会话不会反复提交，新增证据仍与已有卡片保守合并。
+- 公共地图底图、搜索源和 32–1024 MB 瓦片缓存上限可配置；界面保留 OpenStreetMap 署名并直达各服务使用政策。
+- 新增 Playwright 视觉/拖拽回归、Electron 启动与 `safeStorage` 明文迁移烟测，以及 electron-builder NSIS 安装器和 GitHub 自动更新基础。
 
 ## 0.2.1 至 0.3.0 更新简介
 
@@ -50,6 +63,7 @@ THEIA 是一个本地优先的个人现实任务图工具。它把你主动导�
 - 同步生成有证据引用的人物卡，缓存导出记录中可访问的头像，并按关系信号排序。
 - 用可缩放、可平移、可拖拽归类的任务图展示任务；任务完成状态与行程保持一致。
 - 使用开源地图底图和公共地理搜索，支持搜索、选点、拖动、编辑、删除和近似范围。
+- 可在选项中切换 OSM DE、OSM Standard 或 HOT 底图，选择自动/Nominatim/Photon 搜索，并限制本机瓦片缓存容量。
 - 根据关联人物、任务时间、地点及未来 16 天内可用天气生成行动建议。
 - 将大聊天归档、轻量界面状态、INI 设置、图片和日志分开保存，降低大数据量下的同步开销。
 - 桌面版默认启用 Chromium GPU 合成；也提供软件渲染故障回退。
@@ -90,9 +104,22 @@ npm run dev
 
 然后打开终端显示的本地地址，通常为 `http://127.0.0.1:5173/`。不要直接双击 `index.html`，因为设置、模型、地图代理和共享存储需要本地 Node.js 服务。
 
-### 从源码发布包启动
+开发检查与发行构建：
 
-发布包不是免安装 EXE。第一次使用，在发布包的 `app` 目录打开 PowerShell：
+```powershell
+npm test
+npm run test:e2e
+npm run test:desktop-smoke
+npm run dist:installer
+```
+
+`dist:installer` 生成 Windows x64 NSIS 安装器；无签名证书时允许本地未签名构建。正式发行应通过 `CSC_LINK` / `CSC_KEY_PASSWORD` 注入 Windows 代码签名证书，并使用 `GH_TOKEN` 发布 GitHub 更新元数据。
+
+### 从安装器、便携版或源码发布包启动
+
+NSIS 安装器和自带运行时的便携版不需要 Node.js，也不用执行 `npm install`。安装版可从开始菜单或桌面快捷方式启动；可变数据位于 `%APPDATA%\THEIA\`。
+
+源码发布包用于审查和自定义。第一次使用时，在发布包的 `app` 目录打开 PowerShell：
 
 ```powershell
 npm install
@@ -108,7 +135,7 @@ npm install
 ## 第一次使用
 
 1. 打开“选项”，先设置显示名称、头像、主题和全局背景。
-2. 在“模型通道池”填入 API 根地址、明文 API Key，并点击检测模型列表；单条 API 受限时可再添加独立通道。
+2. 在“模型通道池”填入 API 根地址和 API Key，并点击检测模型列表；单条 API 受限时可再添加独立通道。
 3. 选择用于结构化输出的对话模型，保留 API 模式为“自动”即可。
 4. 在“情报库”导入少量示例或自己的一个私聊会话。
 5. 打开会话，检查时间、发言人以及“你/对方”方向是否正确。
@@ -125,7 +152,7 @@ npm install
                 v
       浏览器内本地解析与去重
                 |
-                +----> 原始归档（独立大文件 / IndexedDB）
+                +----> 原始归档（gzip JSONL 分段 / IndexedDB v2）
                 |
                 v
       用户选择会话、范围并启动提炼
@@ -143,7 +170,7 @@ npm install
        用户审核后写入任务和人物状态
 ```
 
-前端不会直接持有模型密钥。密钥由本地 Node.js 服务读取并写入通用 INI。当前产品按用户要求以明文保存 Key，方便编辑和迁移，因此 `settings.ini` 必须作为密码文件保护。
+模型密钥只通过 loopback API 交给本地服务。打包桌面版优先使用 Electron `safeStorage` 加密后写入 `credentials.json`，INI 只保存 `credentialRef`；纯 Node/浏览器开发模式无法使用 Electron 凭据后端时会回退为 INI 明文兼容。无论哪种模式，都应把整个运行时 `data/` 当作敏感数据保护。
 
 ## 开发与发布目录
 
@@ -157,8 +184,12 @@ THEIA-release/
     avatars/                 从导出记录下载的联系人头像缓存
   data/
     state.json               任务、人物、地点、候选和任务图布局
-    chat-archive.json.gz      原始聊天归档（gzip 压缩），旧 JSON 可自动迁移
-    settings.ini             名称、外观、提示词、模型地址和明文 Key
+    chat-archive/             append-only gzip JSONL 归档段
+    chat-archive.json.gz      旧版原始聊天归档，只作为迁移/回滚源
+    chat-archive.meta.json    归档 schema、水位、段数和消息计数
+    settings.ini             名称、外观、提示词、模型地址和 credentialRef
+    credentials.json         桌面版 safeStorage 加密密钥容器
+    migrations/              schema 迁移前备份
     electron/                桌面版 Chromium 数据
     runtime/desktop.pid      运行中的桌面实例标记
     examples/                完全虚构的导入示例
@@ -172,7 +203,7 @@ THEIA-release/
 
 ### 存储压缩与迁移
 
-原始聊天归档现在以 `chat-archive.json.gz`（开发目录为 `.theia-shared-intel.json.gz`）保存，读取时仍兼容旧的未压缩 JSON。首次启动会在压缩文件成功写入后自动迁移并删除旧 JSON，不会覆盖原文件失败的迁移。
+原始聊天归档现在以 `chat-archive/`（开发目录为 `.theia-intel-store/`）中的 gzip JSONL segment 保存，读取时仍兼容旧 gzip/JSON。首次迁移建立 snapshot segment，并保留旧文件作为回滚源；小规模目录更新追加 delta，不再重写完整归档。达到 24 个 segment 后自动压实为新 snapshot。
 
 已完成的任务日志会压缩为 `*.jsonl.gz`；服务启动时会继续整理超过 10 分钟的旧日志。调试摘要日志限制为约 8 MB，并保留最多 3 个轮转文件，避免长期运行无限增长。
 
@@ -184,7 +215,10 @@ THEIA-release/
 | `npm run dev:web` | 只启动 Vite；需要另行启动 API |
 | `npm run dev:api` | 只启动 `127.0.0.1:8787` 本地 API |
 | `npm run desktop` | 启动 Electron、本地 API 和 Vite |
-| `npm test` | 用两个本地假服务验证多 API 分流、故障隔离和日志脱敏，不调用真实模型 |
+| `npm test` | 运行 importer、分段、候选、存储、迁移、恢复、前端工具和本地假服务回归；不调用真实模型 |
+| `npm run test:e2e` | 运行任务图、拖拽、地图设置和存储健康视觉回归 |
+| `npm run test:desktop-smoke` | 用隔离 runtime 验证 Electron 启动和 safeStorage 凭据迁移 |
+| `npm run test:unpacked-smoke` | 验证已生成的 `win-unpacked/THEIA.exe` 可以独立启动 |
 | `npm run build` | TypeScript 项目构建检查并生成 `dist/` |
 | `npm run lint` | 执行 ESLint |
 | `npm run preview` | 预览 Vite 构建产物；涉及 API 的功能仍需本地服务 |
@@ -195,8 +229,8 @@ THEIA-release/
 发布工具：
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.3.0\THEIA-release-0.3.0
-npm run dist:exe -- ..\staging\v0.3.0\THEIA-0.3.0-portable
+node release-tools/package-release.mjs ..\staging\v0.4.0\THEIA-release-0.4.0
+npm run dist:exe -- ..\staging\v0.4.0\THEIA-0.4.0-portable
 npm run release:index
 ```
 
@@ -220,6 +254,6 @@ npm run release:index
 - 地图、天气、在线语录和头像地址依赖第三方公共服务，可能受限流、网络或地区影响。
 - 自动提炼的最短间隔是 24 小时，且当前需要应用页面保持打开；它不是系统后台服务。
 - 当前没有加密数据库。保护 Windows 账户、磁盘和备份介质是用户责任。
-- 当前没有自动升级旧数据 schema 的正式兼容承诺。升级前先备份整个运行时目录。
+- 当前通过版本化 schema、迁移前备份和离线回滚脚本兼容旧状态与归档；跨大版本升级前仍须备份整个运行时目录。
 
 本项目只支持用户授权的导出数据，不提供绕过登录、盗取凭据、解密私人数据库或未授权抓取能力。

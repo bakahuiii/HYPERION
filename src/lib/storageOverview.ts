@@ -13,6 +13,29 @@ export interface StorageOverviewEntry {
 export interface StorageOverview {
   workspace: string
   entries: StorageOverviewEntry[]
+  health?: {
+    sharedState: {
+      schema: string
+      schemaVersion: number
+      migration: { state: 'pending' | 'ready' | 'failed'; migrated?: boolean; reason?: string; error?: string }
+      rollbackBackups: string[]
+    }
+    archive: {
+      schema: string
+      schemaVersion: number
+      storageEngine: string
+      recordCount: number
+      segmentCount: number
+      updatedAt: string | null
+      migration: { state: 'pending' | 'ready' | 'failed'; migrated?: boolean; error?: string }
+    }
+    recovery: {
+      uncleanShutdownDetected: boolean
+      previous?: { startedAt?: string } | null
+      session?: { startedAt?: string } | null
+    }
+    rollbackCommand: string
+  }
 }
 
 export async function loadStorageOverview(signal?: AbortSignal): Promise<StorageOverview> {

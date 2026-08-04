@@ -4,6 +4,7 @@ import test from 'node:test'
 import { planDirectoryImport } from '../src/lib/directoryManifest.ts'
 import { compactIntelItem, compactIntelItems, hydrateIntelItem } from '../src/lib/intelPersistence.ts'
 import { mergeSharedChanges, toSharedData } from '../src/lib/sharedStateMerge.ts'
+import { hydrateSharedSnapshot } from '../src/lib/sharedStateHydration.ts'
 import { filterDismissedPeople, removePeopleCards, resolvePersonDismissals } from '../src/lib/peopleState.ts'
 import { scanExportDirectory } from '../src/lib/directorySync.ts'
 import { parseIntelFile } from '../src/lib/importer.ts'
@@ -244,6 +245,44 @@ const shared = (overrides = {}) => ({
   aiCandidates: [],
   atlas: { categoryPositions: {} },
   ...overrides,
+})
+
+test('shared hydration preserves local startup edits and renderer-only intel', () => {
+  const current = createSeedData()
+  current.intel = [{ id: 'raw-message', source: 'wechat', content: 'local archive', capturedAt: '', status: 'new' }]
+  const base = toSharedData(current)
+  current.quests = [...current.quests, { id: 'local-quest', title: 'Local edit', description: '', status: 'available', tags: [], characterIds: [] }]
+  const remote = {
+    ...base,
+    places: [...base.places, { id: 'remote-place', name: 'Remote place', category: 'explore', lat: 1, lng: 2, note: '' }],
+  }
+
+  const result = hydrateSharedSnapshot(current, base, remote, { peopleModelVersion: 5, peopleDismissalVersion: 5 })
+  assert.ok(result.data.quests.some((quest) => quest.id === 'local-quest'))
+  assert.ok(result.data.places.some((place) => place.id === 'remote-place'))
+  assert.equal(result.data.intel, current.intel)
+  assert.equal(result.skipEchoWrite, false)
+})
+
+test('shared hydration keeps repaired dismissal semantics and suppresses remote echo writes', () => {
+  const current = createSeedData()
+  current.peopleDismissalVersion = 5
+  current.dismissedPersonConversationIds = ['deleted-locally']
+  const base = toSharedData(current)
+  const remote = {
+    ...base,
+    dismissedPersonConversationIds: ['legacy-deletion'],
+    peopleDismissalVersion: 4,
+    peopleModelVersion: 5,
+  }
+
+  const result = hydrateSharedSnapshot(current, base, remote, { peopleModelVersion: 5, peopleDismissalVersion: 5 })
+  assert.deepEqual(result.data.dismissedPersonConversationIds, ['deleted-locally'])
+  assert.equal(result.data.peopleDismissalVersion, 5)
+
+  const echoBase = toSharedData(result.data)
+  const echo = hydrateSharedSnapshot(result.data, echoBase, echoBase, { peopleModelVersion: 5, peopleDismissalVersion: 5 })
+  assert.equal(echo.skipEchoWrite, true)
 })
 
 test('three-way shared merge preserves remote additions and local deletions', () => {

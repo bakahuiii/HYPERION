@@ -2,12 +2,15 @@ import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import process from 'node:process'
 import { runtimePaths } from './runtimePaths.mjs'
+import { credentialStoreAvailable, deleteCredential, loadCredential, saveCredential } from './credentialStore.mjs'
 
 const { settingsPath, legacyProviderPath, backgroundDirectoryPath: backgroundDirectory } = runtimePaths
 let settingsWriteQueue = Promise.resolve()
 const supportedModes = new Set(['auto', 'responses', 'chat-completions'])
 const themes = new Set(['verdant', 'nocturne', 'paper', 'sakura'])
 const analysisModes = new Set(['balanced', 'action', 'planning', 'review'])
+const mapTileProviders = new Set(['osm-de', 'osm-standard', 'osm-hot'])
+const mapSearchProviders = new Set(['balanced', 'nominatim', 'photon'])
 const backgroundTargets = ['app']
 const imageTypes = new Map([
   ['image/jpeg', 'jpg'],
@@ -52,9 +55,18 @@ function defaultSettings() {
       concurrency: 4,
       feedback: [],
     },
+    mapSettings: { tileProvider: 'osm-de', searchProvider: 'balanced', cacheMaxMb: 128 },
     provider,
     providers: [provider],
     primaryProviderId: provider.id,
+  }
+}
+
+export function normalizeMapSettings(input, fallback = { tileProvider: 'osm-de', searchProvider: 'balanced', cacheMaxMb: 128 }) {
+  return {
+    tileProvider: mapTileProviders.has(input?.tileProvider) ? input.tileProvider : fallback.tileProvider,
+    searchProvider: mapSearchProviders.has(input?.searchProvider) ? input.searchProvider : fallback.searchProvider,
+    cacheMaxMb: Math.round(clamp(input?.cacheMaxMb, 32, 1024, fallback.cacheMaxMb)),
   }
 }
 
@@ -239,6 +251,7 @@ function normalizeProvider(input, fallback, index = 0) {
     name: text(input?.name, 80) || text(fallback?.name, 80) || `通道 ${index + 1}`,
     enabled: typeof input?.enabled === 'boolean' ? input.enabled : fallback?.enabled !== false,
     apiKey: hasKey ? text(input?.apiKey ?? input?.key, 1000) : text(fallback?.apiKey, 1000),
+    credentialRef: text(input?.credentialRef, 160) || text(fallback?.credentialRef, 160) || undefined,
     baseURL: hasBaseUrl ? text(input?.baseURL ?? input?.url, 1000) || fallback?.baseURL : fallback?.baseURL,
     model: hasModel ? text(input?.model, 200) || fallback?.model : fallback?.model,
     apiMode: supportedModes.has(input?.apiMode) ? input.apiMode : supportedModes.has(fallback?.apiMode) ? fallback.apiMode : 'auto',
@@ -272,18 +285,58 @@ function normalizeSettings(input, fallback = defaultSettings()) {
     profile: { name: text(input?.profile?.name, 32) || fallback.profile.name, avatarUrl: safeBackgroundUrl(input?.profile?.avatarUrl) },
     appearance: normalizeAppearance(input?.appearance, fallback.appearance),
     aiSettings: normalizeAiSettings(input?.aiSettings, fallback.aiSettings),
+    mapSettings: normalizeMapSettings(input?.mapSettings, fallback.mapSettings),
     provider,
     providers,
     primaryProviderId: provider.id,
   }
 }
 
-function serializeSettings(settings) {
+function credentialReference(channel) {
+  return text(channel?.credentialRef, 160) || `theia/provider/${normalizeProviderId(channel?.id, 'primary')}`
+}
+
+async function protectProviderCredentials(settings) {
+  if (!(await credentialStoreAvailable())) return { settings, protected: false }
+  const providers = []
+  for (const channel of settings.providers) {
+    const credentialRef = credentialReference(channel)
+    if (channel.apiKey) await saveCredential(credentialRef, channel.apiKey)
+    else await deleteCredential(credentialRef)
+    providers.push({ ...channel, credentialRef })
+  }
+  const provider = providers.find((channel) => channel.id === settings.primaryProviderId) ?? providers[0]
+  return { settings: { ...settings, providers, provider }, protected: true }
+}
+
+async function hydrateProviderCredentials(settings) {
+  if (!(await credentialStoreAvailable())) return { settings, migratedPlaintext: false }
+  let migratedPlaintext = false
+  const providers = []
+  for (const channel of settings.providers) {
+    const credentialRef = credentialReference(channel)
+    let apiKey = channel.apiKey
+    if (apiKey) {
+      await saveCredential(credentialRef, apiKey)
+      migratedPlaintext = true
+    } else {
+      apiKey = await loadCredential(credentialRef) ?? ''
+    }
+    providers.push({ ...channel, apiKey, credentialRef })
+  }
+  const provider = providers.find((channel) => channel.id === settings.primaryProviderId) ?? providers[0]
+  return { settings: { ...settings, providers, provider }, migratedPlaintext }
+}
+
+function serializeSettings(settings, protectedCredentials = false) {
   const encode = (item) => encodeURIComponent(String(item ?? ''))
+  const serializedProviders = settings.providers.map((channel) => protectedCredentials
+    ? { ...channel, apiKey: undefined, key: undefined, credentialRef: credentialReference(channel) }
+    : channel)
   const lines = [
     '; THEIA local shared settings. Values are URL-encoded to preserve newlines and = characters.',
     '[meta]',
-    'version=3',
+    'version=4',
     `appSettingsInitialized=${encode(settings.appSettingsInitialized)}`,
     '',
     '[profile]',
@@ -310,12 +363,18 @@ function serializeSettings(settings) {
     `lastPeopleFollowupAt=${encode(settings.aiSettings.lastPeopleFollowupAt ?? '')}`,
     `interruptedRun=${encode(JSON.stringify(settings.aiSettings.interruptedRun ?? null))}`,
     '',
+    '[map]',
+    `tileProvider=${encode(settings.mapSettings.tileProvider)}`,
+    `searchProvider=${encode(settings.mapSettings.searchProvider)}`,
+    `cacheMaxMb=${encode(settings.mapSettings.cacheMaxMb)}`,
+    '',
     '[provider]',
     `id=${encode(settings.provider.id)}`,
     `name=${encode(settings.provider.name)}`,
     `enabled=${encode(settings.provider.enabled)}`,
     `url=${encode(settings.provider.baseURL)}`,
-    `key=${encode(settings.provider.apiKey)}`,
+    `key=${encode(protectedCredentials ? '' : settings.provider.apiKey)}`,
+    `credentialRef=${encode(protectedCredentials ? credentialReference(settings.provider) : settings.provider.credentialRef ?? '')}`,
     `model=${encode(settings.provider.model)}`,
     `apiMode=${encode(settings.provider.apiMode)}`,
     `models=${encode(JSON.stringify(settings.provider.models))}`,
@@ -323,7 +382,7 @@ function serializeSettings(settings) {
     '',
     '[providers]',
     `primaryId=${encode(settings.primaryProviderId)}`,
-    `channels=${encode(JSON.stringify(settings.providers))}`,
+    `channels=${encode(JSON.stringify(serializedProviders))}`,
     '',
   ]
   return lines.join('\n')
@@ -355,12 +414,18 @@ function fromIni(raw) {
       lastPeopleFollowupAt: value(parsed, 'ai', 'lastPeopleFollowupAt'),
       interruptedRun: jsonValue(parsed, 'ai', 'interruptedRun', undefined),
     },
+    mapSettings: {
+      tileProvider: value(parsed, 'map', 'tileProvider'),
+      searchProvider: value(parsed, 'map', 'searchProvider'),
+      cacheMaxMb: value(parsed, 'map', 'cacheMaxMb'),
+    },
     provider: {
       id: value(parsed, 'provider', 'id'),
       name: value(parsed, 'provider', 'name'),
       enabled: value(parsed, 'provider', 'enabled', '') === '' ? undefined : value(parsed, 'provider', 'enabled') === 'true',
       url: value(parsed, 'provider', 'url'),
       key: value(parsed, 'provider', 'key'),
+      credentialRef: value(parsed, 'provider', 'credentialRef'),
       model: value(parsed, 'provider', 'model'),
       apiMode: value(parsed, 'provider', 'apiMode'),
       models: jsonValue(parsed, 'provider', 'models', []),
@@ -395,7 +460,9 @@ async function migrateLegacyProvider() {
 
 export async function loadSettings() {
   try {
-    return { settings: fromIni(await readFile(settingsPath, 'utf8')), initialized: true }
+    const hydrated = await hydrateProviderCredentials(fromIni(await readFile(settingsPath, 'utf8')))
+    if (hydrated.migratedPlaintext) return { settings: await writeSettingsFile(hydrated.settings), initialized: true }
+    return { settings: hydrated.settings, initialized: true }
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error
     const migrated = await migrateLegacyProvider()
@@ -408,11 +475,13 @@ export async function loadSettings() {
 }
 
 async function writeSettingsFile(input) {
-  const settings = normalizeSettings(input)
+  const normalized = normalizeSettings(input)
+  const protectedResult = await protectProviderCredentials(normalized)
+  const settings = protectedResult.settings
   const temporaryPath = `${settingsPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 10)}.tmp`
   await mkdir(dirname(settingsPath), { recursive: true, mode: 0o700 })
   try {
-    await writeFile(temporaryPath, serializeSettings(settings), { encoding: 'utf8', mode: 0o600 })
+    await writeFile(temporaryPath, serializeSettings(settings, protectedResult.protected), { encoding: 'utf8', mode: 0o600 })
     await rename(temporaryPath, settingsPath)
   } finally {
     await unlink(temporaryPath).catch((error) => {
@@ -441,7 +510,16 @@ export function saveAppSettings(input) {
       profile: input?.profile ?? settings.profile,
       appearance: input?.appearance ?? settings.appearance,
       aiSettings: input?.aiSettings ?? settings.aiSettings,
+      mapSettings: input?.mapSettings ?? settings.mapSettings,
     })
+  })
+}
+
+export function saveMapSettings(input) {
+  return enqueueSettingsWrite(async () => {
+    const { settings } = await loadSettings()
+    const next = await writeSettingsFile({ ...settings, mapSettings: normalizeMapSettings(input, settings.mapSettings) })
+    return next.mapSettings
   })
 }
 

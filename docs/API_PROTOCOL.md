@@ -1,13 +1,13 @@
 # THEIA 本地 API 与模型协议参考
 
-本文是 THEIA `0.3.0` 的协议级参考，面向前端、桌面壳、第三方导出适配器、测试服务和二次开发者。它描述的是当前 `server/index.mjs` 和 `src/lib/aiClient.ts` 的实际行为，不是未来规划。
+本文是 THEIA `0.4.0` 的协议级参考，面向前端、桌面壳、第三方导出适配器、测试服务和二次开发者。它描述的是当前 `server/index.mjs` 和 `src/lib/aiClient.ts` 的实际行为，不是未来规划。
 
 协议有两个边界：
 
 1. THEIA 本地 HTTP API 只监听 `127.0.0.1`，供浏览器、Electron renderer 和开发脚本使用。
 2. 本地服务再把经过校验的模型请求转发到用户配置的 OpenAI-compatible 服务。外部服务不会直接访问 THEIA 的本地文件。
 
-本地 API 没有用户认证，不能暴露到局域网或公网。尤其是设置接口会返回当前明文 API Key，这是现有产品为了方便编辑和迁移而保留的行为。
+本地 API 没有用户认证，不能暴露到局域网或公网。设置接口可能向本机界面返回解密后的 API Key；打包桌面版的静态存储使用 Electron `safeStorage`，纯 Node 开发模式可能回退为 INI 明文。
 
 ## 1. 基本约定
 
@@ -79,7 +79,7 @@ Cache-Control: no-store
 
 ### 2.2 `GET /api/ai/status`
 
-返回完整通道池状态。Key 默认只返回 `keyHint`；设置接口才会返回明文 Key。
+返回完整通道池状态。Key 默认只返回 `keyHint`；设置接口仅在 loopback 上为编辑返回可用 Key。
 
 ```json
 {
@@ -515,6 +515,7 @@ Accept: application/json
 | `GET` | `/api/sync/intel/meta` | 读取 gzip 原始归档元数据 |
 | `GET` | `/api/sync/intel` | 读取完整原始归档 |
 | `POST` | `/api/sync/intel` | 压缩、加锁并原子写入原始归档 |
+| `POST` | `/api/sync/intel/delta` | 追加 upsert/delete 操作，不上传未变化消息 |
 
 快照请求示例：
 
@@ -534,9 +535,39 @@ Accept: application/json
 
 原始 `intel` 不应放回 `data`，也不应进入 shared snapshot。冲突返回 409，并带 `currentUpdatedAt`；客户端应重新读取、三方合并后重试。
 
+增量归档请求：
+
+```json
+{
+  "expectedUpdatedAt": "2026-08-04T12:00:00.000Z",
+  "sourceFingerprint": "sha256:directory-fingerprint",
+  "upserts": [
+    { "id": "message-42", "conversationId": "direct:A", "capturedAt": "2026-08-04T11:00:00Z", "content": "updated" }
+  ],
+  "deleteIds": ["message-17"]
+}
+```
+
+服务端会先校验水位，再把操作写入 `theia-intel-archive/v1` 的 gzip JSONL delta segment。`upserts` 中的记录按稳定 `id` 覆盖，`deleteIds` 在 upsert 前执行；同一请求同时更新时以 upsert 为准。首次迁移、未知基线或大规模替换不应调用此接口，客户端会自动回退全量 snapshot。
+
 ### 6.2 设置
 
-`GET/POST /api/settings` 读写 profile、appearance、AI settings。模型提示词四个字段为：`task`、`people`、`peopleMerge`、`taskGuidance`。设置文件使用 URL 编码的 INI；调用方不要手写 INI 覆盖整个文件，优先使用接口以保留迁移和归一化规则。
+`GET/POST /api/settings` 读写 profile、appearance、AI settings；POST 未携带的 `mapSettings` 会保留，不会被界面设置保存覆盖。模型提示词四个字段为：`task`、`people`、`peopleMerge`、`taskGuidance`。设置文件使用 URL 编码的 INI v4；调用方不要手写 INI 覆盖整个文件，优先使用接口以保留迁移、凭据引用和归一化规则。
+
+`GET /api/storage/overview` 除 `workspace/entries` 外返回：
+
+```json
+{
+  "health": {
+    "sharedState": { "schema": "theia-shared-state/v1", "schemaVersion": 1, "migration": { "state": "ready", "migrated": false }, "rollbackBackups": [] },
+    "archive": { "schema": "theia-intel-archive/v1", "schemaVersion": 1, "storageEngine": "append-only-jsonl-gzip", "recordCount": 273713, "segmentCount": 3, "updatedAt": "2026-08-04T12:00:00.000Z", "migration": { "state": "ready", "migrated": false } },
+    "recovery": { "uncleanShutdownDetected": false },
+    "rollbackCommand": "npm run data:rollback -- --latest"
+  }
+}
+```
+
+这只是元数据接口，不返回聊天正文、Key 或任务日志内容。回滚没有开放 HTTP 写接口；必须关闭应用后从本机命令行执行，避免运行中的 renderer 把旧状态立刻覆盖。
 
 ### 6.3 地图、头像和背景
 
@@ -546,10 +577,20 @@ Accept: application/json
 | `GET` | `/api/settings/background/:id` | 读取本地背景/头像资产 |
 | `GET` | `/api/media/avatar?src=` | 受白名单限制的 QQ/微信头像代理和缓存 |
 | `GET` | `/api/map/tiles/:z/:x/:y.png` | 公共 OSM 瓦片代理，z 0-19 |
-| `GET` | `/api/map/search?q=` | 多源公共地理搜索，最多 8 条 |
+| `GET` | `/api/map/search?q=&provider=` | 公共地理搜索，provider 为 balanced/nominatim/photon |
+| `GET` | `/api/map/config` | 地图设置、可选服务、署名、policy URL 和使用说明 |
+| `POST` | `/api/map/config` | 保存 tileProvider/searchProvider/cacheMaxMb |
 | `GET` | `/api/quote` | 在线语录，失败时离线回退 |
 
-这些公共服务没有 SLA。地图搜索只发送搜索词，不发送任务正文、人物或聊天内容；头像代理拒绝不在白名单内的远程域名。
+瓦片请求查询参数：`provider=osm-de|osm-standard|osm-hot`，`cacheMaxMb=32..1024`。服务端验证 z/x/y 和 host 白名单，把瓦片写入有界本地缓存，并用 `x-theia-map-cache: hit|miss` 标记命中。所选源失败时可尝试其他白名单 OSM 源。不得用此接口实现批量预取或离线抓图。
+
+地图配置 POST：
+
+```json
+{ "tileProvider": "osm-de", "searchProvider": "balanced", "cacheMaxMb": 128 }
+```
+
+这些公共服务没有 SLA。地图搜索只发送搜索词，不发送任务正文、人物或聊天内容；头像代理拒绝不在白名单内的远程域名。客户端必须展示响应中的 attribution，并让用户可以查看 provider policy URL。
 
 ## 7. 领域 ID 与数据约束
 

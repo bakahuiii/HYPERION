@@ -1,6 +1,6 @@
 # THEIA 开发者文档
 
-本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.3.0` 稳定源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 的逐字段定义为准。
+本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.4.0` 源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 的逐字段定义为准。
 
 ## 1. 项目定位与工程边界
 
@@ -15,7 +15,7 @@ THEIA 是单用户、本地优先的个人任务图应用。它的信任边界�
 - 把模型输出当作无需审核的事实数据库；
 - 云端账号、多人协作和远程同步。
 
-当前发布形态是源码发布包。没有安装程序签名、自动更新、崩溃上报、遥测、数据库加密或稳定的跨版本迁移层。
+当前发布形态包含源码包、便携包和 electron-builder NSIS 安装器。已有本地崩溃恢复标记、schema 迁移备份、回滚脚本和 GitHub Release 更新检查；项目没有远程崩溃上报或遥测。Windows 签名是发布环境的可选步骤，本地无证书构建不会失败。聊天正文归档不加密；桌面版 API Key 使用系统凭据加密，纯 Node 开发模式有明文兼容回退。
 
 ## 2. 已锁定技术栈
 
@@ -29,6 +29,8 @@ THEIA 是单用户、本地优先的个人任务图应用。它的信任边界�
 | 语言 | TypeScript | 5.8.3 | 前端及共享类型检查 |
 | 构建 | Vite | 8.1.5 | 开发服务器、HMR、生产构建 |
 | 桌面壳 | Electron | 43.2.0 | Windows 桌面窗口、Chromium、GPU 合成 |
+| 安装/更新 | electron-builder / electron-updater | 26.15.3 / 6.8.9 | NSIS、GitHub Release 更新和可选签名 |
+| UI 回归 | Playwright | 1.62.1 | 浏览器视觉/拖拽测试与 Electron smoke |
 | 模型 SDK | OpenAI JS | 7.0.0 | 依赖保留；核心兼容请求当前由本地服务直接 `fetch` |
 | 地图 | Leaflet | 1.9.4 | OSM 瓦片、标记、范围、拖拽 |
 | 图标 | Lucide React | 1.27.0 | UI 图标 |
@@ -55,7 +57,9 @@ THEIA 是单用户、本地优先的个人任务图应用。它的信任边界�
 │  └─ settings.mjs             INI 设置、迁移和背景保存
 ├─ src/
 │  ├─ components/              侧栏、顶栏、任务编辑、来源和外观弹窗
+│  ├─ hooks/                   shared/settings/AI workflow 状态机
 │  ├─ lib/                     导入、分析计划、AI 客户端、存储、地图、天气等
+│  ├─ workers/                 大型导出文件后台解析
 │  ├─ views/                   任务图、行程、地图、人物、情报库、选项
 │  ├─ App.tsx                  顶层状态、共享同步和跨视图编排
 │  ├─ seed.ts                  无个人信息的初始示例状态
@@ -68,7 +72,21 @@ THEIA 是单用户、本地优先的个人任务图应用。它的信任边界�
 └─ package.json
 ```
 
-当前两个最大组件仍是 `App.tsx` 和 `IntelView.tsx`。它们混合了状态编排、同步和 UI，属于已知维护成本。扩展前优先抽取 `useSharedSync`、`useAiWorkflow`、`useIntelAnalysis` 一类 hook，并把纯 reducer 放进 `src/lib/`，但不要在功能发布前做无测试保护的大规模重写。
+`App.tsx` 仍保留领域状态和任务图编排；共享同步位于 `useSharedSync.ts`，通用设置位于 `useSettingsSync.ts`。任务/人物串联、暂停检查点、恢复、失败重试和定时运行位于 `useAiWorkflow.ts`，不得把跨分钟请求闭包重新绑定到渲染时的旧 `data`。`IntelView.tsx` 只编排 `ArchivePanel`、`AnalysisPanel`、`CandidateQueue` 和 `ConversationBrowser`；时间线选择由 `useIntelAnalysisSelection.ts` 负责。
+
+导入器以 1 MiB 为前后台分界：小文件直接调用 `parseIntelFileContent`，大文件通过 module Worker `workers/intelParser.worker.ts` 解析。File 由 structured clone 传入 Worker，结果仍经过同一套 ID、时间、会话和头像规则，Node 测试环境没有 Worker 时自动走直接路径。
+
+### 3.1 大归档存储边界
+
+`server/archiveStore.mjs` 是本机原始聊天归档的写入边界。它按 segment 顺序重放得到内存索引，但磁盘写入只追加一个 gzip JSONL segment：首段 `kind=snapshot`，增量段 `kind=delta`。每段首行是：
+
+```json
+{"schema":"theia-intel-archive/v1","schemaVersion":1,"kind":"delta","updatedAt":"2026-08-04T00:00:00.001Z","sourceFingerprint":"sha256:..."}
+```
+
+后续行只能是 `{ "op": "upsert", "item": {...} }` 或 `{ "op": "delete", "id": "..." }`。服务端在 `expectedUpdatedAt` 不匹配时返回 409，不能盲写。`/api/sync/intel/delta` 只接受 `upserts`、`deleteIds`、`sourceFingerprint` 和可选 `expectedUpdatedAt`。前端只有在已建立签名基线且变更量较小时使用 delta；否则使用全量 snapshot 兼容路径。
+
+本地浏览器缓存不是归档的权威副本。IndexedDB v2 的 `intelRecords` 以 `id` 为 keyPath，`intelMeta` 保存 `updatedAt/sourceFingerprint/recordCount/schemaVersion`；迁移时旧 `snapshots` 只读不删除，第一次成功写入后再懒升级。
 
 ## 4. 运行拓扑
 
@@ -184,7 +202,7 @@ AppData（React 内存）
 | 内容 | 路径 |
 | --- | --- |
 | 轻量快照 | `data/state.json` |
-| 原始归档 | `data/chat-archive.json.gz`（兼容读取旧 JSON） |
+| 原始归档 | `data/chat-archive/*.jsonl.gz`（旧 `chat-archive.json.gz` 保留作迁移/回滚源） |
 | 通用设置 | `data/settings.ini` |
 | 摘要日志 | `logs/ai-debug.jsonl` |
 | 工作日志 | `logs/tasks/` |
@@ -199,7 +217,7 @@ AppData（React 内存）
 - shared state 写入通过进程内 Promise queue 串行化，避免桌面与浏览器同时复用临时文件。
 - 快照带 `updatedAt`；渲染器轮询元数据，避免旧页面关闭时覆盖更新快照。
 - 原始聊天从 shared state 中剥离；读取旧快照时兼容迁移内嵌 `intel`，之后不再随 UI 状态反复写入。
-- 设置以 URL 编码的 INI v3 保存，允许提示词包含换行和 `=`；旧 v2/legacy provider 会在读取时迁移。
+- 设置以 URL 编码的 INI v4 保存，允许提示词包含换行和 `=`；旧 v2/v3/legacy provider 会在读取时迁移。v4 增加地图服务配置和桌面凭据引用。
 
 这不是事务数据库。若未来支持多用户、后台写入或多进程并发，应迁移到 SQLite，并为 schema、事务和备份建立正式层。
 
@@ -370,7 +388,7 @@ Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `respon
 
 ### 10.2 归并
 
-人物 facts 是最多 48 条的内部证据缓冲，UI 主要显示收敛后的 portrait/preferences/advice。当缓冲过长时，`consolidatePeopleIfNeeded` 只发送已核验笔记，不发送原始聊天；请求期间新写入的事实会在返回后并入。每个人最多自动重试 3 次，避免无限归并循环。
+人物 facts 是最多 48 条的内部证据缓冲，UI 主要显示收敛后的 portrait/preferences/advice。自动更新有三层增量边界：会话 fingerprint 只选择已发生变化的私聊；`incrementalConversationRecords` 只提交新增消息及每条新增消息之前最多 16 条上下文；`mergePersonEvidence` 按已核验 claim/source 去重，只有 evidence signature 改变才失效并重新生成 portrait。归并仍读取该人物的完整已核验证据，以免局部文本覆盖旧画像，但不会重发原始聊天；请求期间新写入的证据会使旧响应失效并重新排队。每个人最多自动重试 3 次，避免无限归并循环。
 
 ### 10.3 头像
 
@@ -388,16 +406,19 @@ Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `respon
 
 ### 12.1 底图
 
-Leaflet 请求本地 `/api/map/tiles/{z}/{x}/{y}.png`。服务端验证 z 0-19 和 x/y 边界，依次尝试：
+Leaflet 请求本地 `/api/map/tiles/{z}/{x}/{y}.png?provider=&cacheMaxMb=`。服务端验证 z 0-19、x/y 边界、provider 白名单和 32–1024 MiB 缓存范围。可选底图：
 
 1. `tile.openstreetmap.de`
-2. `a.tile.openstreetmap.fr/hot`
+2. `tile.openstreetmap.org`
+3. `a.tile.openstreetmap.fr/hot`
 
-只返回图片 MIME，限制大小并缓存 7 天。UI 显示 OpenStreetMap/HOT attribution。
+所选源优先，失败后才尝试其他白名单源。瓦片以扁平安全文件名写入 `mapTileCacheDirectoryPath`；每次写入通过同一串行维护队列按 mtime 淘汰旧文件，容量由 INI `[map].cacheMaxMb` 决定。只允许交互式访问，不实现批量预取；UI 始终显示 OpenStreetMap attribution，并提供各服务政策链接。
 
 ### 12.2 地理搜索
 
-`/api/map/search?q=` 至少两个字符、最多 180 字符。服务端按顺序尝试公共服务，拿到首个非空结果集：Nominatim、Photon、ArcGIS World Geocoder、Wikidata、Open-Meteo geocoding。每个提供者约 7 秒超时，最多返回 8 条。
+`/api/map/search?q=&provider=` 至少两个字符、最多 180 字符。`balanced` 并行查询 Nominatim、Photon、ArcGIS World Geocoder、Wikidata 和 Open-Meteo，采用最先返回的有效结果；`nominatim`/`photon` 只调用指定服务。每个提供者约 7 秒超时，最终最多返回 12 条去重坐标。
+
+`GET/POST /api/map/config` 读取或保存 `tileProvider`、`searchProvider`、`cacheMaxMb`。响应还包含可展示的 provider 名称、policy URL、attribution 和 usageNotice；POST 只返回归一化后的三项设置。
 
 只有搜索词发送给第三方；任务标题、人物和地点备注不发送。公共服务无 SLA，应保留手动选点。
 
@@ -434,7 +455,7 @@ Leaflet 请求本地 `/api/map/tiles/{z}/{x}/{y}.png`。服务端验证 z 0-19 �
 | GET | `/api/map/search?q=` | 多源公共地理搜索 |
 | GET | `/api/quote` | 在线语录及离线回退 |
 
-本 API 未设计为局域网或公网服务。不要将 8787 反向代理到外网；它没有用户认证，并且设置 API 可返回当前明文 Key 供本机界面编辑。
+本 API 未设计为局域网或公网服务。不要将 8787 反向代理到外网；它没有用户认证，并且设置 API 可向本机界面返回已解密 Key 供编辑。
 
 ## 14. 日志与可观测性
 
@@ -462,7 +483,7 @@ Leaflet 请求本地 `/api/map/tiles/{z}/{x}/{y}.png`。服务端验证 z 0-19 �
 
 ## 15. 设置和模型配置
 
-INI v3 分为 `[meta]`、`[profile]`、`[appearance]`、`[ai]`、兼容主通道 `[provider]` 和通道池 `[providers]`。`[providers] channels` 保存通道数组，`primaryId` 保存主通道。所有值 URL encode，JSON 子对象再整体编码。写入前做长度、枚举、URL 和数值归一化。
+INI v4 分为 `[meta]`、`[profile]`、`[appearance]`、`[ai]`、`[map]`、兼容主通道 `[provider]` 和通道池 `[providers]`。`[providers] channels` 保存通道数组，`primaryId` 保存主通道；桌面版通道只写 `credentialRef`，密钥密文放在凭据容器。所有值 URL encode，JSON 子对象再整体编码。写入前做长度、枚举、URL 和数值归一化。
 
 启动优先级：已有 INI > 一次性迁移 legacy provider > 环境变量默认值。环境变量：
 
@@ -477,7 +498,7 @@ THEIA_RUNTIME_ROOT=<release-root>
 THEIA_SOFTWARE_RENDERING=1
 ```
 
-环境配置首次保存后进入 INI。Key 按产品需求以明文保留；文档和发布器必须明确此风险。
+打包 Electron 的本地服务运行在主进程，可调用 `safeStorage`：INI 保存 `credentialRef`，密文写入 `credentials.json`。纯 Node 开发/浏览器入口没有 Electron 后端时保留 INI 明文回退。测试和日志不得输出任一形态的 Key。
 
 ## 16. 性能策略
 
@@ -491,10 +512,11 @@ THEIA_SOFTWARE_RENDERING=1
 - 人物聊天浮窗和人物列表使用虚拟窗口，避免一次渲染数万 DOM 节点。
 - 任务图拖拽、缩放和平移尽量通过 rAF 和 CSS transform 写入，结束时才提交 React 状态。
 - Leaflet 使用 canvas 偏好；Electron 默认 GPU 加速。
+- 大于 1 MiB 的 JSON/CSV/TXT 通过 module Web Worker 解析，避免 `JSON.parse`、CSV 扫描和消息归一化长时间占用 renderer。
 - 快照写入和设置写入分别有 250 ms、350 ms 防抖。
 - 头像首次发现时预取并落本地缓存，降低人物页首次打开抖动。
 
-继续优化前应先用 Chrome Performance/Memory profile 找热点。不要仅凭“感觉卡”增加 Web Worker 或并发；大对象 JSON stringify、React 顶层状态更新和超长日志写入通常比图标渲染更值得测量。
+继续优化前应先用 Chrome Performance/Memory profile 找热点。当前 Worker 阈值应通过大文件基准调整；不要为了小文件盲目创建 Worker。大对象 stringify、React 顶层状态更新和超长日志写入仍比图标渲染更值得测量。
 
 ## 17. 开发、检查与构建
 
@@ -511,23 +533,20 @@ npm run dev
 npm run desktop
 npm run lint
 npm run build
+npm run test:e2e
+npm run test:desktop-smoke
 node --check server/index.mjs
 node --check electron/main.mjs
 ```
 
-`npm run build` 先执行 `tsc -b`，再运行 Vite build。`npm test` 会启动两个只在 loopback 监听的假 OpenAI 服务和一个隔离运行目录，验证多通道并行分流、502 单路冷却、备用通道接管以及日志密钥脱敏；它不读取本机聊天、INI 或真实 API Key，也不会访问外网。
+`npm run build` 先执行 `tsc -b`，再运行 Vite build。`npm test` 覆盖 importer、会话分段、候选校验、浏览器存储、append-only archive、schema 迁移/回滚、崩溃恢复/日志轮转和通道池；所有集成测试使用一次性 `THEIA_RUNTIME_ROOT`，不读取本机聊天、INI 或真实 API Key。
 
-当前自动化仍只覆盖通道池关键路径，没有完整的 importer、React 交互或 Electron 端到端测试。不要用单个集成测试代替 lint、build 和发布烟测。
+`npm run test:e2e` 使用 Playwright 和隔离 API/Vite 端口，验证任务图视觉基线、缩放、主题拖拽、拖拽后无文本选择、地图设置和存储健康 UI。Windows 有 Edge 时直接使用系统 Edge，否则使用 Playwright 安装的 Chromium。`npm run test:desktop-smoke` 启动源码 Electron，验证首页、独立 runtime、`safeStorage` 明文 Key 迁移和无明文落盘。生成 unpacked 目录后，`npm run test:unpacked-smoke` 会实际启动打包后的 `THEIA.exe`。不要把视觉快照自动更新当作通过；必须人工查看图片后再提交。
 
-建议优先补测试的纯函数：
+仍建议补充的测试：
 
-- `normalizeCapturedAt` 和各种 importer 字段映射；
-- `conversationContext` 与分段核心/overlap 不重复覆盖；
-- 候选过期和邀请方向判定；
 - 人物证据引用校验与同名会话隔离；
-- shared state 迁移和旧页面写入保护；
 - provider URL 规范化和 API 模式回退；
-- 多通道负载均衡、冷却、主通道停用时的 pool-level configured 语义；
 - 地图搜索结果 bounds/precision/radius。
 
 ## 18. 发布流程
@@ -545,7 +564,7 @@ node --check electron/main.mjs
 ### 18.2 打包器
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.3.0\THEIA-release-0.3.0
+node release-tools/package-release.mjs ..\staging\v0.4.0\THEIA-release-0.4.0
 ```
 
 打包器要求目标在源码目录之外且不存在，避免误覆盖。它复制必要源码、锁文件、发布文档、默认资源和虚构示例，并生成 `RELEASE_MANIFEST.json`。明确排除：
@@ -559,18 +578,27 @@ node release-tools/package-release.mjs ..\staging\v0.3.0\THEIA-release-0.3.0
 
 发布后在目标目录运行 `npm --prefix app install` 和一次 build。若压缩为 ZIP，应记录文件大小和 SHA-256；不要覆盖旧 ZIP 后仍沿用旧校验值。
 
-### 18.3 当前不是生产安装器
+### 18.3 Windows 安装器、签名与更新
 
-此流程输出源码发布包，不会：
+标准安装器：
 
-- 打包 `asar`；
-- 生成 EXE/MSI；
-- 签署可执行文件；
-- 捆绑 Node/npm；
-- 离线附带 `node_modules`；
-- 自动更新。
+```powershell
+npm run dist:installer
+```
 
-若要面向普通用户正式分发，建议引入 electron-builder/electron-forge、固定所有依赖版本、Windows 代码签名、安装/卸载策略、迁移脚本和可回滚更新。还应决定模型 Key 是否迁移到 Windows Credential Manager，而不是继续明文 INI。
+electron-builder 输出到 `release-bin/installer/`，使用 `asar` 和 Windows x64 NSIS assisted installer；允许选择安装目录，创建桌面/开始菜单快捷方式，卸载默认不删除 `%APPDATA%\THEIA`。构建优先复用 `node_modules/electron/dist` 中已由 npm 安装的同版本 Electron，避免重复下载大型运行时；NSIS 工具链首次仍从 electron-builder 官方 GitHub Release 获取并校验固定 SHA-256。`npm run dist:unpacked` 只生成 unpacked 目录，适合发布前烟测。原有 `npm run dist:exe` 便携构建继续保留，两条路线不能混用更新元数据。
+
+正式签名构建在干净 CI 中注入：
+
+```text
+CSC_LINK=<base64、HTTPS URL 或证书文件路径>
+CSC_KEY_PASSWORD=<证书密码>
+GH_TOKEN=<仅发布 GitHub Release 时使用>
+```
+
+仓库不保存 PFX、密码或 token。`win.forceCodeSigning=false` 只为本地开发保留未签名构建能力；公开发行应把“缺少签名”作为 CI 失败条件。GitHub publisher 固定为 `bakahuiii/THEIA`。electron-builder 生成 `app-update.yml` 和 `latest.yml`；Electron 仅在 packaged 且存在 `app-update.yml` 时调用 electron-updater。更新下载后询问立即重启，选择稍后则在正常退出时安装。
+
+自动更新不能替代数据 schema 回滚。应用升级前仍应备份 runtime；应用二进制可回退，但新版本已经迁移过的数据必须通过 `migrations/` 和 `npm run data:rollback` 单独处理。
 
 ## 19. 修改数据结构时的规则
 
@@ -587,23 +615,12 @@ node release-tools/package-release.mjs ..\staging\v0.3.0\THEIA-release-0.3.0
 
 ## 20. 已知风险与后续优先级
 
-高优先级：
+`0.4.0` 已完成本轮列出的测试、hook/视图拆分、append-only store、schema/回滚、系统凭据、地图配置/缓存、崩溃恢复、Worker、附件成本提示、Playwright 和安装器基础。仍需继续处理：
 
-- 为 importer、分段、候选校验和持久化补自动化测试；
-- 把 `App.tsx` 的 shared sync/settings sync/AI workflow 抽成可测 hook；
-- 把 `IntelView.tsx` 拆为导入、会话浏览、候选和分析控制器；
-- 采用 SQLite 或 append-only store 处理百万级归档，避免整文件 JSON 重写；
-- 为发布版建立 schema version、迁移和回滚；
-- 将 API Key 移入系统凭据存储；
-- 为公共地图服务增加可配置源、使用政策和本地缓存上限；
-- 增加崩溃恢复和日志轮转。
+- 将 `App.tsx` 中人物归并、任务建议和领域 reducer 继续拆成可单测模块；
+- 为地图缓存加入命中率/清理统计和显式“清空地图缓存”；
+- 增加 macOS/Linux 安装验证，以及 CI 中的 Windows EV/OV 证书签名和发布审批；
+- 为附件识别增加每个文件的运行状态、失败重试和真实 provider usage 回填；
+- 在百万级实际数据上建立导入耗时、内存峰值、归档 compaction 和恢复时间基准。
 
-中优先级：
-
-- Web Worker 解析大型 JSON/CSV；
-- 附件内容识别的明确队列和成本提示；
-- 更细粒度人物增量更新；
-- Playwright 桌面/浏览器视觉回归和任务图拖拽测试；
-- 正式安装器、自动更新和签名。
-
-在这些基础设施完成前，`0.3.0` 仍应理解为可审计的单用户源码/便携版，而不是无条件承诺可处理任意格式、任意规模和任意兼容中转。
+THEIA 仍是单用户本地应用，不承诺无上限规模、任意导出格式、任何公共服务 SLA 或所有 OpenAI 兼容中转完全一致。新增协议必须继续保留 0.3.0 的并发、2 秒本地退避和 502 请求稳定基线。

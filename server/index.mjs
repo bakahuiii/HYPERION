@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { appendFile, mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { dirname, resolve } from 'node:path'
-import { gzip, gunzip } from 'node:zlib'
+import { gzip } from 'node:zlib'
 import { promisify } from 'node:util'
 import {
   createProviderChannel,
@@ -19,10 +19,14 @@ import {
   saveProviderConfig,
   updateProviderChannel,
 } from './providerConfig.mjs'
-import { backgroundAssetPath, loadSettings, saveAppSettings, saveBackgroundAsset } from './settings.mjs'
+import { backgroundAssetPath, loadSettings, saveAppSettings, saveBackgroundAsset, saveMapSettings } from './settings.mjs'
 import { runtimePaths } from './runtimePaths.mjs'
 import { rotateFileCopies } from './fileRotation.mjs'
 import { withFileLock, writeFileAtomically } from './atomicFile.mjs'
+import { createAppendOnlyArchiveStore } from './archiveStore.mjs'
+import { listSharedStateBackups, migrateSharedStateFile, versionSharedState, SHARED_STATE_SCHEMA, SHARED_STATE_SCHEMA_VERSION } from './schemaMigrations.mjs'
+import { pruneLogDirectory } from './logRetention.mjs'
+import { finishRecoverySession, recordRuntimeFailure, startRecoverySession } from './crashRecovery.mjs'
 
 const port = Number(process.env.AI_PORT || 8787)
 const maxBodyBytes = 256 * 1024 * 1024
@@ -37,25 +41,43 @@ const fallbackQuotes = [
 const {
   sharedStatePath,
   sharedIntelPath,
+  sharedIntelStoreDirectoryPath,
   sharedIntelMetaPath,
   sharedIntelLegacyPath,
   aiDebugLogPath,
   taskLogDirectoryPath,
+  crashLogPath,
+  serviceSessionPath,
   avatarCacheDirectoryPath,
+  mapTileCacheDirectoryPath,
   settingsPath,
+  credentialStorePath,
   backgroundDirectoryPath,
   electronUserDataPath,
   legacyProviderPath,
   desktopPidPath,
+  migrationDirectoryPath,
 } = runtimePaths
+const sharedIntelStore = createAppendOnlyArchiveStore({
+  directory: sharedIntelStoreDirectoryPath,
+  metadataPath: sharedIntelMetaPath,
+  legacyCompressedPath: sharedIntelPath,
+  legacyJsonPath: sharedIntelLegacyPath,
+})
 const gzipAsync = promisify(gzip)
-const gunzipAsync = promisify(gunzip)
 let sharedStateWriteQueue = Promise.resolve()
 let sharedIntelWriteQueue = Promise.resolve()
 let aiDebugWriteQueue = Promise.resolve()
 const activeTaskLogs = new Set()
+let taskLogMaintenanceQueue = Promise.resolve()
+let mapTileMaintenanceQueue = Promise.resolve()
+let recoveryStatus = { uncleanShutdownDetected: false, previous: null, session: null }
+let sharedStateMigrationStatus = { state: 'pending', migrated: false }
+let archiveMigrationStatus = { state: 'pending', migrated: false }
 const aiDebugMaxBytes = 8 * 1024 * 1024
 const aiDebugRotationCount = 3
+const taskLogMaxFiles = 2_000
+const taskLogMaxBytes = 512 * 1024 * 1024
 const providerRuntimeById = new Map()
 const providerOriginRuntimeByKey = new Map()
 // Multiple saved channels can point at the same relay. Keep a high safety
@@ -92,6 +114,15 @@ const aiSessions = new Map()
 const aiSessionTtlMs = 30 * 60 * 1000
 const aiSessionMaxEnqueue = 40
 const aiSessionResultPageSize = 120
+const recoveryMonitorKey = Symbol.for('theia.runtimeRecoveryMonitor')
+
+function installRuntimeFailureMonitor() {
+  if (globalThis[recoveryMonitorKey]) return
+  globalThis[recoveryMonitorKey] = true
+  process.on('uncaughtExceptionMonitor', (error, origin) => {
+    void recordRuntimeFailure(crashLogPath, origin, error).catch(() => undefined)
+  })
+}
 
 async function readJsonFile(path) {
   try {
@@ -144,19 +175,50 @@ async function storageEntry(id, path, description, includeDirectorySize = false)
 }
 
 async function storageOverview() {
-  const entries = await Promise.all([
+  const [entries, migrationBackups, archiveMeta] = await Promise.all([
+    Promise.all([
     storageEntry('shared-state', sharedStatePath, '任务、人物、地点、候选任务和界面状态的共享快照。'),
-    storageEntry('shared-intel', sharedIntelPath, '原始聊天归档。仅在本机保留，模型提炼时按你选择的范围读取。'),
-    storageEntry('settings', settingsPath, '通用 INI：名称、外观、模型通道和提炼偏好。包含你保存的明文 API Key。'),
+    storageEntry('shared-intel', sharedIntelStoreDirectoryPath, '原始聊天增量归档。使用带 schema 的 gzip JSONL 分段，避免每次修改都重写整个归档。', true),
+    storageEntry('shared-intel-rollback', sharedIntelPath, '0.3.x gzip 归档回滚源；迁移完成后仍保留，供人工回滚。'),
+    storageEntry('settings', settingsPath, '通用 INI：名称、外观、模型通道和提炼偏好。桌面版只保留凭据引用，不写入明文 API Key。'),
+    storageEntry('credentials', credentialStorePath, '桌面版 API Key 的系统加密凭据 blob；由当前系统账户解密。'),
     storageEntry('backgrounds', backgroundDirectoryPath, '已上传的自定义背景图片。', true),
     storageEntry('debug-log', aiDebugLogPath, '模型请求调试日志，不含聊天正文、附件或密钥。'),
     storageEntry('task-logs', taskLogDirectoryPath, '按任务与时间戳分文件保存的完整本地模型输入、输出和失败信息，不含 API Key。', true),
+    storageEntry('crash-log', crashLogPath, '非正常退出与运行时崩溃记录；最大 2MB，保留 2 份轮转副本。'),
     storageEntry('avatar-cache', avatarCacheDirectoryPath, '从导出记录的微信/QQ头像地址下载的本地缓存。', true),
+    storageEntry('map-tile-cache', mapTileCacheDirectoryPath, '公共地图瓦片的有界本地缓存；容量由地图服务设置控制。', true),
     storageEntry('electron-user-data', electronUserDataPath, '桌面客户端的 Chromium 会话、缓存和窗口运行数据；退出客户端后仍会保留。'),
     storageEntry('desktop-pid', desktopPidPath, '桌面客户端运行标记；关闭客户端后会自动清除。'),
+    storageEntry('migrations', migrationDirectoryPath, 'schema 升级前的只读回滚备份；可通过 npm run data:rollback 查看和恢复。', true),
     storageEntry('legacy-provider', legacyProviderPath, '旧版模型通道配置；若仍存在，仅用于一次性迁移。'),
+    ]),
+    listSharedStateBackups(migrationDirectoryPath),
+    loadSharedIntelMeta().catch(() => null),
   ])
-  return { workspace: runtimePaths.workspace, entries }
+  return {
+    workspace: runtimePaths.workspace,
+    entries,
+    health: {
+      sharedState: {
+        schema: SHARED_STATE_SCHEMA,
+        schemaVersion: SHARED_STATE_SCHEMA_VERSION,
+        migration: sharedStateMigrationStatus,
+        rollbackBackups: migrationBackups,
+      },
+      archive: {
+        schema: archiveMeta?.schema ?? 'theia-intel-archive/v1',
+        schemaVersion: Number(archiveMeta?.schemaVersion) || 1,
+        storageEngine: archiveMeta?.storageEngine ?? 'append-only-jsonl-gzip',
+        recordCount: Number(archiveMeta?.recordCount) || 0,
+        segmentCount: Number(archiveMeta?.segmentCount) || 0,
+        updatedAt: archiveMeta?.updatedAt ?? null,
+        migration: archiveMigrationStatus,
+      },
+      recovery: recoveryStatus,
+      rollbackCommand: 'npm run data:rollback -- --latest',
+    },
+  }
 }
 
 async function rotateAiDebugLog(nextBytes) {
@@ -253,6 +315,17 @@ async function compactExistingTaskLogs() {
   } catch (error) {
     if (error?.code !== 'ENOENT') console.warn(`[THEIA AI] Unable to compact task logs: ${error instanceof Error ? error.message : String(error)}`)
   }
+  scheduleTaskLogMaintenance()
+}
+
+function scheduleTaskLogMaintenance() {
+  const maintenance = taskLogMaintenanceQueue.then(() => pruneLogDirectory(taskLogDirectoryPath, {
+    maxFiles: taskLogMaxFiles,
+    maxBytes: taskLogMaxBytes,
+    exclude: activeTaskLogs,
+  }))
+  taskLogMaintenanceQueue = maintenance.catch(() => undefined)
+  return maintenance
 }
 
 async function finishTaskLog(log, event, details) {
@@ -264,6 +337,7 @@ async function finishTaskLog(log, event, details) {
     // storage view and shutdown/cleanup deterministic while retaining the
     // compressed-at-rest format for completed logs.
     await compressTaskLog(log.path)
+    scheduleTaskLogMaintenance()
   } catch (error) {
     activeTaskLogs.delete(log.path)
     console.warn(`[THEIA AI] Unable to finish task log: ${error instanceof Error ? error.message : String(error)}`)
@@ -307,6 +381,9 @@ function providerDebugFields(value) {
 async function loadSharedState() {
   const payload = await readJsonFile(sharedStatePath)
   if (!payload || typeof payload !== 'object' || !payload.data) return null
+  if (payload.schemaVersion && Number(payload.schemaVersion) > SHARED_STATE_SCHEMA_VERSION) {
+    throw new Error(`共享状态 schema ${payload.schemaVersion} 高于当前支持版本 ${SHARED_STATE_SCHEMA_VERSION}`)
+  }
   // Raw archives are intentionally not part of a dashboard snapshot. Older
   // files may still contain `intel`; keep those bytes untouched on disk while
   // stripping them before they can freeze browser/desktop synchronization.
@@ -315,131 +392,23 @@ async function loadSharedState() {
 }
 
 async function loadSharedIntel() {
-  let compressed
-  try {
-    compressed = await readFile(sharedIntelPath)
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error
-  }
-  let payload
-  if (compressed) {
-    try {
-      payload = JSON.parse((await gunzipAsync(compressed)).toString('utf8'))
-    } catch (error) {
-      throw new Error(`本机原始聊天归档已损坏，无法解压或解析：${error instanceof Error ? error.message : String(error)}`)
-    }
-  } else {
-    payload = await readJsonFile(sharedIntelLegacyPath)
-  }
-  // Releases before the cross-client archive sync stored the raw array
-  // directly. Keep that archive readable while new writes use gzip storage.
-  if (Array.isArray(payload)) return { updatedAt: null, sourceFingerprint: null, recordCount: payload.length, items: payload }
-  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.items)) return { updatedAt: null, sourceFingerprint: null, recordCount: 0, items: [] }
-  return {
-    updatedAt: typeof payload.updatedAt === 'string' ? payload.updatedAt : null,
-    sourceFingerprint: typeof payload.sourceFingerprint === 'string' ? payload.sourceFingerprint : null,
-    recordCount: payload.items.length,
-    items: payload.items,
-  }
+  return sharedIntelStore.loadSnapshot()
 }
 
 async function loadSharedIntelMeta() {
-  const metadata = await readJsonFile(sharedIntelMetaPath)
-  if (metadata && typeof metadata === 'object' && Number.isFinite(Number(metadata.recordCount))) {
-    return {
-      updatedAt: typeof metadata.updatedAt === 'string' ? metadata.updatedAt : null,
-      sourceFingerprint: typeof metadata.sourceFingerprint === 'string' ? metadata.sourceFingerprint : null,
-      recordCount: Math.max(0, Math.floor(Number(metadata.recordCount))),
-    }
-  }
-
-  let details
-  try {
-    details = await stat(sharedIntelPath)
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error
-    try { details = await stat(sharedIntelLegacyPath) } catch (legacyError) {
-      if (legacyError?.code !== 'ENOENT') throw legacyError
-      return { updatedAt: null, sourceFingerprint: null, recordCount: 0 }
-    }
-  }
-  // Old releases have no sidecar. Reuse the small dashboard summary instead
-  // of inflating and parsing a 100+ MB gzip archive just to render Options.
-  const state = await loadSharedState().catch(() => null)
-  return {
-    updatedAt: details.mtime.toISOString(),
-    sourceFingerprint: typeof state?.data?.archive?.sourceFingerprint === 'string' ? state.data.archive.sourceFingerprint : null,
-    recordCount: Math.max(1, Math.floor(Number(state?.data?.archive?.messageCount) || 0)),
-  }
+  return sharedIntelStore.loadMeta()
 }
 
 async function writeSharedIntelUnlocked(payload) {
-  const items = Array.isArray(payload?.items) ? payload.items : Array.isArray(payload) ? payload : null
-  if (!items) throw new Error('原始聊天归档格式无效')
-  const compactItems = items.map((item) => {
-    if (!item || typeof item !== 'object' || typeof item.content !== 'string' || !item.content.trim()) return item
-    if (!Object.hasOwn(item, 'title') && !Object.hasOwn(item, 'summary')) return item
-    const stored = { ...item }
-    delete stored.title
-    delete stored.summary
-    return stored
-  })
-  const previousMetadata = await readJsonFile(sharedIntelMetaPath)
-  // Releases before the sidecar metadata file was introduced still have a
-  // valid archive on disk. Treat its mtime as the version in that case so a
-  // renderer that read `/api/sync/intel/meta` can successfully perform an
-  // optimistic write instead of receiving a permanent 409 conflict.
-  let archiveUpdatedAt = null
-  if (typeof previousMetadata?.updatedAt !== 'string') {
-    let details
-    try {
-      details = await stat(sharedIntelPath)
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error
-      try {
-        details = await stat(sharedIntelLegacyPath)
-      } catch (legacyError) {
-        if (legacyError?.code !== 'ENOENT') throw legacyError
-      }
-    }
-    if (details) archiveUpdatedAt = details.mtime.toISOString()
-  }
-  const currentUpdatedAt = typeof previousMetadata?.updatedAt === 'string'
-    ? previousMetadata.updatedAt
-    : archiveUpdatedAt
-  if (Object.prototype.hasOwnProperty.call(payload ?? {}, 'expectedUpdatedAt')) {
-    const expectedUpdatedAt = typeof payload.expectedUpdatedAt === 'string' ? payload.expectedUpdatedAt : null
-    if (expectedUpdatedAt !== currentUpdatedAt) {
-      const conflict = new Error('本机原始聊天归档已被另一个窗口更新，请合并后重试')
-      conflict.statusCode = 409
-      conflict.currentUpdatedAt = currentUpdatedAt
-      throw conflict
-    }
-  }
-  const previousTime = currentUpdatedAt ? Date.parse(currentUpdatedAt) : Number.NaN
-  const snapshot = {
-    // Metadata polling uses a strict greater-than comparison. Keep timestamps
-    // monotonic even for two tiny writes completed in the same millisecond.
-    updatedAt: new Date(Math.max(Date.now(), Number.isFinite(previousTime) ? previousTime + 1 : 0)).toISOString(),
-    sourceFingerprint: typeof payload?.sourceFingerprint === 'string' ? payload.sourceFingerprint : null,
-    items: compactItems,
-  }
-  const compressed = await gzipAsync(Buffer.from(JSON.stringify(snapshot), 'utf8'), { level: 6 })
-  await writeFileAtomically(sharedIntelPath, compressed, { mode: 0o600 })
-  await writeJsonAtomically(sharedIntelMetaPath, {
-    updatedAt: snapshot.updatedAt,
-    sourceFingerprint: snapshot.sourceFingerprint,
-    recordCount: compactItems.length,
-  })
-  // Remove the legacy JSON only after the compressed archive is in place.
-  await unlink(sharedIntelLegacyPath).catch((error) => {
-    if (error?.code !== 'ENOENT') throw error
-  })
-  return { updatedAt: snapshot.updatedAt, sourceFingerprint: snapshot.sourceFingerprint, recordCount: compactItems.length }
+  return sharedIntelStore.commit(payload)
 }
 
 async function writeSharedIntel(payload) {
-  return withFileLock(`${sharedIntelPath}.lock`, () => writeSharedIntelUnlocked(payload))
+  return withFileLock(`${sharedIntelStoreDirectoryPath}.lock`, () => writeSharedIntelUnlocked(payload))
+}
+
+async function writeSharedIntelDelta(payload) {
+  return withFileLock(`${sharedIntelStoreDirectoryPath}.lock`, () => sharedIntelStore.commitDelta(payload))
 }
 
 function migrateLegacySharedIntel() {
@@ -447,17 +416,9 @@ function migrateLegacySharedIntel() {
   // Otherwise a first import racing startup could be overwritten by the old
   // JSON snapshot that migration read a moment earlier.
   const migration = sharedIntelWriteQueue.then(async () => {
-    try {
-      await stat(sharedIntelPath)
-      return
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error
-    }
-    const legacy = await readJsonFile(sharedIntelLegacyPath)
-    const items = Array.isArray(legacy) ? legacy : legacy?.items
-    if (!Array.isArray(items) || !items.length) return
-    await writeSharedIntel({ items })
-    console.log(`[THEIA] migrated ${items.length} chat records to gzip archive storage`)
+    const migrated = await withFileLock(`${sharedIntelStoreDirectoryPath}.lock`, () => sharedIntelStore.migrate())
+    if (migrated) console.log('[THEIA] migrated the legacy gzip chat archive to append-only segment storage; the legacy file remains available for rollback')
+    return migrated
   })
   sharedIntelWriteQueue = migration.catch(() => undefined)
   return migration
@@ -467,6 +428,12 @@ function saveSharedIntel(payload) {
   // The archive can be large. Serializing writes prevents two browser/desktop
   // clients from competing for the same temporary file during startup.
   const write = sharedIntelWriteQueue.then(() => writeSharedIntel(payload))
+  sharedIntelWriteQueue = write.catch(() => undefined)
+  return write
+}
+
+function saveSharedIntelDelta(payload) {
+  const write = sharedIntelWriteQueue.then(() => writeSharedIntelDelta(payload))
   sharedIntelWriteQueue = write.catch(() => undefined)
   return write
 }
@@ -497,7 +464,7 @@ async function writeSharedState(payload) {
   const { intel: _ignoredIntel, ...data } = payload.data
   const previousTime = typeof legacy?.updatedAt === 'string' ? Date.parse(legacy.updatedAt) : Number.NaN
   const updatedAt = new Date(Math.max(Date.now(), Number.isFinite(previousTime) ? previousTime + 1 : 0)).toISOString()
-  const snapshot = { updatedAt, data }
+  const snapshot = versionSharedState({ updatedAt, data })
   await writeJsonAtomically(sharedStatePath, snapshot)
   return snapshot
 }
@@ -505,7 +472,7 @@ async function writeSharedState(payload) {
 function saveSharedState(payload) {
   // Desktop and browser may sync at nearly the same time. A single temporary
   // file is safe only when snapshot writes are serialized.
-  const write = sharedStateWriteQueue.then(() => writeSharedState(payload))
+  const write = sharedStateWriteQueue.then(() => withFileLock(`${sharedStatePath}.lock`, () => writeSharedState(payload)))
   sharedStateWriteQueue = write.catch(() => undefined)
   return write
 }
@@ -2724,25 +2691,61 @@ async function fetchApprovedImage(initialUrl, { maxBytes, allowedHost }) {
   throw new Error('图片服务重定向次数过多')
 }
 
-function mapTileUrls(z, x, y) {
-  const maxCoordinate = (2 ** z) - 1
-  if (![z, x, y].every(Number.isInteger) || z < 0 || z > 19 || x < 0 || y < 0 || x > maxCoordinate || y > maxCoordinate) throw new Error('地图瓦片坐标无效')
-  // The canonical OSM host times out on some Chinese networks. These are
-  // public OSM-compatible mirrors, tried in a verified order without API keys.
-  return [
-    new URL(`https://tile.openstreetmap.de/${z}/${x}/${y}.png`),
-    new URL(`https://a.tile.openstreetmap.fr/hot/${z}/${x}/${y}.png`),
-  ]
+const mapTileProviders = {
+  'osm-de': {
+    name: 'OpenStreetMap DE',
+    policyUrl: 'https://www.openstreetmap.de/germanstyle.html',
+    host: 'tile.openstreetmap.de',
+    url: (z, x, y) => `https://tile.openstreetmap.de/${z}/${x}/${y}.png`,
+  },
+  'osm-standard': {
+    name: 'OpenStreetMap Standard',
+    policyUrl: 'https://operations.osmfoundation.org/policies/tiles/',
+    host: 'tile.openstreetmap.org',
+    url: (z, x, y) => `https://tile.openstreetmap.org/${z}/${x}/${y}.png`,
+  },
+  'osm-hot': {
+    name: 'Humanitarian OpenStreetMap',
+    policyUrl: 'https://www.hotosm.org/terms/',
+    host: 'a.tile.openstreetmap.fr',
+    url: (z, x, y) => `https://a.tile.openstreetmap.fr/hot/${z}/${x}/${y}.png`,
+  },
 }
 
-async function fetchMapTile(z, x, y) {
+function mapTileUrls(providerId, z, x, y) {
+  const maxCoordinate = (2 ** z) - 1
+  if (![z, x, y].every(Number.isInteger) || z < 0 || z > 19 || x < 0 || y < 0 || x > maxCoordinate || y > maxCoordinate) throw new Error('地图瓦片坐标无效')
+  const selected = Object.hasOwn(mapTileProviders, providerId) ? providerId : 'osm-de'
+  const ordered = [selected, ...Object.keys(mapTileProviders).filter((id) => id !== selected)]
+  return ordered.map((id) => new URL(mapTileProviders[id].url(z, x, y)))
+}
+
+async function fetchMapTile(providerId, z, x, y, cacheMaxMb) {
+  const selected = Object.hasOwn(mapTileProviders, providerId) ? providerId : 'osm-de'
+  const cachePath = resolve(mapTileCacheDirectoryPath, `${selected}-${z}-${x}-${y}.png`)
+  try {
+    const content = await readFile(cachePath)
+    if (content.length > 0 && content.length <= maxTileBytes) return { mimeType: 'image/png', content, cache: 'hit' }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') console.warn(`[THEIA] map tile cache read failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
   let failure
-  for (const url of mapTileUrls(z, x, y)) {
+  for (const url of mapTileUrls(selected, z, x, y)) {
     try {
-      return await fetchApprovedImage(url, {
+      const image = await fetchApprovedImage(url, {
         maxBytes: maxTileBytes,
-        allowedHost: (host) => host === 'tile.openstreetmap.de' || host === 'a.tile.openstreetmap.fr',
+        allowedHost: (host) => Object.values(mapTileProviders).some((provider) => provider.host === host),
       })
+      try {
+        await mkdir(mapTileCacheDirectoryPath, { recursive: true, mode: 0o700 })
+        await writeFileAtomically(cachePath, image.content, { mode: 0o600 })
+        const maxBytes = Math.round(Math.max(32, Math.min(1024, Number(cacheMaxMb) || 128)) * 1024 * 1024)
+        const maintenance = mapTileMaintenanceQueue.then(() => pruneLogDirectory(mapTileCacheDirectoryPath, { maxFiles: 100_000, maxBytes, exclude: new Set([cachePath]) }))
+        mapTileMaintenanceQueue = maintenance.catch(() => undefined)
+      } catch (cacheError) {
+        console.warn(`[THEIA] map tile cache write failed: ${cacheError instanceof Error ? cacheError.message : String(cacheError)}`)
+      }
+      return { ...image, cache: 'miss' }
     } catch (error) {
       failure = error
     }
@@ -2770,7 +2773,9 @@ export const server = http.createServer(async (request, response) => {
   if (tileMatch && request.method === 'GET') {
     try {
       const [z, x, y] = tileMatch.slice(1).map(Number)
-      const image = await fetchMapTile(z, x, y)
+      const parameters = new URL(request.url || '/', 'http://127.0.0.1').searchParams
+      const image = await fetchMapTile(parameters.get('provider') || 'osm-de', z, x, y, parameters.get('cacheMaxMb'))
+      response.setHeader('x-theia-map-cache', image.cache)
       sendImage(response, image.mimeType, image.content, 60 * 60 * 24 * 7)
     } catch (error) {
       sendRequestError(response, error, '地图底图加载失败')
@@ -2787,9 +2792,39 @@ export const server = http.createServer(async (request, response) => {
     }
     return
   }
+  if (requestPath === '/api/map/config' && request.method === 'GET') {
+    try {
+      const { settings } = await loadSettings()
+      sendJson(response, 200, {
+        ...settings.mapSettings,
+        tileProviders: Object.entries(mapTileProviders).map(([id, provider]) => ({ id, name: provider.name, policyUrl: provider.policyUrl })),
+        searchProviders: [
+          { id: 'balanced', name: '自动选择', detail: '并行查询多个公共地理编码服务，采用最先返回的有效结果。', policyUrl: 'https://operations.osmfoundation.org/policies/nominatim/' },
+          { id: 'nominatim', name: 'Nominatim', detail: 'OpenStreetMap 官方公共搜索服务，适合低频人工查询。', policyUrl: 'https://operations.osmfoundation.org/policies/nominatim/' },
+          { id: 'photon', name: 'Photon', detail: 'Komoot 提供的开源地理编码服务。', policyUrl: 'https://photon.komoot.io/' },
+        ],
+        attribution: '© OpenStreetMap contributors',
+        usageNotice: '仅用于交互式个人地图。禁止批量预取或离线抓取；THEIA 会使用有界本地缓存并保留地图署名。',
+      })
+    } catch (error) {
+      sendRequestError(response, error, '地图服务设置读取失败')
+    }
+    return
+  }
+  if (requestPath === '/api/map/config' && request.method === 'POST') {
+    try {
+      const mapSettings = await saveMapSettings(await readBody(request))
+      sendJson(response, 200, mapSettings)
+    } catch (error) {
+      sendRequestError(response, error, '地图服务设置保存失败')
+    }
+    return
+  }
   if (requestPath === '/api/map/search' && request.method === 'GET') {
     try {
-      const query = new URL(request.url || '/', 'http://127.0.0.1').searchParams.get('q')?.trim() || ''
+      const mapRequestUrl = new URL(request.url || '/', 'http://127.0.0.1')
+      const query = mapRequestUrl.searchParams.get('q')?.trim() || ''
+      const searchProvider = mapRequestUrl.searchParams.get('provider') || 'balanced'
       if (query.length < 2) throw new Error('搜索地点至少需要两个字符')
       const normalizedQuery = query.slice(0, 180)
       const headers = { accept: 'application/json', 'user-agent': 'THEIA-personal-map/0.1 (local user search)' }
@@ -2900,7 +2935,8 @@ export const server = http.createServer(async (request, response) => {
           return Array.isArray(payload?.results) ? keepValid(payload.results.map((item) => ({ display_name: [cleanString(item?.name, 120), cleanString(item?.admin1, 120), cleanString(item?.country, 120)].filter(Boolean).join('，'), lat: String(item?.latitude ?? ''), lon: String(item?.longitude ?? ''), kind: cleanString(item?.feature_code, 80) }))) : []
         },
       ]
-      const attempts = providers.map((provider) => provider())
+      const selectedProviders = searchProvider === 'nominatim' ? providers.slice(0, 1) : searchProvider === 'photon' ? providers.slice(1, 2) : providers
+      const attempts = selectedProviders.map((provider) => provider())
       const firstUseful = new Promise((resolveFirst) => {
         attempts.forEach((attempt) => {
           void attempt.then((items) => {
@@ -3047,6 +3083,10 @@ export const server = http.createServer(async (request, response) => {
     }
     return
   }
+  if (request.url === '/api/runtime/recovery' && request.method === 'GET') {
+    sendJson(response, 200, recoveryStatus)
+    return
+  }
   if (request.url === '/api/sync/snapshot' && request.method === 'GET') {
     try {
       const snapshot = await loadSharedState()
@@ -3079,6 +3119,18 @@ export const server = http.createServer(async (request, response) => {
       sendJson(response, 200, archive)
     } catch (error) {
       sendJson(response, 500, { error: error instanceof Error ? error.message : '无法读取本机原始聊天归档' })
+    }
+    return
+  }
+  if (requestPath === '/api/sync/intel/delta' && request.method === 'POST') {
+    try {
+      sendJson(response, 200, await saveSharedIntelDelta(await readBody(request)))
+    } catch (error) {
+      const status = Number(error?.statusCode) === 409 ? 409 : Number(error?.status) === 413 ? 413 : 400
+      sendJson(response, status, {
+        error: error instanceof Error ? error.message : '无法增量保存本机原始聊天归档',
+        ...(status === 409 ? { currentUpdatedAt: error?.currentUpdatedAt ?? null } : {}),
+      })
     }
     return
   }
@@ -3435,7 +3487,26 @@ export function startAiProxy() {
       const address = server.address()
       const listeningPort = address && typeof address !== 'string' ? address.port : port
       console.log(`AI proxy listening on http://127.0.0.1:${listeningPort}`)
-      void migrateLegacySharedIntel().catch((error) => console.warn(`[THEIA] archive migration skipped: ${error instanceof Error ? error.message : String(error)}`))
+      installRuntimeFailureMonitor()
+      void startRecoverySession(serviceSessionPath, crashLogPath, { port: listeningPort })
+        .then((status) => { recoveryStatus = status })
+        .catch((error) => console.warn(`[THEIA] recovery marker unavailable: ${error instanceof Error ? error.message : String(error)}`))
+      server.once('close', () => { void finishRecoverySession(serviceSessionPath).catch(() => undefined) })
+      void withFileLock(`${sharedStatePath}.lock`, () => migrateSharedStateFile(sharedStatePath, migrationDirectoryPath))
+        .then((result) => {
+          sharedStateMigrationStatus = { state: 'ready', ...result }
+          if (result.migrated) console.log(`[THEIA] shared state schema migrated to v${result.toVersion}; rollback backup: ${result.backupPath}`)
+        })
+        .catch((error) => {
+          sharedStateMigrationStatus = { state: 'failed', migrated: false, error: error instanceof Error ? error.message : String(error) }
+          console.warn(`[THEIA] shared state migration skipped: ${sharedStateMigrationStatus.error}`)
+        })
+      void migrateLegacySharedIntel()
+        .then((migrated) => { archiveMigrationStatus = { state: 'ready', migrated } })
+        .catch((error) => {
+          archiveMigrationStatus = { state: 'failed', migrated: false, error: error instanceof Error ? error.message : String(error) }
+          console.warn(`[THEIA] archive migration skipped: ${archiveMigrationStatus.error}`)
+        })
       void compactExistingTaskLogs()
       resolve(server)
     })

@@ -1,7 +1,6 @@
-import { app, BrowserWindow, Menu, protocol } from 'electron'
+import { app, BrowserWindow, dialog, Menu, protocol } from 'electron'
 import { createServer } from 'vite'
-import { spawn } from 'node:child_process'
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { dirname, extname, isAbsolute, relative, resolve } from 'node:path'
 import process from 'node:process'
@@ -25,12 +24,12 @@ const [{ server, startAiProxy }, { runtimePaths }] = await Promise.all([
   import('../server/index.mjs'),
   import('../server/runtimePaths.mjs'),
 ])
+const { recordRuntimeFailure } = await import('../server/crashRecovery.mjs')
 
 let viteServer
 let mainWindow
 let ownsAiProxy = false
-let packagedServiceProcess
-const { electronUserDataPath: userDataPath, desktopPidPath } = runtimePaths
+const { electronUserDataPath: userDataPath, desktopPidPath, crashLogPath } = runtimePaths
 
 // Large task maps and Leaflet tiles need Chromium compositing and raster work
 // on the GPU. Software rendering remains an explicit fallback for a broken
@@ -75,7 +74,13 @@ function clearDesktopPid() {
 }
 
 async function startLocalServices() {
-  if (app.isPackaged) return startPackagedService()
+  if (app.isPackaged) {
+    await startAiProxy()
+    ownsAiProxy = true
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('THEIA local service did not expose a loopback port.')
+    return `http://127.0.0.1:${address.port}/`
+  }
 
   try {
     await startAiProxy()
@@ -96,53 +101,6 @@ async function startLocalServices() {
   })
   await viteServer.listen()
   return viteServer.resolvedUrls?.local?.[0] ?? 'http://127.0.0.1:5173/'
-}
-
-function startPackagedService() {
-  const nodeRuntime = resolve(root, 'runtime', 'node.exe')
-  const serverEntry = resolve(root, 'server', 'index.mjs')
-  const serviceEnvironment = { ...process.env, AI_PORT: '0' }
-  delete serviceEnvironment.ELECTRON_RUN_AS_NODE
-  return new Promise((resolvePromise, reject) => {
-    let settled = false
-    let output = ''
-    let errorOutput = ''
-    const settle = (callback) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeout)
-      callback()
-    }
-    const child = spawn(nodeRuntime, [serverEntry], {
-      cwd: root,
-      env: serviceEnvironment,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-    })
-    packagedServiceProcess = child
-    const timeout = setTimeout(() => {
-      settle(() => {
-        child.kill('SIGTERM')
-        reject(new Error(`THEIA local service did not become ready. ${errorOutput}`))
-      })
-    }, 15_000)
-    child.stdout.setEncoding('utf8')
-    child.stderr.setEncoding('utf8')
-    child.stdout.on('data', (chunk) => {
-      output += chunk
-      const match = output.match(/AI proxy listening on http:\/\/127\.0\.0\.1:(\d+)/)
-      if (match) settle(() => {
-        resolvePromise(`http://127.0.0.1:${match[1]}/`)
-      })
-    })
-    child.stderr.on('data', (chunk) => {
-      errorOutput = `${errorOutput}${chunk}`.slice(-2_000)
-    })
-    child.once('error', (error) => settle(() => reject(error)))
-    child.once('exit', (code) => {
-      if (!settled) settle(() => reject(new Error(`THEIA local service exited with code ${code ?? 'unknown'}. ${errorOutput}`)))
-    })
-  })
 }
 
 async function registerPackagedProtocol() {
@@ -200,6 +158,9 @@ function createWindow(apiBase) {
   window.webContents.on('before-input-event', (event, input) => {
     if ((input.key === 'Alt' || input.key === 'F10') && !input.control && !input.meta) event.preventDefault()
   })
+  window.webContents.on('render-process-gone', (_event, details) => {
+    void recordRuntimeFailure(crashLogPath, 'electron-renderer', details).catch(() => undefined)
+  })
   let closeReady = false
   let closeInProgress = false
   window.on('close', (event) => {
@@ -222,6 +183,34 @@ function createWindow(apiBase) {
   void window.loadURL(pageUrl)
 }
 
+async function enableAutomaticUpdates() {
+  const updateMetadata = resolve(process.resourcesPath, 'app-update.yml')
+  if (!app.isPackaged || !existsSync(updateMetadata)) return
+  try {
+    const module = await import('electron-updater')
+    const autoUpdater = module.autoUpdater ?? module.default?.autoUpdater
+    if (!autoUpdater) throw new Error('electron-updater did not expose autoUpdater')
+    autoUpdater.autoDownload = true
+    autoUpdater.autoInstallOnAppQuit = true
+    autoUpdater.on('error', (error) => console.warn(`[THEIA] update check failed: ${error instanceof Error ? error.message : String(error)}`))
+    autoUpdater.on('update-downloaded', (info) => {
+      void dialog.showMessageBox(mainWindow, {
+        type: 'info',
+        title: 'THEIA 更新已就绪',
+        message: `THEIA ${info.version} 已下载完成。`,
+        detail: '立即重启会先等待当前本地数据写入完成；也可以稍后在退出应用时自动安装。',
+        buttons: ['立即重启安装', '稍后'],
+        defaultId: 0,
+        cancelId: 1,
+        noLink: true,
+      }).then(({ response }) => { if (response === 0) autoUpdater.quitAndInstall(false, true) })
+    })
+    await autoUpdater.checkForUpdatesAndNotify()
+  } catch (error) {
+    console.warn(`[THEIA] automatic updates unavailable: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 if (hasSingleInstanceLock) app.whenReady().then(async () => {
   Menu.setApplicationMenu(null)
   app.setName('THEIA')
@@ -229,6 +218,7 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   writeDesktopPid()
   const apiBase = await startLocalServices()
   createWindow(apiBase)
+  setTimeout(() => { void enableAutomaticUpdates() }, 8_000)
   app.on('activate', () => {
     if (!BrowserWindow.getAllWindows().length) createWindow(apiBase)
   })
@@ -248,5 +238,4 @@ app.on('will-quit', () => {
   clearDesktopPid()
   void viteServer?.close()
   if (ownsAiProxy && server.listening) server.close()
-  if (packagedServiceProcess && !packagedServiceProcess.killed) packagedServiceProcess.kill('SIGTERM')
 })

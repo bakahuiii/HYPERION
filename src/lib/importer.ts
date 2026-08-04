@@ -263,7 +263,10 @@ export function normalizeCapturedAt(value: unknown): string | undefined {
   }
 
   const text = String(raw).replace(/\u3000/g, ' ').trim()
-  const matched = text.match(/(\d{4})\s*[年/-]\s*(\d{1,2})\s*[月/-]\s*(\d{1,2})(?:\s*[日号]?)?(?:[ T]+(\d{1,2})(?:\s*[:时]\s*(\d{1,2}))?(?:\s*[:分]\s*(\d{1,2}))?\s*(?:秒)?\s*)?/)
+  // Keep the optional time group separate from the optional day suffix. The
+  // previous expression could consume the separator whitespace as a day and
+  // silently truncate `2026-08-04 10:00:00` to a date-only value.
+  const matched = text.match(/(\d{4})\s*(?:年|[-/])\s*(\d{1,2})\s*(?:月|[-/])\s*(\d{1,2})(?:\s*(?:日|号))?(?:[ T]+(\d{1,2})(?:\s*[:时]\s*(\d{1,2}))?(?:\s*[:分]\s*(\d{1,2}))?\s*(?:秒)?\s*)?/)
   if (matched) {
     return localIso(
       Number(matched[1]),
@@ -442,7 +445,7 @@ function conversationContext(file: File, path?: string) {
   }
 }
 
-export async function parseIntelFile(file: File, context: ImportContext = {}): Promise<IntelItem[]> {
+export async function parseIntelFileContent(file: File, context: ImportContext = {}): Promise<IntelItem[]> {
   const raw = await file.text()
   let lines: ParsedLine[]
 
@@ -488,4 +491,25 @@ export async function parseIntelFile(file: File, context: ImportContext = {}): P
     capturedAt: normalizeCapturedAt(line.timestamp) ?? '',
     status: 'new',
   }}))
+}
+
+const WORKER_PARSE_THRESHOLD_BYTES = 1024 * 1024
+
+/** Parse large exports off the renderer thread while keeping tests and small files synchronous. */
+export async function parseIntelFile(file: File, context: ImportContext = {}): Promise<IntelItem[]> {
+  if (typeof Worker === 'undefined' || Number(file.size) < WORKER_PARSE_THRESHOLD_BYTES) return parseIntelFileContent(file, context)
+  return new Promise<IntelItem[]>((resolve, reject) => {
+    const worker = new Worker(new URL('../workers/intelParser.worker.ts', import.meta.url), { type: 'module', name: 'theia-intel-parser' })
+    const finish = () => worker.terminate()
+    worker.onmessage = (event: MessageEvent<{ items?: IntelItem[]; error?: string }>) => {
+      finish()
+      if (event.data.error) reject(new Error(event.data.error))
+      else resolve(event.data.items ?? [])
+    }
+    worker.onerror = (event) => {
+      finish()
+      reject(new Error(event.message || '后台导入解析失败'))
+    }
+    worker.postMessage({ file, context })
+  })
 }

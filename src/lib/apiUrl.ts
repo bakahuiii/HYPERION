@@ -21,5 +21,7 @@ export function localProxyUrl(path: string) {
   if (packaged !== path || !path.startsWith('/api/')) return packaged
   const { protocol, hostname } = window.location
   const isLocalHttp = protocol === 'http:' && (hostname === '127.0.0.1' || hostname === 'localhost')
-  return isLocalHttp ? `${protocol}//${hostname}:8787${path}` : path
+  const viteEnvironment = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env
+  const developmentPort = String(viteEnvironment?.VITE_THEIA_API_PORT || '8787').replace(/\D/g, '') || '8787'
+  return isLocalHttp ? `${protocol}//${hostname}:${developmentPort}${path}` : path
 }

@@ -81,6 +81,7 @@ function normalizeStoredProvider(stored, index = 0) {
     name: text(stored?.name, 80) || (index === 0 ? '主通道' : `通道 ${index + 1}`),
     enabled: stored?.enabled !== false,
     apiKey: text(stored?.apiKey ?? stored?.key, 1000),
+    credentialRef: text(stored?.credentialRef, 160) || undefined,
     baseURL,
     model: text(stored?.model, 200) || 'gpt-5-mini',
     apiMode: normalizeMode(stored?.apiMode),

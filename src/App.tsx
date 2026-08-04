@@ -6,20 +6,21 @@ import { QuestModal } from './components/QuestModal'
 import { QuestSourceModal } from './components/QuestSourceModal'
 import { AppearanceModal } from './components/AppearanceModal'
 import { TaskMapView, type TaskAtlasArrangement } from './views/TaskMapView'
-import { IntelView, type AnalysisWorkState } from './views/IntelView'
+import { IntelView } from './views/IntelView'
+import type { AnalysisWorkState } from './hooks/useAiWorkflow'
 import { loadData, resetData, saveData } from './lib/storage'
 import { normalizeAppearance } from './lib/appearance'
-import { loadIntelSnapshot, loadSharedIntelMeta, loadSharedIntelSnapshot, saveIntelSnapshot, saveSharedIntelSnapshot } from './lib/intelStore'
+import { loadIntelSnapshot, loadSharedIntelMeta, loadSharedIntelSnapshot, primeSharedIntelSnapshot, saveIntelSnapshot, saveSharedIntelSnapshot } from './lib/intelStore'
 import { shouldLoadSharedIntelSnapshot } from './lib/intelSnapshotSelection'
 import { createSeedData } from './seed'
 import type { AiExtractionCheckpoint, AiFeedbackReason, AiSettings, AiTaskCandidate, AiTaskFeedback, AppData, ArchiveAnalysisSummary, AppearanceSettings, IntelItem, Person, PersonEvidence, Place, Profile, Quest, TaskAtlasCategory, TaskAtlasPosition, ViewId } from './types'
 import { loadBackgroundAsset } from './lib/appearanceAssets'
 import { sourceProvider } from './lib/people'
 import { analyzePeople, buildDirectConversationFallbackPeople, candidateRejectionReason, consolidatePerson, generateTaskGuidance, getAiStatus, type AiDebugEntry, type AiProgress } from './lib/aiClient'
-import { loadSharedMeta, loadSharedSnapshot, saveSharedSnapshot, SharedSnapshotConflictError } from './lib/sharedSync'
-import { mergeSharedChanges, toSharedData, type SharedData } from './lib/sharedStateMerge'
-import { loadSharedSettings, saveSharedSettings, waitForSharedSettingsWrites } from './lib/settingsClient'
-import { editableSettingsSignature } from './lib/settingsState'
+import { useSettingsSync } from './hooks/useSettingsSync'
+import { useSharedSync } from './hooks/useSharedSync'
+import { hydrateSharedSnapshot } from './lib/sharedStateHydration'
+import type { SharedData } from './lib/sharedStateMerge'
 import { mapSearchPrecision, mapSearchRadius, searchMapPlaces } from './lib/mapSearch'
 import { archiveSummaryWithAnalysis, archiveSummaryWithImport, summarizeArchive } from './lib/archiveSummary'
 import { fetchTaskWeather } from './lib/weather'
@@ -437,16 +438,8 @@ function App() {
   const [analysisWork, setAnalysisWork] = useState<AnalysisWorkState | null>(null)
   const [backgroundUrls, setBackgroundUrls] = useState<Record<string, string>>({})
   const [appearancePreview, setAppearancePreview] = useState<{ profile: Profile; appearance: AppearanceSettings } | null>(null)
-  const [sharedReady, setSharedReady] = useState(false)
-  const [settingsReady, setSettingsReady] = useState(false)
   const shellRef = useRef<HTMLDivElement>(null)
   const dataRef = useRef(data)
-  const sharedReadyRef = useRef(false)
-  const sharedUpdatedAtRef = useRef('')
-  const sharedBaseDataRef = useRef<SharedData>(toSharedData(data))
-  const sharedSaveQueueRef = useRef<Promise<unknown>>(Promise.resolve())
-  const skipSharedWriteRef = useRef(false)
-  const sharedWriteTimerRef = useRef<number | undefined>(undefined)
   const sharedIntelWriteTimerRef = useRef<number | undefined>(undefined)
   const lastSharedIntelWriteKeyRef = useRef('')
   const pendingSharedIntelWriteKeyRef = useRef('')
@@ -455,9 +448,6 @@ function App() {
   const hasAuthoritativeIntelSnapshotRef = useRef(false)
   const initialLocalIntelUpdatedAtRef = useRef<string | undefined>(undefined)
   const sharedIntelUpdatedAtRef = useRef<string | null>(null)
-  const settingsReadyRef = useRef(false)
-  const settingsWriteTimerRef = useRef<number | undefined>(undefined)
-  const flushInFlightRef = useRef<Promise<void> | null>(null)
   const checkpointWriteTimerRef = useRef<number | undefined>(undefined)
   const pendingCheckpointRef = useRef<AiExtractionCheckpoint | undefined>(data.aiSettings.interruptedRun)
   const pendingPersonConsolidationsRef = useRef(new Set<string>())
@@ -475,11 +465,39 @@ function App() {
   const [taskGuidanceRefreshTick, setTaskGuidanceRefreshTick] = useState(0)
   const effectiveProfile = appearancePreview?.profile ?? data.profile
   const effectiveAppearance = normalizeAppearance(appearancePreview?.appearance ?? data.appearance)
-  const regularSettingsSignature = useMemo(() => editableSettingsSignature({
-    profile: data.profile,
-    appearance: data.appearance,
-    aiSettings: data.aiSettings,
-  }), [data.aiSettings, data.appearance, data.profile])
+  const { flushSettings } = useSettingsSync({ data, dataRef, setData, setSyncErrors })
+  const prepareIncomingShared = useCallback((current: AppData, base: SharedData, remote: SharedData) => {
+    const hydrated = hydrateSharedSnapshot(current, base, remote, {
+      peopleModelVersion: 5,
+      peopleDismissalVersion: PEOPLE_DISMISSAL_SEMANTICS_VERSION,
+    })
+    const next = hydrated.data
+    return {
+      skipEchoWrite: hydrated.skipEchoWrite,
+      data: dismissInvalidAiCandidates(mergePeople(
+        { ...next, people: enrichPeopleEvidence(next.people, current.intel) },
+        buildDirectConversationFallbackPeople(current.intel),
+      )),
+    }
+  }, [])
+  const reconcileSharedConflict = useCallback((current: AppData, reconciled: SharedData) => cleanDanglingPersonReferences({
+    ...current,
+    ...reconciled,
+    intel: current.intel,
+    peopleModelVersion: 5,
+  }), [])
+  const { ready: sharedReady } = useSharedSync({
+    data,
+    dataRef,
+    setData,
+    intelHydrated,
+    setSyncErrors,
+    flushSettings,
+    pendingCheckpointRef,
+    checkpointWriteTimerRef,
+    prepareIncoming: prepareIncomingShared,
+    reconcileConflict: reconcileSharedConflict,
+  })
   const sharedIntelWriteKey = `${data.archive.sourceFingerprint ?? 'adhoc'}\u0000${data.archive.lastImport?.importedAt ?? 'initial'}\u0000${data.intel.length}\u0000${data.intel[0]?.id ?? ''}\u0000${data.intel.at(-1)?.id ?? ''}`
   const effectiveSelectedPlaceId = data.places.some((place) => place.id === selectedPlaceId)
     ? selectedPlaceId
@@ -489,48 +507,6 @@ function App() {
     window.dispatchEvent(new CustomEvent<AiDebugEntry>('theia:ai-debug', { detail: entry }))
   }
 
-  const persistSharedSnapshot = useCallback((snapshot: AppData) => {
-    const localAtEnqueue = toSharedData(snapshot)
-    const operation = sharedSaveQueueRef.current.then(async () => {
-      let outgoing = localAtEnqueue
-      let mergeBase = sharedBaseDataRef.current
-      let mergedConflict = false
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        try {
-          const saved = await saveSharedSnapshot(outgoing, sharedUpdatedAtRef.current || null)
-          sharedUpdatedAtRef.current = saved.updatedAt ?? ''
-          sharedBaseDataRef.current = outgoing
-          if (mergedConflict) {
-            // Preserve edits made after this write was queued while bringing
-            // independent remote changes into the current renderer.
-            setData((current) => {
-              const reconciled = mergeSharedChanges(localAtEnqueue, toSharedData(current), outgoing)
-              return cleanDanglingPersonReferences({ ...current, ...reconciled, intel: current.intel, peopleModelVersion: 5 })
-            })
-          }
-          return saved
-        } catch (error) {
-          if (!(error instanceof SharedSnapshotConflictError)) throw error
-          const remote = await loadSharedSnapshot()
-          sharedUpdatedAtRef.current = remote.updatedAt ?? ''
-          if (!remote.data) continue
-          outgoing = mergeSharedChanges(mergeBase, outgoing, remote.data)
-          mergeBase = remote.data
-          mergedConflict = true
-        }
-      }
-      throw new Error('共享数据连续发生写入冲突，请稍后重试')
-    })
-    const visibleOperation = operation.then((saved) => {
-      setSyncErrors((current) => current.shared ? { ...current, shared: undefined } : current)
-      return saved
-    }, (error) => {
-      setSyncErrors((current) => ({ ...current, shared: `任务、人物与地点的共享状态保存失败：${error instanceof Error ? error.message : String(error)}` }))
-      throw error
-    })
-    sharedSaveQueueRef.current = visibleOperation.then(() => undefined, () => undefined)
-    return visibleOperation
-  }, [])
   const visualMotion = effectiveAppearance.performanceVersion === 1 && effectiveAppearance.motionEnabled
   const referencedIntelIds = useMemo(() => new Set([
     ...data.quests.flatMap((quest) => quest.sourceIds ?? []),
@@ -565,57 +541,6 @@ function App() {
       image.src = source
     })
   }, [data.people])
-
-  useEffect(() => {
-    let active = true
-    const initialSignature = editableSettingsSignature({
-      profile: dataRef.current.profile,
-      appearance: dataRef.current.appearance,
-      aiSettings: dataRef.current.aiSettings,
-    })
-    void loadSharedSettings().then((settings) => {
-      if (!active) return
-      const currentSignature = editableSettingsSignature({
-        profile: dataRef.current.profile,
-        appearance: dataRef.current.appearance,
-        aiSettings: dataRef.current.aiSettings,
-      })
-      if (settings.initialized && currentSignature === initialSignature) {
-        setSyncErrors((current) => current.settings ? { ...current, settings: undefined } : current)
-        setData((current) => ({
-          ...current,
-          profile: settings.profile,
-          appearance: settings.appearance,
-          aiSettings: settings.aiSettings,
-        }))
-      } else {
-        // The settings write effect runs once readiness becomes observable.
-        // Reading dataRef there preserves edits made while this request was in
-        // flight instead of seeding the INI from the mount-time snapshot.
-        setSyncErrors((current) => current.settings ? { ...current, settings: undefined } : current)
-      }
-    }).catch((error) => {
-      // The browser cache remains usable when the optional local proxy is offline.
-      if (active) setSyncErrors((current) => ({ ...current, settings: `通用设置读取失败：${error instanceof Error ? error.message : String(error)}` }))
-    }).finally(() => {
-      if (!active) return
-      settingsReadyRef.current = true
-      setSettingsReady(true)
-    })
-    return () => { active = false }
-  }, [])
-
-  useEffect(() => {
-    if (!settingsReady) return
-    if (settingsWriteTimerRef.current) window.clearTimeout(settingsWriteTimerRef.current)
-    settingsWriteTimerRef.current = window.setTimeout(() => {
-      const current = dataRef.current
-      void saveSharedSettings({ profile: current.profile, appearance: current.appearance, aiSettings: current.aiSettings })
-        .then(() => setSyncErrors((errors) => errors.settings ? { ...errors, settings: undefined } : errors))
-        .catch((error) => setSyncErrors((errors) => ({ ...errors, settings: `通用设置保存失败：${error instanceof Error ? error.message : String(error)}` })))
-    }, 350)
-    return () => { if (settingsWriteTimerRef.current) window.clearTimeout(settingsWriteTimerRef.current) }
-  }, [regularSettingsSignature, settingsReady])
 
   // Older builds used the same field for bulk clear and individual deletion.
   // Clear that legacy state once; new deletions are recreated by explicit
@@ -685,6 +610,7 @@ function App() {
         && sharedMeta?.recordCount === localSnapshot.items.length
         && sharedMeta.sourceFingerprint === localSnapshot.sourceFingerprint
         && sharedMeta.updatedAt && localSnapshot.updatedAt && sharedMeta.updatedAt >= localSnapshot.updatedAt)
+      if (storesAlreadyMatch && localSnapshot) primeSharedIntelSnapshot(localSnapshot.items, sharedMeta?.sourceFingerprint)
       hasAuthoritativeIntelSnapshotRef.current = snapshotAvailable
       skipInitialLocalIntelPersistRef.current = Boolean(snapshotAvailable && !selectedFromShared && storesAlreadyMatch)
       skipInitialSharedIntelPersistRef.current = Boolean(snapshotAvailable && (selectedFromShared || storesAlreadyMatch))
@@ -838,174 +764,6 @@ function App() {
     const timer = window.setInterval(restoreSharedArchive, 15_000)
     return () => { active = false; window.clearInterval(timer) }
   }, [data.intel.length, intelHydrated])
-
-  useEffect(() => {
-    if (!intelHydrated) return
-    let active = true
-    void loadSharedSnapshot().then((snapshot) => {
-      if (!active) return
-      if (snapshot.data && snapshot.updatedAt) {
-        const snapshotData = snapshot.data
-        const previousBase = sharedBaseDataRef.current
-        sharedUpdatedAtRef.current = snapshot.updatedAt
-        sharedBaseDataRef.current = snapshotData
-        setData((current) => {
-          // The first shared read can finish after the user has already edited
-          // local state. Apply those edits on top of the remote snapshot just
-          // like later polling does; direct replacement would silently lose
-          // tasks or people created during startup.
-          const mergedSnapshotData = mergeSharedChanges(previousBase, toSharedData(current), snapshotData)
-          const hasLocalChanges = JSON.stringify(mergedSnapshotData) !== JSON.stringify(snapshotData)
-          const keepPeople = mergedSnapshotData.peopleModelVersion === 5 && Array.isArray(mergedSnapshotData.people)
-          skipSharedWriteRef.current = keepPeople && !hasLocalChanges
-          // This renderer may have just repaired the legacy bulk-dismissal
-          // state while the initial shared read was still in flight. Do not
-          // let that older snapshot put the broken list back into memory.
-          const keepLocalDismissals = current.peopleDismissalVersion === PEOPLE_DISMISSAL_SEMANTICS_VERSION
-            && mergedSnapshotData.peopleDismissalVersion !== PEOPLE_DISMISSAL_SEMANTICS_VERSION
-          const next: AppData = {
-            ...current,
-            ...mergedSnapshotData,
-            dismissedPersonConversationIds: keepLocalDismissals
-              ? current.dismissedPersonConversationIds
-              : mergedSnapshotData.dismissedPersonConversationIds,
-            peopleDismissalVersion: keepLocalDismissals
-              ? current.peopleDismissalVersion
-              : mergedSnapshotData.peopleDismissalVersion,
-            people: keepPeople ? mergedSnapshotData.people : [],
-            intel: current.intel,
-            peopleModelVersion: 5,
-          }
-          return dismissInvalidAiCandidates(mergePeople(
-            { ...next, people: enrichPeopleEvidence(next.people, current.intel) },
-            buildDirectConversationFallbackPeople(current.intel),
-          ))
-        })
-      } else {
-        // Seed durable task data even before chat records are available. This
-        // path intentionally omits raw intel so huge archives cannot block it.
-        void persistSharedSnapshot(data).catch(() => undefined)
-      }
-    }).catch((error) => {
-      if (active) setSyncErrors((current) => ({ ...current, shared: `共享状态读取失败：${error instanceof Error ? error.message : String(error)}` }))
-    }).finally(() => {
-      if (!active) return
-      sharedReadyRef.current = true
-      setSharedReady(true)
-    })
-    return () => { active = false }
-    // The initial pull establishes the desktop/browser shared source of truth once.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [intelHydrated])
-
-  useEffect(() => {
-    if (!intelHydrated || !sharedReady) return
-    if (skipSharedWriteRef.current) { skipSharedWriteRef.current = false; return }
-    if (sharedWriteTimerRef.current) window.clearTimeout(sharedWriteTimerRef.current)
-    const snapshot = data
-    sharedWriteTimerRef.current = window.setTimeout(() => {
-      // Task and people state is intentionally small and writes independently
-      // of the raw archive. A failed bulk archive upload can no longer discard
-      // new tasks or people cards.
-      void persistSharedSnapshot(snapshot).catch(() => undefined)
-    }, 250)
-  }, [data, intelHydrated, persistSharedSnapshot, sharedReady])
-
-  useEffect(() => {
-    const flush = async () => {
-      if (flushInFlightRef.current) return flushInFlightRef.current
-      const operation = (async () => {
-      if (sharedWriteTimerRef.current) {
-        window.clearTimeout(sharedWriteTimerRef.current)
-        sharedWriteTimerRef.current = undefined
-      }
-      if (settingsWriteTimerRef.current) {
-        window.clearTimeout(settingsWriteTimerRef.current)
-        settingsWriteTimerRef.current = undefined
-      }
-      if (checkpointWriteTimerRef.current) {
-        window.clearTimeout(checkpointWriteTimerRef.current)
-        checkpointWriteTimerRef.current = undefined
-      }
-
-      const current = dataRef.current
-      const writes: Promise<unknown>[] = []
-      if (sharedReadyRef.current) {
-        // Always enqueue the local snapshot. persistSharedSnapshot compares
-        // the expected version and performs a three-way merge on conflict;
-        // skipping this write when a remote version is newer would silently
-        // discard edits made locally just before shutdown.
-        writes.push(persistSharedSnapshot(current))
-      }
-      if (settingsReadyRef.current) {
-        writes.push(saveSharedSettings({
-          profile: current.profile,
-          appearance: current.appearance,
-          aiSettings: { ...current.aiSettings, interruptedRun: pendingCheckpointRef.current },
-        }))
-      }
-      await Promise.allSettled(writes)
-      await sharedSaveQueueRef.current
-      await waitForSharedSettingsWrites()
-      })()
-      flushInFlightRef.current = operation
-      try {
-        await operation
-      } finally {
-        if (flushInFlightRef.current === operation) flushInFlightRef.current = null
-      }
-    }
-    window.theiaFlush = flush
-    const handlePageHide = () => { void flush() }
-    window.addEventListener('pagehide', handlePageHide)
-    return () => {
-      window.removeEventListener('pagehide', handlePageHide)
-      void flush()
-      delete window.theiaFlush
-    }
-  }, [persistSharedSnapshot])
-
-  useEffect(() => {
-    if (!intelHydrated) return
-    const timer = window.setInterval(() => {
-      void loadSharedMeta().then((meta) => {
-        if (!meta.updatedAt || meta.updatedAt <= sharedUpdatedAtRef.current) return
-        return loadSharedSnapshot().then((snapshot) => {
-          const snapshotData = snapshot.data
-          if (!snapshotData || !snapshot.updatedAt || snapshot.updatedAt <= sharedUpdatedAtRef.current) return
-          const previousBase = sharedBaseDataRef.current
-          sharedUpdatedAtRef.current = snapshot.updatedAt
-          setData((current) => {
-            const mergedSnapshotData = mergeSharedChanges(previousBase, toSharedData(current), snapshotData)
-            const hasLocalChanges = JSON.stringify(mergedSnapshotData) !== JSON.stringify(snapshotData)
-            sharedBaseDataRef.current = snapshotData
-            const keepPeople = mergedSnapshotData.peopleModelVersion === 5 && Array.isArray(mergedSnapshotData.people)
-            skipSharedWriteRef.current = keepPeople && !hasLocalChanges
-            const keepLocalDismissals = current.peopleDismissalVersion === PEOPLE_DISMISSAL_SEMANTICS_VERSION
-              && mergedSnapshotData.peopleDismissalVersion !== PEOPLE_DISMISSAL_SEMANTICS_VERSION
-            const next: AppData = {
-              ...current,
-              ...mergedSnapshotData,
-              dismissedPersonConversationIds: keepLocalDismissals
-                ? current.dismissedPersonConversationIds
-                : mergedSnapshotData.dismissedPersonConversationIds,
-              peopleDismissalVersion: keepLocalDismissals
-                ? current.peopleDismissalVersion
-                : mergedSnapshotData.peopleDismissalVersion,
-              people: keepPeople ? mergedSnapshotData.people : [],
-              intel: current.intel,
-              peopleModelVersion: 5,
-            }
-            return dismissInvalidAiCandidates(mergePeople(
-              { ...next, people: enrichPeopleEvidence(next.people, current.intel) },
-              buildDirectConversationFallbackPeople(current.intel),
-            ))
-          })
-        })
-      }).catch((error) => setSyncErrors((current) => ({ ...current, shared: `共享状态刷新失败：${error instanceof Error ? error.message : String(error)}` })))
-    }, 15_000)
-    return () => window.clearInterval(timer)
-  }, [intelHydrated])
 
   useEffect(() => {
     let active = true
@@ -1870,12 +1628,8 @@ function App() {
 
     const persist = () => {
       checkpointWriteTimerRef.current = undefined
-      const current = dataRef.current
-      void saveSharedSettings({
-        profile: current.profile,
-        appearance: current.appearance,
-        aiSettings: { ...current.aiSettings, interruptedRun: pendingCheckpointRef.current },
-      }).then(() => setSyncErrors((errors) => errors.settings ? { ...errors, settings: undefined } : errors))
+      void flushSettings(pendingCheckpointRef.current)
+        .then(() => setSyncErrors((errors) => errors.settings ? { ...errors, settings: undefined } : errors))
         .catch((error) => setSyncErrors((errors) => ({ ...errors, settings: `提炼恢复进度保存失败：${error instanceof Error ? error.message : String(error)}` })))
     }
     const immediate = !checkpoint || Boolean(checkpoint.pausedAt)
@@ -1887,7 +1641,7 @@ function App() {
     if (!checkpointWriteTimerRef.current) {
       checkpointWriteTimerRef.current = window.setTimeout(persist, 1_000)
     }
-  }, [])
+  }, [flushSettings])
 
   const stopPeopleAnalysis = () => {
     const controller = peopleAnalysisAbortRef.current

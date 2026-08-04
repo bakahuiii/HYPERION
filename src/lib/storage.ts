@@ -1,11 +1,13 @@
-import { createSeedData, seedData } from '../seed'
-import type { AiAnalysisWatermarks, AiExtractionCheckpoint, AiSettings, AppData } from '../types'
-import { normalizeAppearance } from './appearance'
-import { summarizeArchive } from './archiveSummary'
-import { DEFAULT_AI_CONCURRENCY, normalizeAiConcurrency } from './aiConcurrency'
-import { recoverArray } from './storageRecovery'
+import { createSeedData, seedData } from '../seed.ts'
+import type { AiAnalysisWatermarks, AiExtractionCheckpoint, AiSettings, AppData } from '../types.ts'
+import { normalizeAppearance } from './appearance.ts'
+import { summarizeArchive } from './archiveSummary.ts'
+import { DEFAULT_AI_CONCURRENCY, normalizeAiConcurrency } from './aiConcurrency.ts'
+import { recoverArray } from './storageRecovery.ts'
+import { APP_STORAGE_SCHEMA, unwrapAppStorage, wrapAppStorage } from './storageSchema.ts'
 
 const STORAGE_KEY = 'theia:v1'
+const STORAGE_ROLLBACK_KEY = 'theia:v1:rollback'
 
 export const defaultPromptInstructions = {
   task: '优先保留仍需你处理、具体可执行的安排。约见、返校、报名、缴费、回复、预约、截止事项优先；闲聊、历史通知、已过期事项不输出。',
@@ -81,7 +83,14 @@ export function loadData(): AppData {
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
     if (!saved) return createSeedData()
-    const parsed = JSON.parse(saved) as Omit<AppData, 'peopleModelVersion'> & { peopleModelVersion?: number }
+    const decoded = JSON.parse(saved) as unknown
+    const unwrapped = unwrapAppStorage<Omit<AppData, 'peopleModelVersion'> & { peopleModelVersion?: number }>(decoded)
+    if (unwrapped.migratedFrom === 0 && !localStorage.getItem(STORAGE_ROLLBACK_KEY)) {
+      // Keep one untouched copy of the pre-schema payload. It is deliberately
+      // not rewritten on every save and can be restored by support tooling.
+      try { localStorage.setItem(STORAGE_ROLLBACK_KEY, saved) } catch { /* Optional rollback copy. */ }
+    }
+    const parsed = unwrapped.data
     // Version 5 invalidates free-form portraits. Only structured paragraphs
     // with claim IDs survive; verified claims, avatars, and profile notes stay.
     const isModelPeople = [3, 4, 5].includes(Number(parsed.peopleModelVersion))
@@ -211,13 +220,13 @@ export function saveData(data: AppData) {
   try {
     // Chat exports can be thousands of records long. Keep the lightweight
     // dashboard state in localStorage; the raw intel queue lives in IndexedDB.
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(wrapAppStorage(payload)))
   } catch {
     // Browser quotas are commonly 5 MB. Retry once with bounded evidence
     // strings and source arrays before reporting a persistence failure; the
     // normal in-memory model is unchanged.
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...compactPeopleForQuota(data), intel: [] }))
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(wrapAppStorage({ ...compactPeopleForQuota(data), intel: [] })))
     } catch {
       console.warn('本地存储空间不足，本次会话数据仍可使用，但刷新后可能无法完整恢复。')
     }
@@ -226,4 +235,20 @@ export function saveData(data: AppData) {
 
 export function resetData() {
   localStorage.removeItem(STORAGE_KEY)
+  localStorage.removeItem(STORAGE_ROLLBACK_KEY)
+}
+
+export function restoreRollbackData(): boolean {
+  const backup = localStorage.getItem(STORAGE_ROLLBACK_KEY)
+  if (!backup) return false
+  // Refuse a backup that is already a current envelope; this key is reserved
+  // for the untouched pre-migration representation.
+  try {
+    const parsed = JSON.parse(backup) as Record<string, unknown>
+    if (parsed?.schema === APP_STORAGE_SCHEMA) return false
+  } catch {
+    return false
+  }
+  localStorage.setItem(STORAGE_KEY, backup)
+  return true
 }

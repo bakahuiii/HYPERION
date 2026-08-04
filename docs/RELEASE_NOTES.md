@@ -1,5 +1,40 @@
 # Release Notes
 
+## 0.4.0 大归档与同步架构升级
+
+发布日期：2026-08-04
+
+发布类型：在 `0.3.0` 稳定提炼基线上的兼容性增强版本，重点解决百万级聊天归档的重复上传、共享状态竞态和前端大组件维护成本。
+
+### 主要变化
+
+- 原始聊天归档采用 `theia-intel-archive/v1` append-only gzip JSONL segment。首个写入是 snapshot，后续写入是带 `upsert/delete` 操作的 delta；达到段数阈值后自动 compaction。旧 gzip/JSON 文件不会被直接删除，迁移失败可回滚。
+- 新增 `POST /api/sync/intel/delta`。客户端在确认本地与共享归档版本一致后只发送 `upserts` 和 `deleteIds`；无法证明基线、首次导入或变更过大时自动回退 `POST /api/sync/intel` 全量协议。
+- 浏览器缓存 schema 升级为 IndexedDB v2：`intelRecords` 按消息存储，`intelMeta` 存水位和 fingerprint，保留旧 `snapshots` store 用于一次性迁移。
+- 新增 `useSharedSync`、`useIntelAnalysisSelection` 和候选队列组件；共享状态按字段比较，修复字段顺序不同导致的多端无意义回写。
+- 新增 `useAiWorkflow`，把任务/人物串联、暂停检查点、恢复、失败重试和自动更新从视图移出；情报库进一步拆成 ArchivePanel、AnalysisPanel、CandidateQueue 和 ConversationBrowser。
+- Electron 主进程优先使用系统凭据存储，INI 只保存 `credentialRef`；纯 Node 开发环境保留明文兼容路径。
+- 新增运行标记、崩溃恢复状态、任务日志大小/数量轮转，以及 importer、分段、候选校验、存储、迁移、恢复和增量归档测试。
+- 大于 1 MB 的 JSON/CSV/TXT 由 Web Worker 解析；附件队列在发送前显示大小、文本 token 粗估和模型侧图片/文档计费边界。
+- 人物自动更新使用会话内容指纹：已有水位后只提交新增消息及每条新增消息之前最多 16 条上下文，成功后再推进该会话的人物水位；未变化私聊不会重复计费。
+- 选项页可配置 OSM DE、OSM Standard、HOT 底图，自动/Nominatim/Photon 搜索源及 32–1024 MB 本地瓦片缓存；服务端按容量淘汰旧瓦片并保留公共服务政策链接和地图署名。
+- 数据与存储面板显示共享 schema、归档 engine/记录/分段、迁移结果、回滚备份和非正常退出状态。
+- 新增 Playwright 任务图视觉/拖拽回归和 Electron `safeStorage` 迁移烟测；发布工程新增 NSIS 安装器、GitHub 更新检查和可选 Windows 签名。
+
+### 升级与回滚
+
+- `0.3.0` 的任务、人物、地点、通道和旧聊天归档可以直接读取。首次启动会在 runtime 的 `migrations/` 写入备份，再建立新 schema。
+- 归档迁移失败时不要删除旧文件；可使用 `npm run data:rollback -- --latest` 恢复最近的共享状态备份。回滚只处理状态/归档文件，不会修改 API 通道配置。
+- 共享状态写入包含 `expectedUpdatedAt` 乐观版本号。发生 409 时客户端读取远端并按 ID 合并，再重试最多三次。
+
+### 验证
+
+- `npm test`：客户端、导入、分段、候选校验、存储、append-only archive、schema migration、恢复日志和 provider pool 全部通过。
+- `npm run test:e2e`：任务图视觉基线、缩放、主题拖拽、无文本误选、地图配置和存储健康状态通过。
+- `npm run test:desktop-smoke`：隔离 runtime 下 Electron 启动与 API Key 明文迁移通过。
+- `npm run dist:unpacked` + `npm run test:unpacked-smoke`：ASAR 打包和打包后 `THEIA.exe` 实际启动通过。
+- `npm run lint`、`npm run build`、`node --check server/index.mjs`、`node --check electron/main.mjs`、`git diff --check` 通过。
+
 ## 0.3.0 稳定并发与协议文档
 
 发布日期：2026-08-04

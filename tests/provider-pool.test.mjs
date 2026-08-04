@@ -330,6 +330,20 @@ test('provider pool balances requests and isolates a failing channel', async () 
     })
     assert.equal(migratedSidecarWrite.response.status, 200)
     assert.equal(migratedSidecarWrite.payload.recordCount, 3)
+    const deltaArchiveWrite = await requestJson(baseUrl, '/api/sync/intel/delta', {
+      body: {
+        expectedUpdatedAt: migratedSidecarWrite.payload.updatedAt,
+        upserts: [{ id: 'archive-record-1', conversationId: 'direct-test', content: 'first message updated' }],
+        deleteIds: ['archive-record-2'],
+      },
+    })
+    assert.equal(deltaArchiveWrite.response.status, 200)
+    assert.equal(deltaArchiveWrite.payload.recordCount, 2)
+    const deltaArchiveSnapshot = await requestJson(baseUrl, '/api/sync/intel')
+    assert.deepEqual(deltaArchiveSnapshot.payload.items, [
+      { id: 'archive-record-1', conversationId: 'direct-test', content: 'first message updated' },
+      { id: 'archive-record-3', conversationId: 'direct-test', content: 'third message' },
+    ])
 
     const firstState = await requestJson(baseUrl, '/api/sync/snapshot', {
       body: { expectedUpdatedAt: null, data: { quests: [{ id: 'first' }] } },
@@ -401,7 +415,8 @@ test('provider pool balances requests and isolates a failing channel', async () 
     assert.equal(debugLog.includes(primarySecret) || debugLog.includes(secondarySecret), false)
     assert.equal(taskLogs.includes(primarySecret) || taskLogs.includes(secondarySecret), false)
 
-    await writeFile(join(runtimeRoot, 'data', 'chat-archive.json.gz'), Buffer.from('not-a-gzip-archive'))
+    const archiveSegmentDirectory = join(runtimeRoot, 'data', 'chat-archive')
+    await writeFile(join(archiveSegmentDirectory, '9999999999-corrupt.jsonl.gz'), Buffer.from('not-a-gzip-segment'))
     const corruptedArchive = await requestJson(baseUrl, '/api/sync/intel')
     assert.equal(corruptedArchive.response.status, 500)
     assert.match(corruptedArchive.payload.error, /归档已损坏/)
