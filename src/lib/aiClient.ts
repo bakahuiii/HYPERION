@@ -256,11 +256,11 @@ const MODEL_BATCH_SIZE = 40
 // next queued model job start as soon as a slot is released.
 const MODEL_QUEUE_PREFETCH_FACTOR = 4
 const SESSION_POLL_INTERVAL_MS = 120
-// A shared relay can expose many saved channel slots while still having one
-// origin behind them. Person extraction is evidence-heavy and should keep a
-// small, steady number of complete windows in flight; task extraction retains
-// the user's configured concurrency separately.
-const PEOPLE_WORKFLOW_CONCURRENCY = 4
+// Keep the people workflow open to the same configured capacity as task
+// extraction. The provider pool and shared-origin limiter remain the final
+// authority, so this does not invent capacity or change saved channel limits.
+// A previous fixed value of four left most configured channels idle.
+const PEOPLE_WORKFLOW_CONCURRENCY = 64
 
 type BatchWorkflow = 'tasks' | 'people'
 
@@ -2395,9 +2395,9 @@ export async function analyzePeople(
   })
   const configuredConcurrency = analysisConcurrency(options?.concurrency, directSegments.length)
   const concurrency = Math.min(PEOPLE_WORKFLOW_CONCURRENCY, configuredConcurrency)
-  // Do not multiply person workers by the generic task prefetch factor. A
-  // wide person window carries substantially more context and should occupy a
-  // bounded number of upstream requests, even when the global setting is 40+.
+  // Keep one worker per configured slot. The session batcher still submits in
+  // bounded pages, while the server-side provider pool decides which channel
+  // can accept each request.
   const workerConcurrency = Math.min(concurrency, directSegments.length)
   const batcher = new AiSessionRequestBatcher(workerConcurrency, options?.signal)
   const segmentQueue: Array<{ segment: typeof directSegments[number]; offset: number }> = []

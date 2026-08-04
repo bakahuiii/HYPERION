@@ -299,10 +299,9 @@ function isLocalExportVerifiedPerson(person: Person) {
 }
 
 const PERSON_FACT_BUFFER_LIMIT = 48
-// Portrait merge requests are small structured calls, unlike the wide
-// evidence windows (which stay capped at four). Allow a separate pool to use
-// more configured slots without recreating the 502-causing evidence burst.
-const PERSON_CONSOLIDATION_MAX_CONCURRENT = 8
+// Portrait merge requests use the same configured capacity as evidence
+// extraction. The server-side provider/origin pool remains the final limiter.
+const PERSON_CONSOLIDATION_MAX_CONCURRENT = 64
 const TASK_GUIDANCE_REFRESH_INTERVAL_MS = 10 * 60 * 1000
 // Version 5 separates a deliberate card deletion from the old bulk-clear
 // implementation. The suppression is used only for passive local fallback
