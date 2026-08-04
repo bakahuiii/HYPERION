@@ -299,7 +299,10 @@ function isLocalExportVerifiedPerson(person: Person) {
 }
 
 const PERSON_FACT_BUFFER_LIMIT = 48
-const PERSON_CONSOLIDATION_MAX_CONCURRENT = 4
+// Portrait merge requests are small structured calls, unlike the wide
+// evidence windows (which stay capped at four). Allow a separate pool to use
+// more configured slots without recreating the 502-causing evidence burst.
+const PERSON_CONSOLIDATION_MAX_CONCURRENT = 8
 const TASK_GUIDANCE_REFRESH_INTERVAL_MS = 10 * 60 * 1000
 // Version 5 separates a deliberate card deletion from the old bulk-clear
 // implementation. The suppression is used only for passive local fallback
@@ -463,6 +466,7 @@ function App() {
   const personConsolidationRetriesRef = useRef(new Map<string, number>())
   const completedPersonConsolidationSignaturesRef = useRef(new Map<string, string>())
   const peopleConsolidationPausedRef = useRef(false)
+  const peopleConsolidationScheduledRef = useRef(false)
   const peopleAnalysisAbortRef = useRef<AbortController | null>(null)
   const peopleDismissalMigrationRef = useRef(false)
   const prefetchedAvatarUrlsRef = useRef(new Set<string>())
@@ -1557,9 +1561,26 @@ function App() {
       const retryCount = Math.max(personConsolidationRetriesRef.current.get(person.id) ?? 0, Number(person.portraitRetryCount) || 0)
       const attempt = retryCount + 1
       const controller = new AbortController()
+      const mergeStartedAt = performance.now()
+      let mergeModel = person.model
+      let mergeFailureStatus: number | undefined
       pendingPersonConsolidationsRef.current.add(person.id)
       personConsolidationControllersRef.current.set(person.id, controller)
       personConsolidationRetriesRef.current.set(person.id, attempt)
+      appendPeopleDebug({
+        at: new Date().toISOString(),
+        event: 'people_merge_started',
+        level: 'info',
+        personName: person.name,
+        recordCount: person.evidence?.length ?? 0,
+        totalRecordCount: person.sourceIds?.length ?? 0,
+        pendingCount: pendingPersonConsolidationsRef.current.size,
+        totalCount: dataRef.current.people.filter((candidate) => Boolean(portraitEvidenceSignature(candidate))).length,
+        attempt,
+        workflowConcurrency: Math.min(PERSON_CONSOLIDATION_MAX_CONCURRENT, normalizeAiConcurrency(dataRef.current.aiSettings.concurrency)),
+        model: person.model,
+        message: '人物刻画归并请求已进入本地队列。',
+      })
       setData((current) => {
         const index = current.people.findIndex((candidate) => candidate.id === person.id)
         if (index < 0 || portraitEvidenceSignature(current.people[index]) !== signature) return current
@@ -1590,6 +1611,7 @@ function App() {
         })
       }
       void consolidatePerson(person, dataRef.current.aiSettings, controller.signal).then((consolidated) => {
+        if (consolidated) mergeModel = consolidated.model
         if (!consolidated) {
           failed = true
           markFailure('模型未返回通过证据校验的人物刻画。')
@@ -1629,6 +1651,7 @@ function App() {
       }).catch((error) => {
         aborted = controller.signal.aborted || (error instanceof Error && error.name === 'AbortError')
         failed = !aborted
+        mergeFailureStatus = Number((error as { status?: number })?.status) || undefined
         if (failed) markFailure(error instanceof Error ? error.message : '人物刻画请求失败。')
       }).finally(() => {
         if (personConsolidationControllersRef.current.get(person.id) === controller) {
@@ -1636,15 +1659,44 @@ function App() {
         }
         pendingPersonConsolidationsRef.current.delete(person.id)
         if (!failed || aborted) personConsolidationRetriesRef.current.delete(person.id)
+        const durationMs = Math.max(0, Math.round(performance.now() - mergeStartedAt))
+        const currentPeople = dataRef.current.people
+        const event = aborted ? 'people_merge_aborted' : failed ? 'people_merge_failed' : 'people_merge_succeeded'
+        appendPeopleDebug({
+          at: new Date().toISOString(),
+          event,
+          level: aborted ? 'warn' : failed ? 'error' : 'info',
+          personName: person.name,
+          recordCount: person.evidence?.length ?? 0,
+          totalRecordCount: person.sourceIds?.length ?? 0,
+          pendingCount: pendingPersonConsolidationsRef.current.size,
+          totalCount: currentPeople.filter((candidate) => Boolean(portraitEvidenceSignature(candidate))).length,
+          attempt,
+          status: mergeFailureStatus,
+          durationMs,
+          model: mergeModel,
+          portraitGenerated: !failed && !aborted,
+          workflowConcurrency: Math.min(PERSON_CONSOLIDATION_MAX_CONCURRENT, normalizeAiConcurrency(dataRef.current.aiSettings.concurrency)),
+          message: aborted ? '人物归并请求已取消。' : failed ? '人物归并请求失败，已保留重试状态。' : '人物刻画归并完成。',
+        })
         // Drain a small bounded queue so long archives do not create hundreds
         // of simultaneous profile requests after their evidence pass finishes.
         window.setTimeout(() => {
           updatePortraitProgress()
-          consolidatePeopleIfNeeded()
+          schedulePeopleConsolidation()
         }, 0)
       })
     })
     updatePortraitProgress()
+  }
+
+  const schedulePeopleConsolidation = () => {
+    if (peopleConsolidationPausedRef.current || peopleConsolidationScheduledRef.current) return
+    peopleConsolidationScheduledRef.current = true
+    window.setTimeout(() => {
+      peopleConsolidationScheduledRef.current = false
+      consolidatePeopleIfNeeded()
+    }, 0)
   }
 
   const retryPersonPortrait = (id: string) => {
@@ -1668,7 +1720,7 @@ function App() {
       }
       return { ...current, people: nextPeople }
     })
-    window.setTimeout(() => consolidatePeopleIfNeeded(), 0)
+    schedulePeopleConsolidation()
   }
 
   const mergeIncomingPeople = (additions: Person[], explicitExtraction = false) => {
@@ -1751,13 +1803,16 @@ function App() {
         concurrency: normalizeAiConcurrency(settings.concurrency),
       })
       flushPeople()
-      window.setTimeout(() => consolidatePeopleIfNeeded(), 0)
+      schedulePeopleConsolidation()
       return { started: true, ...result }
     } finally {
       flushPeople()
       if (peopleAnalysisAbortRef.current === controller) {
         peopleAnalysisAbortRef.current = null
-        setAnalysisWork((current) => current?.stage === 'people' ? null : current)
+        const mergeStillRunning = peopleConsolidationScheduledRef.current || pendingPersonConsolidationsRef.current.size > 0
+        if (peopleConsolidationPausedRef.current || !mergeStillRunning) {
+          setAnalysisWork((current) => current?.stage === 'people' ? null : current)
+        }
       }
     }
   }
@@ -1838,14 +1893,19 @@ function App() {
   const stopPeopleAnalysis = () => {
     const controller = peopleAnalysisAbortRef.current
     const portraitControllers = [...personConsolidationControllersRef.current.values()]
-    if (!controller && !portraitControllers.length) return
+    const mergeScheduled = peopleConsolidationScheduledRef.current
+    if (!controller && !portraitControllers.length && !mergeScheduled) return
     peopleConsolidationPausedRef.current = true
+    peopleConsolidationScheduledRef.current = false
     setAnalysisWork((current) => current?.stage === 'people'
       ? { ...current, message: '正在停止人物提炼；已写入本地的人物卡会保留。' }
       : current)
     appendPeopleDebug({ at: new Date().toISOString(), event: 'people_run_cancelled', level: 'warn', message: '用户停止人物提炼；已经写入本地的人物卡会保留。' })
     controller?.abort()
     portraitControllers.forEach((pending) => pending.abort())
+    if (!controller && !portraitControllers.length) {
+      setAnalysisWork((current) => current?.stage === 'people' ? null : current)
+    }
   }
 
   const clearAllPeople = () => {
@@ -2059,7 +2119,7 @@ function App() {
     })
     // State updater execution may be deferred by React batching, so scheduling
     // must not depend on a variable mutated inside that updater.
-    window.setTimeout(() => consolidatePeopleIfNeeded(), 0)
+    schedulePeopleConsolidation()
   }
 
   const resetDemoData = () => {

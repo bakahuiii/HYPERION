@@ -200,6 +200,7 @@ export interface AiDebugEntry {
   level: 'info' | 'warn' | 'error'
   conversationId?: string
   conversationName?: string
+  personName?: string
   recordCount?: number
   totalRecordCount?: number
   attempt?: number
@@ -221,6 +222,10 @@ export interface AiDebugEntry {
   coreRecordCount?: number
   overlapRecordCount?: number
   workflowConcurrency?: number
+  pendingCount?: number
+  totalCount?: number
+  durationMs?: number
+  model?: string
   historical?: boolean
   message?: string
 }
