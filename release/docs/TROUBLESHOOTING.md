@@ -10,7 +10,7 @@
 2. `node --version` 和 `npm --version`。
 3. 操作发生在哪个页面、哪个会话、哪个时间范围。
 4. UI 工作浮窗和终端最后一条有意义错误。
-5. `logs/ai-debug.jsonl` 与对应 `logs/tasks/*.jsonl` 的事件名，但分享前必须脱敏。
+5. `logs/ai-debug.jsonl` 与对应 `logs/tasks/*.jsonl.gz` 的事件名，但分享前必须脱敏。
 
 不要公开 API Key、真实聊天、头像 URL、精确位置或 `settings.ini`。
 
@@ -105,7 +105,7 @@ set THEIA_SOFTWARE_RENDERING=1
 
 ```text
 data/state.json
-data/chat-archive.json
+data/chat-archive.json.gz
 data/settings.ini
 ```
 
@@ -182,7 +182,7 @@ Key 无效、过期、复制了空格，或 Key 属于另一个平台。不要�
 
 ### 429
 
-频率或配额限制。THEIA 会最多重试 5 次并尊重 `retry_after`，但不会无限轰炸服务。降低范围、等待额度恢复，人物并发必要时从代码层降为 1。
+频率或配额限制。THEIA 会最多重试 5 次并尊重 `retry_after`，故障通道会单独冷却，但不会无限轰炸服务。先降低该通道的“并发容量”；若服务商允许，也可以添加一条真正独立的 API 通道分担不同会话。多个 Key 若属于同一账户、同一中转或同一上游，通常仍共享额度。
 
 ### 502/503/504
 
@@ -193,10 +193,24 @@ Key 无效、过期、复制了空格，或 Key 属于另一个平台。不要�
 1. 选一个会话 + 严格时间 + 100 条以内做健康检查。
 2. 查看 task log 中 `segmentIndex/segmentCount`、recordCount 和请求大小。
 3. 确认当前代码已启用 14k-34k 字符动态分段。
-4. 自动模式观察是否从 Responses 回退到 Chat Completions。
-5. 等待服务恢复或切换可信服务商。
+4. 查看通道池是否把故障通道标成冷却，并确认其他通道仍有可用槽位。
+5. 如果错误明确表示 endpoint/schema 不受支持，自动模式应回退到 Chat Completions；普通 gateway 502 不应复制同一大请求做模式回退。
+6. 等待服务恢复，或在服务商规则允许时增加另一条独立 API 通道。
 
 不要把“所有消息都覆盖”误改回“单个无限大请求”。
+
+### 添加多条通道后仍然没有提速
+
+按顺序检查：
+
+1. 每条通道是否都显示“可用”，而不是未配置、停用或冷却；
+2. 全局“并发会话”是否大于 1，并且不小于希望使用的池容量；
+3. 每条“通道并发容量”是否符合服务商允许值；
+4. 当前是否只有一个超长会话——同一会话的片段为保证时间线只能串行；
+5. 多个 Key 是否实际共享同一服务商账户级限流；
+6. `/api/ai/status` 中 `scheduler.activeRequests` 是否同时分布在多个 channel runtime。
+
+不要为了追求数字盲目把并发拉到 32。并发超过通道池实际容量只会在本机排队；超过服务商限额会增加 429/502，反而更慢。
 
 ### Chromium `ssl_client_socket_impl ... net_error -100`
 
@@ -310,7 +324,7 @@ UI 的“0 候选”不是单一故障码。依次看：
 - 不使用 `git reset --hard`、批量删除根目录或不明确的通配符恢复用户数据。
 - JSON 损坏时保留原件，复制后再修复。
 - 删除 `data/electron/` 只会重置桌面 Chromium profile，不等于删除任务；但必须在退出应用后进行。
-- 删除 `data/state.json` 会丢失任务、人物、地点和候选；删除 `data/chat-archive.json` 会丢失原始聊天来源。
+- 删除 `data/state.json` 会丢失任务、人物、地点和候选；删除 `data/chat-archive.json.gz` 会丢失原始聊天来源。
 - API Key 泄露时不能靠删除日志补救，应立即在服务商处吊销并重发。
 
 若仍不能定位，使用完全虚构的最小 JSON 复现，并只分享去标识化后的日志结构。这样既能调试，又不会把真实聊天和密钥交给第三方。

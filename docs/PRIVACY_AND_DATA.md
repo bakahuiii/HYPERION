@@ -23,14 +23,14 @@ THEIA 处理聊天、关系、位置、行程和模型密钥，默认应视为�
 | 路径 | 内容 | 敏感级别 | 删除影响 |
 | --- | --- | --- | --- |
 | `data/state.json` | 任务、人物、地点、候选、布局、忽略列表 | 高 | 丢失主要成果和布局 |
-| `data/chat-archive.json` | 完整导入聊天归档 | 极高 | 无法查看来源或再次从本地归档提炼 |
+| `data/chat-archive.json.gz` | gzip 压缩的完整导入聊天归档 | 极高 | 无法查看来源或再次从本地归档提炼 |
 | `data/settings.ini` | 名称、外观、提示词、模型 URL、明文 API Key | 极高 | 设置重置，模型需重新配置 |
 | `data/electron/` | Chromium profile、缓存和会话数据 | 高 | 桌面 profile 重置 |
 | `data/runtime/desktop.pid` | 当前桌面进程 ID | 低 | 运行中删除会影响启动器识别 |
 | `assets/img/avatars/` | 下载的联系人头像及 URL hash 元数据 | 高 | 头像需重新下载或显示占位符 |
 | `assets/img/backgrounds/` | 用户上传背景和用户头像资产 | 中到高 | 外观图片失效 |
 | `logs/ai-debug.jsonl` | 不含正文的管线摘要 | 中 | 降低调试能力 |
-| `logs/tasks/*.jsonl` | 模型输入、输出、错误，可能含聊天正文 | 极高 | 无法复盘具体模型行为 |
+| `logs/tasks/*.jsonl.gz` | 压缩的模型输入、输出、错误，可能含聊天正文 | 极高 | 无法复盘具体模型行为 |
 
 开发布局使用根目录 `.theia-*` 对应项，敏感等级相同。
 
@@ -166,7 +166,7 @@ logs/        # 若需要保留模型审计
 ## 10. 发布与问题报告检查表
 
 - [ ] 发布器目标是新目录，不覆盖个人运行目录。
-- [ ] 目标中没有 `state.json`、`chat-archive.json`、`settings.ini`。
+- [ ] 目标中没有 `state.json`、`chat-archive.json.gz`、`settings.ini`。
 - [ ] `logs/` 只有 README 和空占位。
 - [ ] `assets/img/avatars/` 为空占位。
 - [ ] 背景和默认头像是通用项目素材。

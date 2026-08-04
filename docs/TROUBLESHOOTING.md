@@ -10,7 +10,7 @@
 2. `node --version` 和 `npm --version`。
 3. 操作发生在哪个页面、哪个会话、哪个时间范围。
 4. UI 工作浮窗和终端最后一条有意义错误。
-5. `logs/ai-debug.jsonl` 与对应 `logs/tasks/*.jsonl` 的事件名，但分享前必须脱敏。
+5. `logs/ai-debug.jsonl` 与对应 `logs/tasks/*.jsonl.gz` 的事件名，但分享前必须脱敏。
 
 不要公开 API Key、真实聊天、头像 URL、精确位置或 `settings.ini`。
 
@@ -105,7 +105,7 @@ set THEIA_SOFTWARE_RENDERING=1
 
 ```text
 data/state.json
-data/chat-archive.json
+data/chat-archive.json.gz
 data/settings.ini
 ```
 
@@ -324,7 +324,7 @@ UI 的“0 候选”不是单一故障码。依次看：
 - 不使用 `git reset --hard`、批量删除根目录或不明确的通配符恢复用户数据。
 - JSON 损坏时保留原件，复制后再修复。
 - 删除 `data/electron/` 只会重置桌面 Chromium profile，不等于删除任务；但必须在退出应用后进行。
-- 删除 `data/state.json` 会丢失任务、人物、地点和候选；删除 `data/chat-archive.json` 会丢失原始聊天来源。
+- 删除 `data/state.json` 会丢失任务、人物、地点和候选；删除 `data/chat-archive.json.gz` 会丢失原始聊天来源。
 - API Key 泄露时不能靠删除日志补救，应立即在服务商处吊销并重发。
 
 若仍不能定位，使用完全虚构的最小 JSON 复现，并只分享去标识化后的日志结构。这样既能调试，又不会把真实聊天和密钥交给第三方。

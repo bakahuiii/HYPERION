@@ -1,6 +1,6 @@
 # THEIA 开发者文档
 
-本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.1.0` 源码预览版，以 `package-lock.json` 和当前实现为准，不把规划中的能力写成已经完成的能力。
+本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.3.0` 稳定源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 的逐字段定义为准。
 
 ## 1. 项目定位与工程边界
 
@@ -139,7 +139,7 @@ enable-features=CanvasOopRasterization
 
 ### 5.4 `Person`
 
-人物卡不是联系人表。它由私聊会话和可引用证据构成，包含头像、事实缓冲、偏好信号、建议、画像、会话 ID、引用 ID、最早/最近可核实时间、平台和模型。`peopleModelVersion` 当前为 3；旧版不可核验人物卡会被清空而不是盲目迁移。
+人物卡不是联系人表。它由私聊会话和可引用证据构成，包含头像、事实缓冲、偏好信号、建议、画像、会话 ID、引用 ID、最早/最近可核实时间、平台和模型。`peopleModelVersion` 当前为 5；旧版可核验版本 3/4 会在读取时归一化，无法核验的旧人物卡会被清空而不是盲目迁移。
 
 ### 5.5 `Place`
 
@@ -152,7 +152,7 @@ THEIA 刻意把大对象和频繁编辑对象分开。
 ```text
 AppData（React 内存）
   ├─ 轻量状态 -> localStorage 缓存 -> shared state JSON
-  ├─ 原始 intel -> IndexedDB 缓存 -> chat archive JSON
+  ├─ 原始 intel -> IndexedDB 缓存 -> gzip chat archive
   └─ profile/appearance/AI settings -> settings.ini
 ```
 
@@ -171,7 +171,7 @@ AppData（React 内存）
 | 内容 | 路径 |
 | --- | --- |
 | 轻量快照 | `.theia-shared-state.json` |
-| 原始归档 | `.theia-shared-intel.json` |
+| 原始归档 | `.theia-shared-intel.json.gz`（兼容读取旧 JSON） |
 | 通用设置 | `.theia-settings.ini` |
 | 摘要日志 | `.theia-ai-debug.log` |
 | 工作日志 | `.theia-task-logs/` |
@@ -184,7 +184,7 @@ AppData（React 内存）
 | 内容 | 路径 |
 | --- | --- |
 | 轻量快照 | `data/state.json` |
-| 原始归档 | `data/chat-archive.json` |
+| 原始归档 | `data/chat-archive.json.gz`（兼容读取旧 JSON） |
 | 通用设置 | `data/settings.ini` |
 | 摘要日志 | `logs/ai-debug.jsonl` |
 | 工作日志 | `logs/tasks/` |
@@ -199,7 +199,7 @@ AppData（React 内存）
 - shared state 写入通过进程内 Promise queue 串行化，避免桌面与浏览器同时复用临时文件。
 - 快照带 `updatedAt`；渲染器轮询元数据，避免旧页面关闭时覆盖更新快照。
 - 原始聊天从 shared state 中剥离；读取旧快照时兼容迁移内嵌 `intel`，之后不再随 UI 状态反复写入。
-- 设置以 URL 编码的 INI v2 保存，允许提示词包含换行和 `=`。
+- 设置以 URL 编码的 INI v3 保存，允许提示词包含换行和 `=`；旧 v2/legacy provider 会在读取时迁移。
 
 这不是事务数据库。若未来支持多用户、后台写入或多进程并发，应迁移到 SQLite，并为 schema、事务和备份建立正式层。
 
@@ -323,7 +323,7 @@ budget = clamp(round(48,000 / max(1, scale)), 14,000, 34,000)
 
 Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `response_format: json_schema`。兼容通道返回明确的 schema 400/422 时降级为 `json_object`，随后仍在本地规范化和验证。
 
-任务-only 输出上限 3,000 tokens；任务+人物联合输出 5,500；旧人物接口 5,000；人物归并和任务建议各 1,200。
+任务-only 输出上限 3,000 tokens；任务+人物联合输出 3,200；人物证据接口 2,400；人物归并 1,800；任务建议 1,200。
 
 ### 9.5 API 模式回退
 
@@ -352,7 +352,7 @@ Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `respon
 4. 负载相同时按最久未选中、主通道、稳定 ID 的顺序打破平局；
 5. 完成后释放槽位并唤醒 FIFO 等待队列。
 
-429、502、503、504、524、网络错误和超时只增加当前通道的失败计数并触发 1–12 秒指数冷却。客户端随后重试 `/api/ai/analyze` 时会重新申请 lease，因此可能切到另一通道；服务端不会把一个请求广播到所有通道。`/api/ai/status` 的顶层 `configured` 表示“至少一条启用且有效的通道存在”，不能只反映主通道。
+429、502、503、504、524、网络错误和超时只增加当前通道及其共享 origin 的失败计数，并触发 250 ms 起步、最多 2 秒的指数冷却。客户端随后重试 `/api/ai/analyze` 时会重新申请 lease，因此可能切到另一通道；服务端不会把一个请求广播到所有通道，也不会把上游的长 `Retry-After` 原样变成本地长时间冻结。`/api/ai/status` 的顶层 `configured` 表示“至少一条启用且有效的通道存在”，不能只反映主通道。
 
 ## 10. 人物流水线
 
@@ -361,8 +361,8 @@ Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `respon
 ### 10.1 请求策略
 
 - 使用与任务相同的连续会话分段；
-- 私聊优先随任务在同一次 `/api/ai/analyze` 请求中返回人物证据；
-- 只有旧兼容服务没有返回 `peopleIncluded` 时，才使用 `/api/ai/people` 二次处理未覆盖的完整私聊；
+- 本地默认任务路径把 `workflows.people` 设为 `false`，先用任务分段处理；随后使用 `/api/ai/people` 的宽窗口人物路径，避免任务 schema 和人物 schema 互相挤占上下文预算；
+- `/api/ai/analyze` 仍支持兼容客户端对 `kind=direct` 设置 `workflows.people=true`，此时服务端返回 `peopleIncluded` 和联合 schema；这不是当前内置批处理的默认策略；
 - 不同会话按用户设置并行，同一会话的片段保持串行；
 - 每个结果必须引用本段实际记录；
 - 记录方向为 self 时只可用于关系上下文，不可当成对方事实；
@@ -444,7 +444,7 @@ Leaflet 请求本地 `/api/map/tiles/{z}/{x}/{y}.png`。服务端验证 z 0-19 �
 
 ### 14.2 工作单元日志
 
-`logs/tasks/YYYYMMDD-HHmmss-mmm-kind-label-digest.jsonl` 记录：
+`logs/tasks/YYYYMMDD-HHmmss-mmm-kind-label-digest.jsonl.gz` 记录：
 
 1. schema `theia-task-log/v1`、开始时间、kind 和完整本地请求；
 2. 完成、失败或回退事件；
@@ -484,8 +484,9 @@ THEIA_SOFTWARE_RENDERING=1
 - 原始 intel 不进入 localStorage 和 shared UI snapshot。
 - 会话计划按字符而不是消息条数切分，避免短消息和巨型消息使用同一上限。
 - 最近段优先，用户可更快看到有价值候选。
-- 私聊任务和人物复用一次上游输入；只有联合输出不可用时才走旧人物请求。
-- 客户端并发范围 1–32；服务端再按每通道 1–8 的容量限流。增加独立通道可以提高不同会话吞吐，但同一会话片段仍串行。
+- 默认任务与人物分离上传：任务使用小分段，人物使用宽窗口；仅兼容客户端显式请求联合 schema 时才复用一次上游输入。
+- 客户端全局并发范围 1–64；服务端再按每通道 1–8 的容量和共享 origin 容量限流。增加独立通道可以提高不同会话吞吐，但同一会话片段仍串行。人物证据提炼和人物归并现在使用同一全局并发配置，不再固定为 4 或 8。
+- 任务分段默认最多 48 条核心记录或约 4,000 个紧凑行字符，并保留最多 6 条/1,000 字符 overlap；人物分段默认最多 320 条或约 24,000 个字符，并保留最多 16 条/3,000 字符 overlap。核心记录完整覆盖，overlap 不重复计入进度。
 - 任务提示的固定前缀保持稳定，动态日期、分段元数据、反馈和记录放在尾部，方便支持 prompt cache 的模型复用前缀。
 - 人物聊天浮窗和人物列表使用虚拟窗口，避免一次渲染数万 DOM 节点。
 - 任务图拖拽、缩放和平移尽量通过 rAF 和 CSS transform 写入，结束时才提交 React 状态。
@@ -544,7 +545,7 @@ node --check electron/main.mjs
 ### 18.2 打包器
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.1.2\THEIA-release-0.1.2
+node release-tools/package-release.mjs ..\staging\v0.3.0\THEIA-release-0.3.0
 ```
 
 打包器要求目标在源码目录之外且不存在，避免误覆盖。它复制必要源码、锁文件、发布文档、默认资源和虚构示例，并生成 `RELEASE_MANIFEST.json`。明确排除：
@@ -605,4 +606,4 @@ node release-tools/package-release.mjs ..\staging\v0.1.2\THEIA-release-0.1.2
 - Playwright 桌面/浏览器视觉回归和任务图拖拽测试；
 - 正式安装器、自动更新和签名。
 
-在这些基础设施完成前，`0.1.0` 应继续标注为源码预览版，而不是无条件承诺可处理任意格式、任意规模和任意兼容中转。
+在这些基础设施完成前，`0.3.0` 仍应理解为可审计的单用户源码/便携版，而不是无条件承诺可处理任意格式、任意规模和任意兼容中转。

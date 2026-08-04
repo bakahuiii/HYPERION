@@ -1,6 +1,6 @@
 # THEIA 开发者文档
 
-本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.1.0` 源码预览版，以 `package-lock.json` 和当前实现为准，不把规划中的能力写成已经完成的能力。
+本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.3.0` 稳定源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 的逐字段定义为准。
 
 ## 1. 项目定位与工程边界
 
@@ -139,7 +139,7 @@ enable-features=CanvasOopRasterization
 
 ### 5.4 `Person`
 
-人物卡不是联系人表。它由私聊会话和可引用证据构成，包含头像、事实缓冲、偏好信号、建议、画像、会话 ID、引用 ID、最早/最近可核实时间、平台和模型。`peopleModelVersion` 当前为 3；旧版不可核验人物卡会被清空而不是盲目迁移。
+人物卡不是联系人表。它由私聊会话和可引用证据构成，包含头像、事实缓冲、偏好信号、建议、画像、会话 ID、引用 ID、最早/最近可核实时间、平台和模型。`peopleModelVersion` 当前为 5；旧版可核验版本 3/4 会在读取时归一化，无法核验的旧人物卡会被清空而不是盲目迁移。
 
 ### 5.5 `Place`
 
@@ -152,7 +152,7 @@ THEIA 刻意把大对象和频繁编辑对象分开。
 ```text
 AppData（React 内存）
   ├─ 轻量状态 -> localStorage 缓存 -> shared state JSON
-  ├─ 原始 intel -> IndexedDB 缓存 -> chat archive JSON
+  ├─ 原始 intel -> IndexedDB 缓存 -> gzip chat archive
   └─ profile/appearance/AI settings -> settings.ini
 ```
 
@@ -171,7 +171,7 @@ AppData（React 内存）
 | 内容 | 路径 |
 | --- | --- |
 | 轻量快照 | `.theia-shared-state.json` |
-| 原始归档 | `.theia-shared-intel.json` |
+| 原始归档 | `.theia-shared-intel.json.gz`（兼容读取旧 JSON） |
 | 通用设置 | `.theia-settings.ini` |
 | 摘要日志 | `.theia-ai-debug.log` |
 | 工作日志 | `.theia-task-logs/` |
@@ -184,7 +184,7 @@ AppData（React 内存）
 | 内容 | 路径 |
 | --- | --- |
 | 轻量快照 | `data/state.json` |
-| 原始归档 | `data/chat-archive.json` |
+| 原始归档 | `data/chat-archive.json.gz`（兼容读取旧 JSON） |
 | 通用设置 | `data/settings.ini` |
 | 摘要日志 | `logs/ai-debug.jsonl` |
 | 工作日志 | `logs/tasks/` |
@@ -199,7 +199,7 @@ AppData（React 内存）
 - shared state 写入通过进程内 Promise queue 串行化，避免桌面与浏览器同时复用临时文件。
 - 快照带 `updatedAt`；渲染器轮询元数据，避免旧页面关闭时覆盖更新快照。
 - 原始聊天从 shared state 中剥离；读取旧快照时兼容迁移内嵌 `intel`，之后不再随 UI 状态反复写入。
-- 设置以 URL 编码的 INI v2 保存，允许提示词包含换行和 `=`。
+- 设置以 URL 编码的 INI v3 保存，允许提示词包含换行和 `=`；旧 v2/legacy provider 会在读取时迁移。
 
 这不是事务数据库。若未来支持多用户、后台写入或多进程并发，应迁移到 SQLite，并为 schema、事务和备份建立正式层。
 
@@ -319,13 +319,15 @@ budget = clamp(round(48,000 / max(1, scale)), 14,000, 34,000)
 
 任务 schema 要求：`title`、`description`、`startAt`、`dueAt`、`sourceIds`、`people`、`place`、`locationPrecision`、`locationRadiusMeters`、`tags`、`guidance`、`actionOwner`。未知标量用 null，未知数组用 `[]`，`actionOwner` 必须为 `self`。
 
-Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `response_format: json_schema`。兼容通道返回 400/422 时降级为 `json_object`，随后仍在本地规范化和验证。
+私聊请求携带 `workflows: { tasks: true, people: true }`，联合 schema 返回 `candidates`、`people` 和 `peopleIncluded`。`peopleIncluded` 表示服务端是否成功解析了人物工作流，与 `people.length` 无关；合法的空人物结果仍是 `true`。群聊 schema 只返回 `candidates`。
 
-任务输出上限 3,000 tokens；人物 5,000；人物归并和任务建议各 1,200。
+Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `response_format: json_schema`。兼容通道返回明确的 schema 400/422 时降级为 `json_object`，随后仍在本地规范化和验证。
+
+任务-only 输出上限 3,000 tokens；任务+人物联合输出 3,200；人物证据接口 2,400；人物归并 1,800；任务建议 1,200。
 
 ### 9.5 API 模式回退
 
-`auto` 先请求 `<base>/responses`。当状态是 400、404、405、422、501、502、503、504，或错误明确表示 endpoint 不支持时，改用 `<base>/chat/completions`。明确选择 responses/chat-completions 时不跨模式回退。
+`auto` 先请求 `<base>/responses`。只有 404、405、415、501，或 400/422 正文明确说明 Responses endpoint/structured output 不受支持时，才改用 `<base>/chat/completions`。502、503、504、超时和网络错误不会在同一个服务内复制大请求到另一种 API 模式，而是让通道进入冷却并交给客户端重试。明确选择 responses/chat-completions 时不跨模式回退。
 
 ### 9.6 候选本地校验
 
@@ -340,6 +342,18 @@ Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `respon
 
 这里没有伪精确“置信度”。丢弃原因会转为可查看、可删除的磨合记录。
 
+### 9.7 多通道调度
+
+`withProviderChannel()` 为分析、旧人物、人物归并和任务建议统一申请通道 lease。调度队列按以下规则工作：
+
+1. 只考虑 `enabled`、有 API Key 且配置有效的通道；
+2. 排除达到 `maxConcurrency` 或仍在冷却的通道；
+3. 优先选择 `activeRequests / maxConcurrency` 最低的通道；
+4. 负载相同时按最久未选中、主通道、稳定 ID 的顺序打破平局；
+5. 完成后释放槽位并唤醒 FIFO 等待队列。
+
+429、502、503、504、524、网络错误和超时只增加当前通道及其共享 origin 的失败计数，并触发 250 ms 起步、最多 2 秒的指数冷却。客户端随后重试 `/api/ai/analyze` 时会重新申请 lease，因此可能切到另一通道；服务端不会把一个请求广播到所有通道，也不会把上游的长 `Retry-After` 原样变成本地长时间冻结。`/api/ai/status` 的顶层 `configured` 表示“至少一条启用且有效的通道存在”，不能只反映主通道。
+
 ## 10. 人物流水线
 
 人物分析只处理 `conversationKind === direct` 的会话。导入后先建立目录核验的占位卡，避免长模型任务期间人物列表完全为空；丰富事实必须通过模型并引用原消息。
@@ -347,7 +361,9 @@ Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `respon
 ### 10.1 请求策略
 
 - 使用与任务相同的连续会话分段；
-- 默认并发 2；
+- 本地默认任务路径把 `workflows.people` 设为 `false`，先用任务分段处理；随后使用 `/api/ai/people` 的宽窗口人物路径，避免任务 schema 和人物 schema 互相挤占上下文预算；
+- `/api/ai/analyze` 仍支持兼容客户端对 `kind=direct` 设置 `workflows.people=true`，此时服务端返回 `peopleIncluded` 和联合 schema；这不是当前内置批处理的默认策略；
+- 不同会话按用户设置并行，同一会话的片段保持串行；
 - 每个结果必须引用本段实际记录；
 - 记录方向为 self 时只可用于关系上下文，不可当成对方事实；
 - 同名人物只有在会话 ID 或证据重叠时合并，不只靠名称合并。
@@ -395,12 +411,15 @@ Leaflet 请求本地 `/api/map/tiles/{z}/{x}/{y}.png`。服务端验证 z 0-19 �
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/api/ai/status` | 返回公开/可编辑模型配置状态 |
-| POST | `/api/ai/config` | 保存模型 URL、明文 Key、模型和模式，并探测列表 |
-| DELETE | `/api/ai/config` | 重置模型配置 |
+| GET | `/api/ai/status` | 返回可编辑通道池、每通道运行状态和调度容量 |
+| GET/POST | `/api/ai/channels` | 列出通道或创建新通道；`/providers` 是等价别名 |
+| POST/PUT/PATCH | `/api/ai/channels/:id` | 更新、启停、设主通道或刷新模型列表 |
+| DELETE | `/api/ai/channels/:id` | 删除一条通道；至少保留一个配置槽 |
+| POST | `/api/ai/config` | 兼容旧客户端：更新当前主通道 |
+| DELETE | `/api/ai/config` | 兼容旧客户端：重置当前主通道 |
 | POST | `/api/ai/models` | 只探测模型列表 |
-| POST | `/api/ai/analyze` | 分析一个任务会话段 |
-| POST | `/api/ai/people` | 分析一个人物会话段 |
+| POST | `/api/ai/analyze` | 分析一个会话段；私聊可联合返回任务与人物 |
+| POST | `/api/ai/people` | 旧兼容路径：单独分析一个人物会话段 |
 | POST | `/api/ai/people/merge` | 收敛已核验人物笔记 |
 | POST | `/api/ai/task-guidance` | 生成或刷新任务建议 |
 | GET/POST | `/api/settings` | 读取/保存 profile、appearance、AI settings |
@@ -425,7 +444,7 @@ Leaflet 请求本地 `/api/map/tiles/{z}/{x}/{y}.png`。服务端验证 z 0-19 �
 
 ### 14.2 工作单元日志
 
-`logs/tasks/YYYYMMDD-HHmmss-mmm-kind-label-digest.jsonl` 记录：
+`logs/tasks/YYYYMMDD-HHmmss-mmm-kind-label-digest.jsonl.gz` 记录：
 
 1. schema `theia-task-log/v1`、开始时间、kind 和完整本地请求；
 2. 完成、失败或回退事件；
@@ -443,7 +462,7 @@ Leaflet 请求本地 `/api/map/tiles/{z}/{x}/{y}.png`。服务端验证 z 0-19 �
 
 ## 15. 设置和模型配置
 
-INI v2 分为 `[meta]`、`[profile]`、`[appearance]`、`[ai]`、`[provider]`。所有值 URL encode，JSON 子对象再整体编码。写入前做长度、枚举、URL 和数值归一化。
+INI v3 分为 `[meta]`、`[profile]`、`[appearance]`、`[ai]`、兼容主通道 `[provider]` 和通道池 `[providers]`。`[providers] channels` 保存通道数组，`primaryId` 保存主通道。所有值 URL encode，JSON 子对象再整体编码。写入前做长度、枚举、URL 和数值归一化。
 
 启动优先级：已有 INI > 一次性迁移 legacy provider > 环境变量默认值。环境变量：
 
@@ -465,7 +484,10 @@ THEIA_SOFTWARE_RENDERING=1
 - 原始 intel 不进入 localStorage 和 shared UI snapshot。
 - 会话计划按字符而不是消息条数切分，避免短消息和巨型消息使用同一上限。
 - 最近段优先，用户可更快看到有价值候选。
-- 人物请求并发 2；任务请求目前以服务稳定性优先，不盲目高并发。
+- 默认任务与人物分离上传：任务使用小分段，人物使用宽窗口；仅兼容客户端显式请求联合 schema 时才复用一次上游输入。
+- 客户端全局并发范围 1–64；服务端再按每通道 1–8 的容量和共享 origin 容量限流。增加独立通道可以提高不同会话吞吐，但同一会话片段仍串行。人物证据提炼和人物归并现在使用同一全局并发配置，不再固定为 4 或 8。
+- 任务分段默认最多 48 条核心记录或约 4,000 个紧凑行字符，并保留最多 6 条/1,000 字符 overlap；人物分段默认最多 320 条或约 24,000 个字符，并保留最多 16 条/3,000 字符 overlap。核心记录完整覆盖，overlap 不重复计入进度。
+- 任务提示的固定前缀保持稳定，动态日期、分段元数据、反馈和记录放在尾部，方便支持 prompt cache 的模型复用前缀。
 - 人物聊天浮窗和人物列表使用虚拟窗口，避免一次渲染数万 DOM 节点。
 - 任务图拖拽、缩放和平移尽量通过 rAF 和 CSS transform 写入，结束时才提交 React 状态。
 - Leaflet 使用 canvas 偏好；Electron 默认 GPU 加速。
@@ -493,7 +515,9 @@ node --check server/index.mjs
 node --check electron/main.mjs
 ```
 
-`npm run build` 先执行 `tsc -b`，再运行 Vite build。当前没有单元测试、集成测试或端到端测试脚本，这是发布风险，不应在文档中声称“测试通过”来代替 lint/build。
+`npm run build` 先执行 `tsc -b`，再运行 Vite build。`npm test` 会启动两个只在 loopback 监听的假 OpenAI 服务和一个隔离运行目录，验证多通道并行分流、502 单路冷却、备用通道接管以及日志密钥脱敏；它不读取本机聊天、INI 或真实 API Key，也不会访问外网。
+
+当前自动化仍只覆盖通道池关键路径，没有完整的 importer、React 交互或 Electron 端到端测试。不要用单个集成测试代替 lint、build 和发布烟测。
 
 建议优先补测试的纯函数：
 
@@ -503,6 +527,7 @@ node --check electron/main.mjs
 - 人物证据引用校验与同名会话隔离；
 - shared state 迁移和旧页面写入保护；
 - provider URL 规范化和 API 模式回退；
+- 多通道负载均衡、冷却、主通道停用时的 pool-level configured 语义；
 - 地图搜索结果 bounds/precision/radius。
 
 ## 18. 发布流程
@@ -510,7 +535,7 @@ node --check electron/main.mjs
 ### 18.1 发布前清单
 
 1. 确认 `package.json` 版本和 release notes。
-2. 运行 lint、build 和 Node syntax check。
+2. 运行 test、lint、build 和 Node syntax check。
 3. 用虚构数据启动桌面版与浏览器版。
 4. 验证模型配置、单一会话、停止/重试、人物阶段、任务生成、地图和重启持久化。
 5. 搜索真实昵称、API Key、服务域名、绝对用户路径和聊天片段。
@@ -520,7 +545,7 @@ node --check electron/main.mjs
 ### 18.2 打包器
 
 ```powershell
-node release-tools/package-release.mjs G:\work\THEIA-release-0.1.0
+node release-tools/package-release.mjs ..\staging\v0.3.0\THEIA-release-0.3.0
 ```
 
 打包器要求目标在源码目录之外且不存在，避免误覆盖。它复制必要源码、锁文件、发布文档、默认资源和虚构示例，并生成 `RELEASE_MANIFEST.json`。明确排除：
@@ -581,4 +606,4 @@ node release-tools/package-release.mjs G:\work\THEIA-release-0.1.0
 - Playwright 桌面/浏览器视觉回归和任务图拖拽测试；
 - 正式安装器、自动更新和签名。
 
-在这些基础设施完成前，`0.1.0` 应继续标注为源码预览版，而不是无条件承诺可处理任意格式、任意规模和任意兼容中转。
+在这些基础设施完成前，`0.3.0` 仍应理解为可审计的单用户源码/便携版，而不是无条件承诺可处理任意格式、任意规模和任意兼容中转。
