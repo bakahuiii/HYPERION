@@ -1,4 +1,5 @@
 import type { IntelItem } from '../types'
+import { deduplicateIntelAvatars } from './intelPersistence.ts'
 
 interface ParsedLine {
   text: string
@@ -280,9 +281,9 @@ export function normalizeCapturedAt(value: unknown): string | undefined {
   return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())}T${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`
 }
 
-function collectJsonMessages(value: unknown, result: ParsedLine[] = [], context: ParseContext = {}): ParsedLine[] {
+function collectJsonMessages(value: unknown, result: ParsedLine[] = [], context: ParseContext = {}, strict = false): ParsedLine[] {
   if (Array.isArray(value)) {
-    value.forEach((item) => collectJsonMessages(item, result, context))
+    value.forEach((item) => collectJsonMessages(item, result, context, strict))
     return result
   }
   if (!value || typeof value !== 'object') return result
@@ -297,11 +298,14 @@ function collectJsonMessages(value: unknown, result: ParsedLine[] = [], context:
     speakerRole: ownRole !== 'unknown' ? ownRole : context.speakerRole,
   }
   const text = firstField(record, contentKeys)
-  if (text.length >= 2) {
+  const hasMessageMetadata = nextContext.timestamp !== undefined
+    || Boolean(nextContext.speaker)
+    || (nextContext.speakerRole !== undefined && nextContext.speakerRole !== 'unknown')
+  if (text.length >= 2 && (!strict || hasMessageMetadata)) {
     result.push({ text, timestamp: nextContext.timestamp, speaker: nextContext.speaker, avatarUrl: nextContext.avatarUrl, messageType: nextContext.messageType, speakerRole: nextContext.speakerRole ?? 'unknown' })
     return result
   }
-  Object.values(record).forEach((item) => collectJsonMessages(item, result, nextContext))
+  Object.values(record).forEach((item) => collectJsonMessages(item, result, nextContext, strict))
   return result
 }
 
@@ -407,20 +411,33 @@ function conversationContext(file: File, path?: string) {
   const groupIndex = folders.findIndex((folder) => /(群聊|群组|群消息|group|groups|chatroom)/i.test(folder))
   const directIndex = folders.findIndex((folder) => /(私聊|单聊|好友|friend|direct|personal)/i.test(folder))
   const categoryIndex = groupIndex >= 0 ? groupIndex : directIndex
+  const fileIsGroup = /^(?:群聊|群组|群消息|group|groups|chatroom)[\s_-]*/i.test(fileStem)
+  const fileIsDirect = /^(?:私聊|单聊|好友|friend|direct|personal)[\s_-]*/i.test(fileStem)
+  const hasCategoryFolder = categoryIndex >= 0
   // Exports commonly place message files inside a shared data/logs subfolder.
   // The folder immediately below 群聊/私聊 is the actual conversation identity.
-  const conversationFolders = categoryIndex >= 0 && folders[categoryIndex + 1]
+  const conversationFolders = hasCategoryFolder && folders[categoryIndex + 1]
     ? folders.slice(0, categoryIndex + 2)
     : folders
-  const conversationPath = conversationFolders.join('/') || fileStem
+  // Some exporters use flat filenames such as “私聊_Alice.json” instead of a
+  // 私聊/Alice folder. Treat that filename as the conversation identity rather
+  // than merging every flat export into one unknown conversation.
+  const fileDefinesConversation = fileIsGroup || fileIsDirect || (hasCategoryFolder && !folders[categoryIndex + 1])
+  const conversationPath = fileDefinesConversation
+    ? [...folders, fileStem].join('/')
+    : conversationFolders.join('/') || fileStem
   const kind: NonNullable<IntelItem['conversationKind']> = groupIndex >= 0
     ? 'group'
     : directIndex >= 0
       ? 'direct'
-      : 'unknown'
+      : fileIsGroup
+        ? 'group'
+        : fileIsDirect
+          ? 'direct'
+          : 'unknown'
   return {
     conversationId: `folder:${conversationPath}`,
-    conversationName: conversationFolders.at(-1) || fileStem,
+    conversationName: fileDefinesConversation ? fileStem : conversationFolders.at(-1) || fileStem,
     conversationKind: kind,
   }
 }
@@ -433,13 +450,14 @@ export async function parseIntelFile(file: File, context: ImportContext = {}): P
     const parsed = JSON.parse(raw) as unknown
     const speakerAvatars = collectSpeakerAvatars(parsed)
     const sessionAvatar = sessionAvatarUrl(parsed)
-    const messages = collectJsonMessages(parsed)
+    const strictDirectoryImport = Boolean(context.path)
+    const messages = collectJsonMessages(parsed, [], {}, strictDirectoryImport)
     lines = messages.length
       ? messages.map((message) => ({
         ...message,
         avatarUrl: message.avatarUrl || (message.speaker ? speakerAvatars.get(message.speaker) : undefined) || sessionAvatar || undefined,
       }))
-      : flattenJson(parsed).filter((line) => line.length >= 8).map((text) => ({ text }))
+      : strictDirectoryImport ? [] : flattenJson(parsed).filter((line) => line.length >= 8).map((text) => ({ text }))
   } else if (file.name.toLowerCase().endsWith('.csv')) {
     lines = parseCsvMessages(raw)
   } else {
@@ -448,7 +466,7 @@ export async function parseIntelFile(file: File, context: ImportContext = {}): P
 
   const source = inferSource(file.name, context.path)
   const conversation = conversationContext(file, context.path)
-  return lines.map((line, index) => {
+  return deduplicateIntelAvatars(lines.map((line, index) => {
     const summary = [line.speaker ? `${line.speaker}:` : '', line.text].filter(Boolean).join(' ').slice(0, 1200)
     const recordKey = [context.path ?? file.name, line.timestamp ?? '', line.speaker ?? '', line.text, index].join('|')
     return {
@@ -459,6 +477,7 @@ export async function parseIntelFile(file: File, context: ImportContext = {}): P
     // one complete conversation to the model rather than a shortened excerpt.
     content: line.text,
     source,
+    sourceFile: context.path || file.name,
     ...conversation,
     speaker: line.speaker || undefined,
     avatarUrl: line.avatarUrl || undefined,
@@ -468,5 +487,5 @@ export async function parseIntelFile(file: File, context: ImportContext = {}): P
     // incorrectly resolving relative dates against an import or export time.
     capturedAt: normalizeCapturedAt(line.timestamp) ?? '',
     status: 'new',
-  }})
+  }}))
 }

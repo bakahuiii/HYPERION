@@ -1,7 +1,7 @@
 {
   "name": "theia",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "electron/main.mjs",
   "engines": {
@@ -17,8 +17,9 @@
     "desktop:release": "node scripts/release-desktop.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "test": "npm run test:provider-pool",
-    "test:provider-pool": "node --test tests/provider-pool.test.mjs",
+    "test": "npm run test:client && npm run test:provider-pool",
+    "test:client": "node --test --experimental-strip-types tests/client-persistence.test.mjs",
+    "test:provider-pool": "node --test --test-concurrency=1 tests/provider-pool.test.mjs",
     "preview": "vite preview",
     "dist:exe": "npm run build && node release-tools/package-portable-exe.mjs",
     "release:index": "node release-tools/update-release-index.mjs"

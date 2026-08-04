@@ -24,6 +24,14 @@ export interface WatchedFile {
   signature: string
 }
 
+export interface DirectoryScanResult {
+  files: WatchedFile[]
+  complete: boolean
+  truncated: boolean
+  skippedOversizedFiles: number
+  depthLimitReached: boolean
+}
+
 function openDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, 1)
@@ -77,15 +85,24 @@ export async function ensureDirectoryPermission(handle: LocalDirectoryHandle, re
 
 const supportedExtensions = ['.json', '.csv', '.txt']
 /** Bump when the importer gains non-text metadata that needs one safe backfill pass. */
-export const DIRECTORY_IMPORT_SIGNATURE_VERSION = 'session-avatar-v1'
+export const DIRECTORY_IMPORT_SIGNATURE_VERSION = 'source-file-v2'
 
-export async function scanExportDirectory(root: LocalDirectoryHandle, maxFiles = 20_000): Promise<WatchedFile[]> {
+export async function scanExportDirectory(root: LocalDirectoryHandle, maxFiles = 20_000, maxFileBytes = 512 * 1024 * 1024): Promise<DirectoryScanResult> {
   const found: WatchedFile[] = []
+  let truncated = false
+  let skippedOversizedFiles = 0
+  let depthLimitReached = false
 
   const visit = async (directory: LocalDirectoryHandle, prefix: string, depth: number): Promise<void> => {
-    if (depth > 24 || found.length >= maxFiles) return
+    if (depth > 24) {
+      depthLimitReached = true
+      return
+    }
     for await (const [name, entry] of directory.entries()) {
-      if (found.length >= maxFiles) break
+      if (found.length >= maxFiles) {
+        truncated = true
+        break
+      }
       const path = prefix ? `${prefix}/${name}` : name
       if (entry.kind === 'directory') {
         await visit(entry, path, depth + 1)
@@ -93,7 +110,13 @@ export async function scanExportDirectory(root: LocalDirectoryHandle, maxFiles =
       }
       if (!supportedExtensions.some((extension) => name.toLowerCase().endsWith(extension))) continue
       const file = await entry.getFile()
-      if (file.size > 50 * 1024 * 1024) continue
+      // Long direct-chat exports can exceed the old 50 MB limit. Keep the
+      // connected directory authoritative up to a practical browser-memory
+      // ceiling instead of silently omitting those conversations.
+      if (file.size > maxFileBytes) {
+        skippedOversizedFiles += 1
+        continue
+      }
       found.push({
         file,
         path,
@@ -103,5 +126,11 @@ export async function scanExportDirectory(root: LocalDirectoryHandle, maxFiles =
   }
 
   await visit(root, '', 0)
-  return found.sort((a, b) => b.file.lastModified - a.file.lastModified)
+  return {
+    files: found.sort((a, b) => b.file.lastModified - a.file.lastModified),
+    complete: !truncated && skippedOversizedFiles === 0 && !depthLimitReached,
+    truncated,
+    skippedOversizedFiles,
+    depthLimitReached,
+  }
 }

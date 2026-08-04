@@ -1,7 +1,7 @@
 import { BookOpen, CheckCircle2, Circle, Clock3, FileText, GraduationCap, Heart, MapPin, Maximize2, Minus, Pencil, Plus, RotateCcw, Sparkles, Trash2, UsersRound, X, type LucideIcon } from 'lucide-react'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent, type WheelEvent } from 'react'
 import { formatQuestTime } from '../lib/questTime'
-import { avatarImageUrl } from '../lib/mediaProxy'
+import { AvatarImage } from '../components/AvatarImage'
 import type { IntelItem, Person, Place, Profile, Quest, TaskAtlasCategory, TaskAtlasLayout, TaskAtlasPosition } from '../types'
 
 interface CategoryDefinition {
@@ -87,7 +87,7 @@ function ClusterEmblem({ category, quests, people }: { category: TaskAtlasCatego
   const linked = people.filter((person) => quests.some((quest) => quest.characterIds.includes(person.id))).slice(0, 3)
   if (category !== 'campus' && linked.length) {
     return <div className="task-atlas-portraits" aria-label={`关联人物：${linked.map((person) => person.name).join('、')}`}>
-      {linked.map((person) => <span key={person.id} title={person.name}>{person.avatarUrl && <img src={avatarImageUrl(person.avatarUrl)} alt="" loading="lazy" onError={(event) => { event.currentTarget.style.display = 'none' }} />}<i>{initialsFor(person.name)}</i></span>)}
+      {linked.map((person) => <span key={person.id} title={person.name}><AvatarImage source={person.avatarUrl} alt="" loading="lazy" /><i>{initialsFor(person.name)}</i></span>)}
     </div>
   }
   return <span className="task-atlas-emblem-icon"><Icon size={category === 'campus' ? 27 : 25} /></span>
@@ -102,14 +102,14 @@ function nodeStyle(index: number, total: number, scale: number) {
   return { '--node-angle': `${angle}deg`, '--node-radius': `${ringRadius(total) * scale}px` } as CSSProperties
 }
 
-function TaskNodeContent({ quest, peopleById, intelById }: { quest: Quest; peopleById: Map<string, Person>; intelById: Map<string, IntelItem> }) {
+function TaskNodeContent({ quest, peopleById, intelById }: { quest: Quest; peopleById: ReadonlyMap<string, Person>; intelById: ReadonlyMap<string, IntelItem> }) {
   const sourceItem = quest.sourceIds?.map((id) => intelById.get(id)).find((item) => item?.avatarUrl)
   const person = quest.characterIds.map((id) => peopleById.get(id)).find(Boolean)
   const avatarUrl = sourceItem?.avatarUrl || person?.avatarUrl
   const avatarName = sourceItem?.speaker || person?.name
   if (avatarUrl || avatarName) {
     return <span className="task-atlas-node-core task-atlas-node-core--person">
-      {avatarUrl && <img src={avatarImageUrl(avatarUrl)} alt="" loading="lazy" onError={(event) => { event.currentTarget.style.display = 'none' }} />}
+      <AvatarImage source={avatarUrl} alt="" loading="lazy" />
       <i>{initialsFor(avatarName)}</i>
       <b className={`task-atlas-status-dot task-atlas-status-dot--${quest.status}`} />
     </span>
@@ -122,7 +122,7 @@ interface TaskMapViewProps {
   quests: Quest[]
   places: Place[]
   people: Person[]
-  intel: IntelItem[]
+  intelById: ReadonlyMap<string, IntelItem>
   atlas: TaskAtlasLayout
   onToggle: (id: string) => void
   onEdit: (quest: Quest) => void
@@ -135,7 +135,7 @@ interface TaskMapViewProps {
 
 type Camera = { x: number; y: number; scale: number }
 
-export function TaskMapView({ profile, quests, places, people, intel, atlas, onToggle, onEdit, onViewSource, onDelete, onGenerateGuidance, onArrange, onMoveCategory }: TaskMapViewProps) {
+export function TaskMapView({ profile, quests, places, people, intelById, atlas, onToggle, onEdit, onViewSource, onDelete, onGenerateGuidance, onArrange, onMoveCategory }: TaskMapViewProps) {
   const [selectedId, setSelectedId] = useState('')
   const [expandedCategory, setExpandedCategory] = useState<TaskAtlasCategory | null>(null)
   const [camera, setCamera] = useState<Camera>({ x: 0, y: 0, scale: 1 })
@@ -159,7 +159,6 @@ export function TaskMapView({ profile, quests, places, people, intel, atlas, onT
   const suppressClickRef = useRef(false)
   const placesById = useMemo(() => new Map(places.map((place) => [place.id, place])), [places])
   const peopleById = useMemo(() => new Map(people.map((person) => [person.id, person])), [people])
-  const intelById = useMemo(() => new Map(intel.map((item) => [item.id, item])), [intel])
   const byCategory = useMemo(() => {
     const groups = new Map<TaskAtlasCategory, Quest[]>(categories.map((category) => [category.id, []]))
     quests.forEach((quest) => groups.get(categoryForQuest(quest, placesById.get(quest.locationId)))?.push(quest))
@@ -180,6 +179,7 @@ export function TaskMapView({ profile, quests, places, people, intel, atlas, onT
   const selectedDefinition = categoryById.get(selectedCategory) ?? categoryById.get('life')!
   const SelectedIcon = selectedDefinition.icon
   const linkedPeople = selected ? people.filter((person) => selected.characterIds.includes(person.id)) : []
+  const sourceItemsFor = (quest: Quest) => quest.sourceIds?.map((id) => intelById.get(id)).filter((item): item is IntelItem => Boolean(item)) ?? []
   const overflowCategory = expandedCategory ? categoryById.get(expandedCategory) : undefined
   const contextQuest = contextMenu ? quests.find((quest) => quest.id === contextMenu.questId) : undefined
 
@@ -192,8 +192,17 @@ export function TaskMapView({ profile, quests, places, people, intel, atlas, onT
   }, [])
 
   useEffect(() => () => {
+    if (dragFrameRef.current) window.cancelAnimationFrame(dragFrameRef.current)
     if (taskDragFrameRef.current) window.cancelAnimationFrame(taskDragFrameRef.current)
     if (categoryDragFrameRef.current) window.cancelAnimationFrame(categoryDragFrameRef.current)
+    if (wheelFrameRef.current) window.cancelAnimationFrame(wheelFrameRef.current)
+    taskDragRef.current?.node.classList.remove('is-dragging')
+    taskDragRef.current?.node.style.removeProperty('--atlas-drag-x')
+    taskDragRef.current?.node.style.removeProperty('--atlas-drag-y')
+    categoryDragRef.current?.cluster.classList.remove('is-dragging')
+    pendingCameraRef.current = null
+    pendingTaskDragRef.current = null
+    pendingCategoryDragRef.current = null
   }, [])
 
   const chooseQuest = (quest: Quest) => {
@@ -301,7 +310,7 @@ export function TaskMapView({ profile, quests, places, people, intel, atlas, onT
       pendingCameraRef.current = null
     }
     panRef.current = null
-    event.currentTarget.releasePointerCapture(event.pointerId)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
   }
 
   const startTaskDrag = (event: PointerEvent<HTMLButtonElement>, quest: Quest, category: TaskAtlasCategory) => {
@@ -366,7 +375,7 @@ export function TaskMapView({ profile, quests, places, people, intel, atlas, onT
   const endTaskDrag = (event: PointerEvent<HTMLButtonElement>) => {
     const drag = taskDragRef.current
     if (!drag || drag.pointerId !== event.pointerId) return
-    event.currentTarget.releasePointerCapture(event.pointerId)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
     if (taskDragFrameRef.current) window.cancelAnimationFrame(taskDragFrameRef.current)
     taskDragFrameRef.current = 0
     pendingTaskDragRef.current = null
@@ -391,6 +400,19 @@ export function TaskMapView({ profile, quests, places, people, intel, atlas, onT
       sourceOrder: targetCategory === drag.sourceCategory ? destinationItems : sourceItems,
       targetOrder: destinationItems,
     })
+  }
+
+  const cancelTaskDrag = (event: PointerEvent<HTMLButtonElement>) => {
+    const drag = taskDragRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
+    if (taskDragFrameRef.current) window.cancelAnimationFrame(taskDragFrameRef.current)
+    taskDragFrameRef.current = 0
+    pendingTaskDragRef.current = null
+    drag.node.style.removeProperty('--atlas-drag-x')
+    drag.node.style.removeProperty('--atlas-drag-y')
+    drag.node.classList.remove('is-dragging')
+    taskDragRef.current = null
+    if (drag.dragged) suppressNextClick()
   }
 
   const startCategoryDrag = (event: PointerEvent<HTMLButtonElement>, category: CategoryDefinition) => {
@@ -433,7 +455,7 @@ export function TaskMapView({ profile, quests, places, people, intel, atlas, onT
   const endCategoryDrag = (event: PointerEvent<HTMLButtonElement>, category: CategoryDefinition) => {
     const drag = categoryDragRef.current
     if (!drag || drag.pointerId !== event.pointerId) return
-    event.currentTarget.releasePointerCapture(event.pointerId)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
     if (categoryDragFrameRef.current) window.cancelAnimationFrame(categoryDragFrameRef.current)
     categoryDragFrameRef.current = 0
     pendingCategoryDragRef.current = null
@@ -448,6 +470,19 @@ export function TaskMapView({ profile, quests, places, people, intel, atlas, onT
       x: drag.origin.x + ((event.clientX - drag.startX) / drag.worldWidth) * 100,
       y: drag.origin.y + ((event.clientY - drag.startY) / drag.worldHeight) * 100,
     }))
+  }
+
+  const cancelCategoryDrag = (event: PointerEvent<HTMLButtonElement>) => {
+    const drag = categoryDragRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
+    if (categoryDragFrameRef.current) window.cancelAnimationFrame(categoryDragFrameRef.current)
+    categoryDragFrameRef.current = 0
+    pendingCategoryDragRef.current = null
+    drag.cluster.classList.remove('is-dragging')
+    drag.cluster.style.left = `${drag.origin.x}%`
+    drag.cluster.style.top = `${drag.origin.y}%`
+    categoryDragRef.current = null
+    if (drag.dragged) suppressNextClick()
   }
 
   const requestGuidance = async () => {
@@ -471,7 +506,7 @@ export function TaskMapView({ profile, quests, places, people, intel, atlas, onT
       <div ref={fieldRef} className={`task-atlas-field ${camera.scale < .75 ? 'is-overview' : ''}`} onWheel={handleWheel} onPointerDown={startPan} onPointerMove={movePan} onPointerUp={endPan} onPointerCancel={endPan}>
         <div ref={worldRef} className="task-atlas-world" style={{ width: `${worldBaseSize.width * camera.scale}px`, height: `${worldBaseSize.height * camera.scale}px`, transform: `translate(-50%, -50%) translate3d(${camera.x}px, ${camera.y}px, 0)` }}>
           <div className="task-atlas-user-marker" aria-label={`${profile.name}的任务图中心`}>
-            <span>{profile.avatarUrl && <img src={avatarImageUrl(profile.avatarUrl)} alt="" onError={(event) => { event.currentTarget.style.display = 'none' }} />}<i>{initialsFor(profile.name)}</i></span>
+            <span><AvatarImage source={profile.avatarUrl} alt="" /><i>{initialsFor(profile.name)}</i></span>
             <strong>{profile.name}</strong>
           </div>
           {categories.map((category) => {
@@ -480,13 +515,13 @@ export function TaskMapView({ profile, quests, places, people, intel, atlas, onT
             const position = positionFor(category, atlas)
             return <section className={`task-atlas-cluster task-atlas-cluster--${category.id}`} data-category={category.id} key={category.id} style={{ left: `${position.x}%`, top: `${position.y}%`, '--ring-radius': `${scaledRadius}px`, '--cluster-size': `${scaledRadius * 2 + 96}px` } as CSSProperties}>
               <div className="task-atlas-orbit" />
-              <button type="button" className="task-atlas-center" onPointerDown={(event) => startCategoryDrag(event, category)} onPointerMove={moveCategoryDrag} onPointerUp={(event) => endCategoryDrag(event, category)} onPointerCancel={(event) => endCategoryDrag(event, category)} onClick={(event) => { event.preventDefault(); if (suppressClickRef.current) { suppressClickRef.current = false; return } setExpandedCategory(category.id) }} title={`拖动${category.label}主题，或点击查看任务`} aria-label={`拖动${category.label}主题，或查看任务`}><ClusterEmblem category={category.id} quests={items} people={people} /><span className="task-atlas-center-label">{category.label}</span><small>{items.length}</small></button>
-              {items.map((quest, index) => <button type="button" key={quest.id} className={`task-atlas-node task-atlas-node--${quest.status} ${selected?.id === quest.id && !expandedCategory ? 'is-selected' : ''}`} style={nodeStyle(index, items.length, camera.scale)} onPointerDown={(event) => startTaskDrag(event, quest, category.id)} onPointerMove={moveTaskDrag} onPointerUp={endTaskDrag} onPointerCancel={endTaskDrag} onClick={() => chooseQuest(quest)} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedId(quest.id); setExpandedCategory(null); setContextMenu({ questId: quest.id, x: Math.min(event.clientX, window.innerWidth - 178), y: Math.min(event.clientY, window.innerHeight - 96) }) }} title={`${quest.title}（拖动排序，右键编辑）`} aria-label={`查看任务：${quest.title}`}><TaskNodeContent quest={quest} peopleById={peopleById} intelById={intelById} /><small>{quest.title}</small></button>)}
+              <button type="button" className="task-atlas-center" onPointerDown={(event) => startCategoryDrag(event, category)} onPointerMove={moveCategoryDrag} onPointerUp={(event) => endCategoryDrag(event, category)} onPointerCancel={cancelCategoryDrag} onLostPointerCapture={cancelCategoryDrag} onClick={(event) => { event.preventDefault(); if (suppressClickRef.current) { suppressClickRef.current = false; return } setExpandedCategory(category.id) }} title={`拖动${category.label}主题，或点击查看任务`} aria-label={`拖动${category.label}主题，或查看任务`}><ClusterEmblem category={category.id} quests={items} people={people} /><span className="task-atlas-center-label">{category.label}</span><small>{items.length}</small></button>
+              {items.map((quest, index) => <button type="button" key={quest.id} className={`task-atlas-node task-atlas-node--${quest.status} ${selected?.id === quest.id && !expandedCategory ? 'is-selected' : ''}`} style={nodeStyle(index, items.length, camera.scale)} onPointerDown={(event) => startTaskDrag(event, quest, category.id)} onPointerMove={moveTaskDrag} onPointerUp={endTaskDrag} onPointerCancel={cancelTaskDrag} onLostPointerCapture={cancelTaskDrag} onClick={() => chooseQuest(quest)} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedId(quest.id); setExpandedCategory(null); setContextMenu({ questId: quest.id, x: Math.min(event.clientX, window.innerWidth - 178), y: Math.min(event.clientY, window.innerHeight - 96) }) }} title={`${quest.title}（拖动排序，右键编辑）`} aria-label={`查看任务：${quest.title}`}><TaskNodeContent quest={quest} peopleById={peopleById} intelById={intelById} /><small>{quest.title}</small></button>)}
             </section>
           })}
         </div>
         {(overflowCategory || selected) && <aside className="task-atlas-detail" aria-live="polite">
-          {overflowCategory ? <div className="task-atlas-overflow-detail"><div className={`task-atlas-detail-art task-atlas-detail-art--${overflowCategory.id}`}><ClusterEmblem category={overflowCategory.id} quests={byCategory.get(overflowCategory.id) ?? []} people={people} /></div><div className="task-atlas-detail-content"><div className="task-atlas-detail-heading"><span><overflowCategory.icon size={15} />{overflowCategory.label}</span><button type="button" className="icon-button" title="关闭详情" aria-label="关闭详情" onClick={closeDetail}><X size={16} /></button></div><h2>{overflowCategory.label}任务</h2><p>{overflowCategory.note}。该主题共有 {(byCategory.get(overflowCategory.id) ?? []).length} 项任务。</p><div className="task-atlas-overflow-list">{(byCategory.get(overflowCategory.id) ?? []).map((quest) => <button type="button" key={quest.id} onClick={() => chooseQuest(quest)}><span className={`status-pip status-pip--${quest.status}`} /><div><strong>{quest.title}</strong><small>{formatQuestTime(quest, intel)}</small></div></button>)}</div></div></div> : selected ? <><div className={`task-atlas-detail-art task-atlas-detail-art--${selectedCategory}`}><ClusterEmblem category={selectedCategory} quests={[selected]} people={people} /></div><div className="task-atlas-detail-content"><div className="task-atlas-detail-heading"><span><SelectedIcon size={15} />{selectedDefinition.label} · {selected.kind === 'long-event' ? '长期事件' : '任务'}</span><div><button type="button" className="icon-button" title="关闭详情" aria-label="关闭详情" onClick={closeDetail}><X size={16} /></button><button type="button" className="icon-button" title="编辑任务" aria-label={`编辑 ${selected.title}`} onClick={() => onEdit(selected)}><Pencil size={16} /></button><button type="button" className="icon-button task-delete-button" title="删除任务" aria-label={`删除 ${selected.title}`} onClick={() => { if (window.confirm(`确定彻底删除“${selected.title}”？此操作不可撤销。`)) onDelete(selected.id) }}><Trash2 size={16} /></button></div></div><h2>{selected.title}</h2><p>{selected.description}</p><dl className="task-atlas-facts"><div><dt><Clock3 size={14} />时间</dt><dd>{formatQuestTime(selected, intel)}</dd></div><div><dt><MapPin size={14} />地点</dt><dd>{selectedPlace?.name ?? '未标注地点'}</dd></div><div><dt><FileText size={14} />来源</dt><dd>{selected.sourcePlatforms?.join(' / ') || selected.source || '手动记录'}</dd></div></dl>{!!selected.guidance?.length && <div className="task-atlas-guidance"><span>行动建议{guidanceUpdatedLabel(selected.guidanceUpdatedAt) && <small>基于人物新资料更新于 {guidanceUpdatedLabel(selected.guidanceUpdatedAt)}</small>}</span>{selected.guidance.map((item, index) => <p key={`${selected.id}-guidance-${index}`}>{item}</p>)}</div>}{!!linkedPeople.length && <div className="task-atlas-linked-people"><span>关联人物</span><div>{linkedPeople.map((person) => <span key={person.id}>{person.avatarUrl && <img src={avatarImageUrl(person.avatarUrl)} alt="" onError={(event) => { event.currentTarget.style.display = 'none' }} />}<i>{initialsFor(person.name)}</i><strong>{person.name}</strong></span>)}</div></div>}<div className="task-atlas-detail-actions"><button type="button" className={`primary-button ${selected.status === 'done' ? 'is-done' : ''}`} onClick={() => onToggle(selected.id)} disabled={selected.status === 'locked'}>{selected.status === 'done' ? <CheckCircle2 size={16} /> : <Circle size={16} />}{selected.status === 'done' ? '已完成' : '标记完成'}</button><button type="button" className="secondary-button" onClick={() => onViewSource(selected)}><FileText size={15} />查看来源</button></div></div></> : null}
+          {overflowCategory ? <div className="task-atlas-overflow-detail"><div className={`task-atlas-detail-art task-atlas-detail-art--${overflowCategory.id}`}><ClusterEmblem category={overflowCategory.id} quests={byCategory.get(overflowCategory.id) ?? []} people={people} /></div><div className="task-atlas-detail-content"><div className="task-atlas-detail-heading"><span><overflowCategory.icon size={15} />{overflowCategory.label}</span><button type="button" className="icon-button" title="关闭详情" aria-label="关闭详情" onClick={closeDetail}><X size={16} /></button></div><h2>{overflowCategory.label}任务</h2><p>{overflowCategory.note}。该主题共有 {(byCategory.get(overflowCategory.id) ?? []).length} 项任务。</p><div className="task-atlas-overflow-list">{(byCategory.get(overflowCategory.id) ?? []).map((quest) => <button type="button" key={quest.id} onClick={() => chooseQuest(quest)}><span className={`status-pip status-pip--${quest.status}`} /><div><strong>{quest.title}</strong><small>{formatQuestTime(quest, sourceItemsFor(quest))}</small></div></button>)}</div></div></div> : selected ? <><div className={`task-atlas-detail-art task-atlas-detail-art--${selectedCategory}`}><ClusterEmblem category={selectedCategory} quests={[selected]} people={people} /></div><div className="task-atlas-detail-content"><div className="task-atlas-detail-heading"><span><SelectedIcon size={15} />{selectedDefinition.label} · {selected.kind === 'long-event' ? '长期事件' : '任务'}</span><div><button type="button" className="icon-button" title="关闭详情" aria-label="关闭详情" onClick={closeDetail}><X size={16} /></button><button type="button" className="icon-button" title="编辑任务" aria-label={`编辑 ${selected.title}`} onClick={() => onEdit(selected)}><Pencil size={16} /></button><button type="button" className="icon-button task-delete-button" title="删除任务" aria-label={`删除 ${selected.title}`} onClick={() => { if (window.confirm(`确定彻底删除“${selected.title}”？此操作不可撤销。`)) onDelete(selected.id) }}><Trash2 size={16} /></button></div></div><h2>{selected.title}</h2><p>{selected.description}</p><dl className="task-atlas-facts"><div><dt><Clock3 size={14} />时间</dt><dd>{formatQuestTime(selected, sourceItemsFor(selected))}</dd></div><div><dt><MapPin size={14} />地点</dt><dd>{selectedPlace?.name ?? '未标注地点'}</dd></div><div><dt><FileText size={14} />来源</dt><dd>{selected.sourcePlatforms?.join(' / ') || selected.source || '手动记录'}</dd></div></dl>{!!selected.guidance?.length && <div className="task-atlas-guidance"><span>行动建议{guidanceUpdatedLabel(selected.guidanceUpdatedAt) && <small>基于人物新资料更新于 {guidanceUpdatedLabel(selected.guidanceUpdatedAt)}</small>}</span>{selected.guidance.map((item, index) => <p key={`${selected.id}-guidance-${index}`}>{item}</p>)}</div>}{!!linkedPeople.length && <div className="task-atlas-linked-people"><span>关联人物</span><div>{linkedPeople.map((person) => <span key={person.id}><AvatarImage source={person.avatarUrl} alt="" /><i>{initialsFor(person.name)}</i><strong>{person.name}</strong></span>)}</div></div>}<div className="task-atlas-detail-actions"><button type="button" className={`primary-button ${selected.status === 'done' ? 'is-done' : ''}`} onClick={() => onToggle(selected.id)} disabled={selected.status === 'locked'}>{selected.status === 'done' ? <CheckCircle2 size={16} /> : <Circle size={16} />}{selected.status === 'done' ? '已完成' : '标记完成'}</button><button type="button" className="secondary-button" onClick={() => onViewSource(selected)}><FileText size={15} />查看来源</button></div></div></> : null}
         </aside>}
       </div>
       {contextMenu && contextQuest && <div className="task-atlas-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onPointerDown={(event) => event.stopPropagation()}><strong>{contextQuest.title}</strong><button type="button" onClick={() => { setContextMenu(null); onEdit(contextQuest) }}><Pencil size={15} />编辑任务</button><button type="button" className="is-danger" onClick={() => { setContextMenu(null); if (window.confirm(`确定彻底删除“${contextQuest.title}”？此操作不可撤销。`)) onDelete(contextQuest.id) }}><Trash2 size={15} />删除任务</button></div>}

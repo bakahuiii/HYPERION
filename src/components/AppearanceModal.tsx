@@ -1,7 +1,7 @@
 import { ImagePlus, Palette, RotateCcw, UserRound, X } from 'lucide-react'
 import { useState, type CSSProperties, type ChangeEvent } from 'react'
 import { defaultAppearance } from '../lib/appearance'
-import { avatarImageUrl } from '../lib/mediaProxy'
+import { AvatarImage } from './AvatarImage'
 import { uploadBackgroundAsset } from '../lib/settingsClient'
 import type { AppearanceSettings, AppearanceTheme } from '../types'
 
@@ -92,12 +92,12 @@ export function AppearanceModal({ open, name, avatarUrl, appearance, onClose, on
         <div className="appearance-body">
           <div className={`appearance-preview theme--${draft.theme}`} style={previewStyle} aria-label="外观预览">
             <div className="appearance-preview-image" />
-            <div className="appearance-preview-content"><span>THEIA</span><div className="appearance-preview-identity">{nextAvatarUrl ? <img src={avatarImageUrl(nextAvatarUrl)} alt="" onError={(event) => { event.currentTarget.style.display = 'none' }} /> : <UserRound size={20} />}<strong>{nextName.trim() || '访客'}</strong></div></div>
+            <div className="appearance-preview-content"><span>THEIA</span><div className="appearance-preview-identity">{nextAvatarUrl ? <AvatarImage source={nextAvatarUrl} alt="" /> : <UserRound size={20} />}<strong>{nextName.trim() || '访客'}</strong></div></div>
           </div>
 
           <div className="appearance-profile-grid">
             <label className="appearance-name"><span>显示名称</span><input value={nextName} onChange={(event) => { const value = event.target.value; setNextName(value); emitPreview({ name: value }) }} maxLength={32} placeholder="访客" /></label>
-            <div className="appearance-avatar-control"><span>用户头像</span><div><div className="appearance-avatar">{nextAvatarUrl && <img src={avatarImageUrl(nextAvatarUrl)} alt="" onError={(event) => { event.currentTarget.style.display = 'none' }} />}<i>{initialsFor(nextName)}</i></div><label className="background-upload"><ImagePlus size={14} /><span>上传</span><input type="file" accept="image/*" onChange={(event) => void selectImage(event, 'avatar')} /></label>{nextAvatarUrl && <button type="button" className="background-clear" onClick={() => { setNextAvatarUrl(''); emitPreview({ avatarUrl: '' }) }}>移除</button>}</div></div>
+            <div className="appearance-avatar-control"><span>用户头像</span><div><div className="appearance-avatar"><AvatarImage source={nextAvatarUrl} alt="" /><i>{initialsFor(nextName)}</i></div><label className="background-upload"><ImagePlus size={14} /><span>上传</span><input type="file" accept="image/*" onChange={(event) => void selectImage(event, 'avatar')} /></label>{nextAvatarUrl && <button type="button" className="background-clear" onClick={() => { setNextAvatarUrl(''); emitPreview({ avatarUrl: '' }) }}>移除</button>}</div></div>
           </div>
 
           <div className="appearance-section">

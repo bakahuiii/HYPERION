@@ -158,6 +158,7 @@ node release-tools/update-release-index.mjs H:\work\THEIA
 - `v0.1.0`：首个源码发布、多个历史源码快照和 Windows 便携版。
 - `v0.1.1`：当前 Windows x64 便携版。
 - `v0.2.0`：多 API 通道池、会话级并发调度与私聊联合提炼的源码版本。
+- `v0.2.1`：支持暂停/恢复的任务与人物提炼，清理重复候选临时归档。
 - 当前 Git 仓库迁移到 `H:\work\THEIA\source`，保留现有提交、未提交改动和本地运行数据。
 
 迁移完成后，`H:\work\THEIA\README.md` 和 `releases\INDEX.md` 是本机查找版本的两个入口。

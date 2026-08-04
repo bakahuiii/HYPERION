@@ -1,9 +1,11 @@
 import http from 'node:http'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
-import { appendFile, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises'
-import { createHash } from 'node:crypto'
+import { appendFile, mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
 import { dirname, resolve } from 'node:path'
+import { gzip, gunzip } from 'node:zlib'
+import { promisify } from 'node:util'
 import {
   createProviderChannel,
   deleteProviderChannel,
@@ -19,6 +21,8 @@ import {
 } from './providerConfig.mjs'
 import { backgroundAssetPath, loadSettings, saveAppSettings, saveBackgroundAsset } from './settings.mjs'
 import { runtimePaths } from './runtimePaths.mjs'
+import { rotateFileCopies } from './fileRotation.mjs'
+import { withFileLock, writeFileAtomically } from './atomicFile.mjs'
 
 const port = Number(process.env.AI_PORT || 8787)
 const maxBodyBytes = 256 * 1024 * 1024
@@ -33,6 +37,8 @@ const fallbackQuotes = [
 const {
   sharedStatePath,
   sharedIntelPath,
+  sharedIntelMetaPath,
+  sharedIntelLegacyPath,
   aiDebugLogPath,
   taskLogDirectoryPath,
   avatarCacheDirectoryPath,
@@ -42,8 +48,35 @@ const {
   legacyProviderPath,
   desktopPidPath,
 } = runtimePaths
+const gzipAsync = promisify(gzip)
+const gunzipAsync = promisify(gunzip)
 let sharedStateWriteQueue = Promise.resolve()
+let sharedIntelWriteQueue = Promise.resolve()
+let aiDebugWriteQueue = Promise.resolve()
+const activeTaskLogs = new Set()
+const aiDebugMaxBytes = 8 * 1024 * 1024
+const aiDebugRotationCount = 3
 const providerRuntimeById = new Map()
+const providerOriginRuntimeByKey = new Map()
+// Multiple saved channels can point at the same relay. Keep a high safety
+// ceiling for an origin, but do not reduce the normal configured pool: five
+// channels with maxConcurrency=8 still expose all 40 slots. The limit only
+// matters for unusually large pools or after adaptive failure reduction.
+const sharedOriginConcurrencyDefault = Math.min(
+  64,
+  Math.max(1, Math.round(Number(process.env.AI_SHARED_ORIGIN_MAX_CONCURRENCY) || 64)),
+)
+// A relay can return a long Retry-After value (Cloudflare commonly returns
+// 60 seconds for a 502), but a local extraction run must remain responsive.
+// Keep the local backoff short and bounded; the original upstream value stays
+// in the per-attempt diagnostic metadata for troubleshooting.
+const providerCooldownBaseMs = 250
+const providerCooldownMaxMs = 2_000
+// `auto` mode learns a relay's working protocol for the lifetime of the
+// local proxy. Some OpenAI-compatible relays expose `/responses` but return
+// malformed Responses payloads for tool-capable models; retrying that same
+// endpoint for every conversation only burns time and upstream quota.
+const providerApiModeById = new Map()
 const providerAcquisitionQueue = []
 let providerDispatchScheduled = false
 let providerDispatchInProgress = false
@@ -51,6 +84,14 @@ let providerDispatchRequested = false
 let providerDispatchTimer = null
 let providerDispatchTimerAt = 0
 let providerSelectionSequence = 0
+// The renderer cannot keep enough long HTTP requests open to fill a large
+// provider pool. Sessions retain a local backlog so a finished provider slot
+// can immediately receive another extraction job without waiting for a whole
+// browser batch to finish.
+const aiSessions = new Map()
+const aiSessionTtlMs = 30 * 60 * 1000
+const aiSessionMaxEnqueue = 40
+const aiSessionResultPageSize = 120
 
 async function readJsonFile(path) {
   try {
@@ -62,19 +103,38 @@ async function readJsonFile(path) {
 }
 
 async function writeJsonAtomically(path, payload) {
-  const temporary = `${path}.tmp`
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
-  await writeFile(temporary, JSON.stringify(payload), 'utf8')
-  await rename(temporary, path)
+  await writeFileAtomically(path, JSON.stringify(payload), { encoding: 'utf8', mode: 0o600 })
 }
 
-async function storageEntry(id, path, description) {
+async function directoryFileSize(path, entries) {
+  let total = 0
+  const files = entries.filter((entry) => entry.isFile())
+  for (let offset = 0; offset < files.length; offset += 128) {
+    const sizes = await Promise.all(files.slice(offset, offset + 128).map(async (entry) => {
+      try { return (await stat(resolve(path, entry.name))).size } catch { return 0 }
+    }))
+    total += sizes.reduce((sum, size) => sum + size, 0)
+  }
+  return total
+}
+
+async function storageEntry(id, path, description, includeDirectorySize = false) {
   try {
     const details = await stat(path)
     if (details.isDirectory()) {
-      let entryCount
-      try { entryCount = (await readdir(path)).length } catch { /* metadata is optional */ }
-      return { id, path, description, exists: true, kind: 'directory', ...(Number.isFinite(entryCount) ? { entryCount } : {}) }
+      let entries
+      try { entries = await readdir(path, { withFileTypes: true }) } catch { /* metadata is optional */ }
+      const entryCount = entries?.length
+      const sizeBytes = includeDirectorySize && entries ? await directoryFileSize(path, entries) : undefined
+      return {
+        id,
+        path,
+        description,
+        exists: true,
+        kind: 'directory',
+        ...(Number.isFinite(entryCount) ? { entryCount } : {}),
+        ...(Number.isFinite(sizeBytes) ? { sizeBytes } : {}),
+      }
     }
     return { id, path, description, exists: true, kind: 'file', sizeBytes: details.size }
   } catch (error) {
@@ -88,15 +148,24 @@ async function storageOverview() {
     storageEntry('shared-state', sharedStatePath, '任务、人物、地点、候选任务和界面状态的共享快照。'),
     storageEntry('shared-intel', sharedIntelPath, '原始聊天归档。仅在本机保留，模型提炼时按你选择的范围读取。'),
     storageEntry('settings', settingsPath, '通用 INI：名称、外观、模型通道和提炼偏好。包含你保存的明文 API Key。'),
-    storageEntry('backgrounds', backgroundDirectoryPath, '已上传的自定义背景图片。'),
+    storageEntry('backgrounds', backgroundDirectoryPath, '已上传的自定义背景图片。', true),
     storageEntry('debug-log', aiDebugLogPath, '模型请求调试日志，不含聊天正文、附件或密钥。'),
-    storageEntry('task-logs', taskLogDirectoryPath, '按任务与时间戳分文件保存的完整本地模型输入、输出和失败信息，不含 API Key。'),
-    storageEntry('avatar-cache', avatarCacheDirectoryPath, '从导出记录的微信/QQ头像地址下载的本地缓存。'),
+    storageEntry('task-logs', taskLogDirectoryPath, '按任务与时间戳分文件保存的完整本地模型输入、输出和失败信息，不含 API Key。', true),
+    storageEntry('avatar-cache', avatarCacheDirectoryPath, '从导出记录的微信/QQ头像地址下载的本地缓存。', true),
     storageEntry('electron-user-data', electronUserDataPath, '桌面客户端的 Chromium 会话、缓存和窗口运行数据；退出客户端后仍会保留。'),
     storageEntry('desktop-pid', desktopPidPath, '桌面客户端运行标记；关闭客户端后会自动清除。'),
     storageEntry('legacy-provider', legacyProviderPath, '旧版模型通道配置；若仍存在，仅用于一次性迁移。'),
   ])
   return { workspace: runtimePaths.workspace, entries }
+}
+
+async function rotateAiDebugLog(nextBytes) {
+  let currentSize = 0
+  try { currentSize = (await stat(aiDebugLogPath)).size } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+  }
+  if (currentSize + nextBytes <= aiDebugMaxBytes) return
+  await rotateFileCopies(aiDebugLogPath, aiDebugRotationCount)
 }
 
 function logAiDebug(event, details = {}) {
@@ -109,9 +178,12 @@ function logAiDebug(event, details = {}) {
   // and request headers. It is for diagnosing the local pipeline only.
   const line = `${JSON.stringify(entry)}\n`
   console.info(`[THEIA AI] ${line.trim()}`)
-  void mkdir(dirname(aiDebugLogPath), { recursive: true, mode: 0o700 })
-    .then(() => appendFile(aiDebugLogPath, line, 'utf8'))
-    .catch(() => undefined)
+  const write = aiDebugWriteQueue.then(async () => {
+    await mkdir(dirname(aiDebugLogPath), { recursive: true, mode: 0o700 })
+    await rotateAiDebugLog(Buffer.byteLength(line, 'utf8'))
+    await appendFile(aiDebugLogPath, line, 'utf8')
+  })
+  aiDebugWriteQueue = write.catch(() => undefined)
 }
 
 function taskLogTimestamp(date = new Date()) {
@@ -143,6 +215,7 @@ async function startTaskLog(kind, payload) {
     const path = resolve(taskLogDirectoryPath, taskLogIdentity(kind, payload))
     const startedAt = new Date().toISOString()
     await writeFile(path, `${JSON.stringify({ schema: 'theia-task-log/v1', startedAt, kind, request: taskLogPayload(payload) })}\n`, { encoding: 'utf8', mode: 0o600 })
+    activeTaskLogs.add(path)
     return { path, startedAt }
   } catch (error) {
     console.warn(`[THEIA AI] Unable to start task log: ${error instanceof Error ? error.message : String(error)}`)
@@ -150,21 +223,61 @@ async function startTaskLog(kind, payload) {
   }
 }
 
+async function compressTaskLog(path) {
+  if (!path || !path.endsWith('.jsonl') || activeTaskLogs.has(path)) return
+  const compressedPath = `${path}.gz`
+  try {
+    const source = await readFile(path)
+    const compressed = await gzipAsync(source, { level: 6 })
+    await writeFileAtomically(compressedPath, compressed, { mode: 0o600 })
+    await unlink(path)
+  } catch (error) {
+    if (error?.code !== 'ENOENT') console.warn(`[THEIA AI] Unable to compact task log: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+async function compactExistingTaskLogs() {
+  try {
+    const entries = await readdir(taskLogDirectoryPath, { withFileTypes: true })
+    const cutoff = Date.now() - 10 * 60 * 1000
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
+      const path = resolve(taskLogDirectoryPath, entry.name)
+      if (activeTaskLogs.has(path)) continue
+      try {
+        const details = await stat(path)
+        if (details.mtimeMs > cutoff) continue
+      } catch { continue }
+      await compressTaskLog(path)
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') console.warn(`[THEIA AI] Unable to compact task logs: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 async function finishTaskLog(log, event, details) {
   if (!log) return
   try {
     await appendFile(log.path, `${JSON.stringify({ at: new Date().toISOString(), event, ...taskLogPayload(details) })}\n`, { encoding: 'utf8', mode: 0o600 })
+    activeTaskLogs.delete(log.path)
+    // Finish the compaction before the request resolves. This keeps the
+    // storage view and shutdown/cleanup deterministic while retaining the
+    // compressed-at-rest format for completed logs.
+    await compressTaskLog(log.path)
   } catch (error) {
+    activeTaskLogs.delete(log.path)
     console.warn(`[THEIA AI] Unable to finish task log: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
 function segmentDebugFields(conversation) {
+  const totalRecordCount = Number(conversation?.totalRecords)
   const segmentIndex = Number(conversation?.segmentIndex)
   const segmentCount = Number(conversation?.segmentCount)
   const coreRecordCount = Number(conversation?.coreRecordCount)
   const overlapRecordCount = Number(conversation?.overlapRecordCount)
   return {
+    totalRecordCount: Number.isInteger(totalRecordCount) ? totalRecordCount : null,
     segmentIndex: Number.isInteger(segmentIndex) ? segmentIndex : null,
     segmentCount: Number.isInteger(segmentCount) ? segmentCount : null,
     coreRecordCount: Number.isInteger(coreRecordCount) ? coreRecordCount : null,
@@ -176,6 +289,8 @@ function segmentDebugFields(conversation) {
 function providerDebugFields(value) {
   const metadata = value?.metadata?.provider ?? value?.providerMetadata
   if (!metadata) return {}
+  const attempts = Array.isArray(metadata.attempts) ? metadata.attempts : []
+  const lastAttempt = attempts.at(-1)
   return {
     providerChannelId: metadata.channelId ?? null,
     providerChannelName: metadata.channelName ?? null,
@@ -184,6 +299,8 @@ function providerDebugFields(value) {
     providerFallbackCount: Number(metadata.fallbackCount) || 0,
     providerRetryAfter: Number(metadata.retryAfter) || null,
     providerUsage: metadata.usage ?? null,
+    providerRequestBytes: Number(lastAttempt?.requestBytes) || null,
+    providerResponseBytes: Number(lastAttempt?.responseBytes) || null,
   }
 }
 
@@ -197,21 +314,190 @@ async function loadSharedState() {
   return { ...payload, data }
 }
 
+async function loadSharedIntel() {
+  let compressed
+  try {
+    compressed = await readFile(sharedIntelPath)
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+  }
+  let payload
+  if (compressed) {
+    try {
+      payload = JSON.parse((await gunzipAsync(compressed)).toString('utf8'))
+    } catch (error) {
+      throw new Error(`本机原始聊天归档已损坏，无法解压或解析：${error instanceof Error ? error.message : String(error)}`)
+    }
+  } else {
+    payload = await readJsonFile(sharedIntelLegacyPath)
+  }
+  // Releases before the cross-client archive sync stored the raw array
+  // directly. Keep that archive readable while new writes use gzip storage.
+  if (Array.isArray(payload)) return { updatedAt: null, sourceFingerprint: null, recordCount: payload.length, items: payload }
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.items)) return { updatedAt: null, sourceFingerprint: null, recordCount: 0, items: [] }
+  return {
+    updatedAt: typeof payload.updatedAt === 'string' ? payload.updatedAt : null,
+    sourceFingerprint: typeof payload.sourceFingerprint === 'string' ? payload.sourceFingerprint : null,
+    recordCount: payload.items.length,
+    items: payload.items,
+  }
+}
+
+async function loadSharedIntelMeta() {
+  const metadata = await readJsonFile(sharedIntelMetaPath)
+  if (metadata && typeof metadata === 'object' && Number.isFinite(Number(metadata.recordCount))) {
+    return {
+      updatedAt: typeof metadata.updatedAt === 'string' ? metadata.updatedAt : null,
+      sourceFingerprint: typeof metadata.sourceFingerprint === 'string' ? metadata.sourceFingerprint : null,
+      recordCount: Math.max(0, Math.floor(Number(metadata.recordCount))),
+    }
+  }
+
+  let details
+  try {
+    details = await stat(sharedIntelPath)
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+    try { details = await stat(sharedIntelLegacyPath) } catch (legacyError) {
+      if (legacyError?.code !== 'ENOENT') throw legacyError
+      return { updatedAt: null, sourceFingerprint: null, recordCount: 0 }
+    }
+  }
+  // Old releases have no sidecar. Reuse the small dashboard summary instead
+  // of inflating and parsing a 100+ MB gzip archive just to render Options.
+  const state = await loadSharedState().catch(() => null)
+  return {
+    updatedAt: details.mtime.toISOString(),
+    sourceFingerprint: typeof state?.data?.archive?.sourceFingerprint === 'string' ? state.data.archive.sourceFingerprint : null,
+    recordCount: Math.max(1, Math.floor(Number(state?.data?.archive?.messageCount) || 0)),
+  }
+}
+
+async function writeSharedIntelUnlocked(payload) {
+  const items = Array.isArray(payload?.items) ? payload.items : Array.isArray(payload) ? payload : null
+  if (!items) throw new Error('原始聊天归档格式无效')
+  const compactItems = items.map((item) => {
+    if (!item || typeof item !== 'object' || typeof item.content !== 'string' || !item.content.trim()) return item
+    if (!Object.hasOwn(item, 'title') && !Object.hasOwn(item, 'summary')) return item
+    const stored = { ...item }
+    delete stored.title
+    delete stored.summary
+    return stored
+  })
+  const previousMetadata = await readJsonFile(sharedIntelMetaPath)
+  // Releases before the sidecar metadata file was introduced still have a
+  // valid archive on disk. Treat its mtime as the version in that case so a
+  // renderer that read `/api/sync/intel/meta` can successfully perform an
+  // optimistic write instead of receiving a permanent 409 conflict.
+  let archiveUpdatedAt = null
+  if (typeof previousMetadata?.updatedAt !== 'string') {
+    let details
+    try {
+      details = await stat(sharedIntelPath)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+      try {
+        details = await stat(sharedIntelLegacyPath)
+      } catch (legacyError) {
+        if (legacyError?.code !== 'ENOENT') throw legacyError
+      }
+    }
+    if (details) archiveUpdatedAt = details.mtime.toISOString()
+  }
+  const currentUpdatedAt = typeof previousMetadata?.updatedAt === 'string'
+    ? previousMetadata.updatedAt
+    : archiveUpdatedAt
+  if (Object.prototype.hasOwnProperty.call(payload ?? {}, 'expectedUpdatedAt')) {
+    const expectedUpdatedAt = typeof payload.expectedUpdatedAt === 'string' ? payload.expectedUpdatedAt : null
+    if (expectedUpdatedAt !== currentUpdatedAt) {
+      const conflict = new Error('本机原始聊天归档已被另一个窗口更新，请合并后重试')
+      conflict.statusCode = 409
+      conflict.currentUpdatedAt = currentUpdatedAt
+      throw conflict
+    }
+  }
+  const previousTime = currentUpdatedAt ? Date.parse(currentUpdatedAt) : Number.NaN
+  const snapshot = {
+    // Metadata polling uses a strict greater-than comparison. Keep timestamps
+    // monotonic even for two tiny writes completed in the same millisecond.
+    updatedAt: new Date(Math.max(Date.now(), Number.isFinite(previousTime) ? previousTime + 1 : 0)).toISOString(),
+    sourceFingerprint: typeof payload?.sourceFingerprint === 'string' ? payload.sourceFingerprint : null,
+    items: compactItems,
+  }
+  const compressed = await gzipAsync(Buffer.from(JSON.stringify(snapshot), 'utf8'), { level: 6 })
+  await writeFileAtomically(sharedIntelPath, compressed, { mode: 0o600 })
+  await writeJsonAtomically(sharedIntelMetaPath, {
+    updatedAt: snapshot.updatedAt,
+    sourceFingerprint: snapshot.sourceFingerprint,
+    recordCount: compactItems.length,
+  })
+  // Remove the legacy JSON only after the compressed archive is in place.
+  await unlink(sharedIntelLegacyPath).catch((error) => {
+    if (error?.code !== 'ENOENT') throw error
+  })
+  return { updatedAt: snapshot.updatedAt, sourceFingerprint: snapshot.sourceFingerprint, recordCount: compactItems.length }
+}
+
+async function writeSharedIntel(payload) {
+  return withFileLock(`${sharedIntelPath}.lock`, () => writeSharedIntelUnlocked(payload))
+}
+
+function migrateLegacySharedIntel() {
+  // Startup migration shares the same serialized writer as renderer imports.
+  // Otherwise a first import racing startup could be overwritten by the old
+  // JSON snapshot that migration read a moment earlier.
+  const migration = sharedIntelWriteQueue.then(async () => {
+    try {
+      await stat(sharedIntelPath)
+      return
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+    const legacy = await readJsonFile(sharedIntelLegacyPath)
+    const items = Array.isArray(legacy) ? legacy : legacy?.items
+    if (!Array.isArray(items) || !items.length) return
+    await writeSharedIntel({ items })
+    console.log(`[THEIA] migrated ${items.length} chat records to gzip archive storage`)
+  })
+  sharedIntelWriteQueue = migration.catch(() => undefined)
+  return migration
+}
+
+function saveSharedIntel(payload) {
+  // The archive can be large. Serializing writes prevents two browser/desktop
+  // clients from competing for the same temporary file during startup.
+  const write = sharedIntelWriteQueue.then(() => writeSharedIntel(payload))
+  sharedIntelWriteQueue = write.catch(() => undefined)
+  return write
+}
+
 async function writeSharedState(payload) {
   if (!payload?.data || typeof payload.data !== 'object') throw new Error('同步数据格式无效')
   // Preserve an inline archive written by an older renderer before stripping
   // it from future snapshots. New renderers never send raw records here.
   const legacy = await readJsonFile(sharedStatePath)
+  if (Object.prototype.hasOwnProperty.call(payload, 'expectedUpdatedAt')) {
+    const expectedUpdatedAt = typeof payload.expectedUpdatedAt === 'string' ? payload.expectedUpdatedAt : null
+    const currentUpdatedAt = typeof legacy?.updatedAt === 'string' ? legacy.updatedAt : null
+    if (expectedUpdatedAt !== currentUpdatedAt) {
+      const conflict = new Error('共享数据已被另一个窗口更新，请合并后重试')
+      conflict.statusCode = 409
+      conflict.currentUpdatedAt = currentUpdatedAt
+      throw conflict
+    }
+  }
   const preservedIntel = Array.isArray(payload.intel) ? payload.intel
     : Array.isArray(payload.data.intel) ? payload.data.intel
       : Array.isArray(legacy?.intel) ? legacy.intel
         : Array.isArray(legacy?.data?.intel) ? legacy.data.intel
           : undefined
-  if (preservedIntel) await writeJsonAtomically(sharedIntelPath, preservedIntel)
+  if (preservedIntel) await writeSharedIntel({ items: preservedIntel })
   // Do not rewrite the companion archive after migration. It may contain
   // hundreds of thousands of messages and is outside shared UI state.
   const { intel: _ignoredIntel, ...data } = payload.data
-  const snapshot = { updatedAt: new Date().toISOString(), data }
+  const previousTime = typeof legacy?.updatedAt === 'string' ? Date.parse(legacy.updatedAt) : Number.NaN
+  const updatedAt = new Date(Math.max(Date.now(), Number.isFinite(previousTime) ? previousTime + 1 : 0)).toISOString()
+  const snapshot = { updatedAt, data }
   await writeJsonAtomically(sharedStatePath, snapshot)
   return snapshot
 }
@@ -244,7 +530,11 @@ const candidateSchema = {
   required: ['title', 'description', 'startAt', 'dueAt', 'sourceIds', 'people', 'place', 'locationPrecision', 'locationRadiusMeters', 'tags', 'guidance', 'actionOwner'],
 }
 
-const personEvidenceClaimSchema = {
+// The segment pass only needs claim-level evidence. Portrait prose, advice,
+// and coverage metadata are generated later by the person merge request. Keep
+// this schema deliberately small so every direct-chat segment does not pay
+// the fixed cost of a full profile response format.
+const compactPersonClaimSchema = {
   type: 'object',
   additionalProperties: false,
   properties: {
@@ -255,32 +545,54 @@ const personEvidenceClaimSchema = {
   required: ['text', 'sourceIds', 'quote'],
 }
 
-const personSchema = {
+const compactPersonSchema = {
   type: 'object',
   additionalProperties: false,
   properties: {
     name: { type: 'string' },
-    facts: { type: 'array', items: personEvidenceClaimSchema },
-    preferences: { type: 'array', items: personEvidenceClaimSchema },
-    advice: { type: 'array', items: { type: 'string' } },
-    sourceIds: { type: 'array', items: { type: 'string' } },
-    platforms: { type: 'array', items: { type: 'string' } },
-    firstObservedAt: { type: ['string', 'null'] },
-    portrait: { type: ['string', 'null'] },
+    facts: { type: 'array', items: compactPersonClaimSchema },
+    preferences: { type: 'array', items: compactPersonClaimSchema },
   },
-  required: ['name', 'facts', 'preferences', 'advice', 'sourceIds', 'platforms', 'firstObservedAt', 'portrait'],
+  required: ['name', 'facts', 'preferences'],
 }
 
 const personMergeSchema = {
   type: 'object',
   additionalProperties: false,
   properties: {
-    facts: { type: 'array', items: { type: 'string' } },
-    preferences: { type: 'array', items: { type: 'string' } },
-    advice: { type: 'array', items: { type: 'string' } },
-    portrait: { type: ['string', 'null'] },
+    // The merge model selects verified claim IDs. It never gets to invent a
+    // replacement fact string that the renderer would have to trust.
+    factClaimIds: { type: 'array', items: { type: 'string' } },
+    preferenceClaimIds: { type: 'array', items: { type: 'string' } },
+    portraitBlocks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          text: { type: 'string' },
+          claimIds: { type: 'array', items: { type: 'string' } },
+          reason: { type: 'string', enum: ['background', 'preference', 'habit', 'interaction', 'change', 'other'] },
+        },
+        required: ['text', 'claimIds', 'reason'],
+      },
+    },
+    advice: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          text: { type: 'string' },
+          claimIds: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['text', 'claimIds'],
+      },
+    },
+    coverageNote: { type: ['string', 'null'] },
+    profileNotesUsed: { type: 'boolean' },
   },
-  required: ['facts', 'preferences', 'advice', 'portrait'],
+  required: ['factClaimIds', 'preferenceClaimIds', 'portraitBlocks', 'advice', 'coverageNote', 'profileNotesUsed'],
 }
 
 const taskGuidanceSchema = {
@@ -306,10 +618,9 @@ const responseFormat = {
   },
 }
 
-// Direct conversations can produce task candidates and evidence-backed
-// contact notes in one model request. This keeps the complete message timeline
-// in a single input instead of uploading the same segment once for tasks and
-// once again for people. Group conversations continue to use responseFormat.
+// Direct conversations can produce task candidates and claim-level person
+// evidence in one model request. The expensive portrait/advice merge happens
+// later, after all segments have been verified and combined.
 const combinedResponseFormat = {
   type: 'json_schema',
   name: 'task_and_people_candidates',
@@ -319,7 +630,7 @@ const combinedResponseFormat = {
     additionalProperties: false,
     properties: {
       candidates: { type: 'array', items: candidateSchema },
-      people: { type: 'array', items: personSchema },
+      people: { type: 'array', items: compactPersonSchema },
     },
     required: ['candidates', 'people'],
   },
@@ -382,7 +693,7 @@ const peopleResponseFormat = {
   schema: {
     type: 'object',
     additionalProperties: false,
-    properties: { people: { type: 'array', items: personSchema } },
+    properties: { people: { type: 'array', items: compactPersonSchema } },
     required: ['people'],
   },
 }
@@ -406,9 +717,18 @@ function sendRequestError(response, error, fallback) {
   const status = Number(error?.status)
   const retryAfter = Number(error?.retryAfter)
   const payload = { error: error instanceof Error ? error.message : fallback }
-  if (Number.isFinite(retryAfter) && retryAfter > 0) payload.retry_after = Math.min(300, Math.ceil(retryAfter))
+  if (Number.isFinite(retryAfter) && retryAfter > 0) payload.retry_after = Math.min(providerCooldownMaxMs / 1_000, Math.ceil(retryAfter))
   if (error?.providerMetadata) payload.metadata = { provider: error.providerMetadata }
   sendJson(response, status >= 400 && status <= 599 ? status : 400, payload)
+}
+
+function requestAbortSignal(request, response) {
+  const controller = new AbortController()
+  request.once('aborted', () => controller.abort())
+  response.once('close', () => {
+    if (!response.writableEnded) controller.abort()
+  })
+  return controller.signal
 }
 
 async function randomQuote() {
@@ -432,20 +752,194 @@ function allowedOrigin(origin) {
   } catch { return false }
 }
 
+function cancelledRequestError(message = 'AI extraction was cancelled') {
+  const error = new Error(message)
+  error.name = 'AbortError'
+  Object.assign(error, { status: 499, code: 'PROVIDER_CANCELLED' })
+  return error
+}
+
+function dispatchLocalAiRequest(path, payload, signal) {
+  return new Promise((resolve, reject) => {
+    const address = server.address()
+    const listeningPort = address && typeof address !== 'string' ? address.port : null
+    if (!listeningPort) {
+      reject(new Error('本机模型代理尚未就绪'))
+      return
+    }
+    const body = JSON.stringify(payload)
+    const request = http.request({
+      hostname: '127.0.0.1',
+      port: listeningPort,
+      path,
+      method: 'POST',
+      signal,
+      // Do not reuse one browser-shaped connection here. Each model job needs
+      // its own local socket so the provider scheduler can occupy every slot.
+      agent: false,
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      },
+    }, (response) => {
+      const chunks = []
+      response.on('data', (chunk) => chunks.push(chunk))
+      response.on('error', reject)
+      response.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8')
+        let result = {}
+        try { result = JSON.parse(raw) } catch { result = { error: raw.slice(0, 2_000) } }
+        const status = Number(response.statusCode) || 500
+        if (status >= 200 && status < 300) {
+          resolve(result)
+          return
+        }
+        const error = new Error(cleanString(result?.error, 2_000) || `本机模型子请求失败 (${status})`)
+        Object.assign(error, { status, retryAfter: Number(result?.retry_after) })
+        reject(error)
+      })
+    })
+    request.setTimeout(providerRequestTimeoutMs + 30_000, () => request.destroy(new Error('本机模型子请求超时')))
+    request.on('error', reject)
+    request.end(body)
+  })
+}
+
+function cleanupAiSessions(now = Date.now()) {
+  for (const [id, session] of aiSessions) {
+    if (now - session.lastTouchedAt <= aiSessionTtlMs) continue
+    session.cancelled = true
+    session.queue.length = 0
+    session.inFlight.forEach((job) => job.controller?.abort())
+    aiSessions.delete(id)
+  }
+}
+
+function createAiSession() {
+  cleanupAiSessions()
+  const session = {
+    id: randomUUID(),
+    createdAt: Date.now(),
+    lastTouchedAt: Date.now(),
+    queue: [],
+    inFlight: new Map(),
+    results: [],
+    jobIds: new Set(),
+    cancelled: false,
+    dispatching: false,
+  }
+  aiSessions.set(session.id, session)
+  return session
+}
+
+function sessionWorkflowPath(workflow) {
+  if (workflow === 'people') return '/api/ai/people'
+  if (workflow === 'tasks') return '/api/ai/analyze'
+  return ''
+}
+
+function sessionResult(id, ok, result, error) {
+  if (ok) return { id, ok: true, result }
+  return {
+    id,
+    ok: false,
+    status: Number(error?.status) || 500,
+    retryAfter: Number(error?.retryAfter) || undefined,
+    error: cleanString(error instanceof Error ? error.message : 'Local model subrequest failed', 2_000),
+  }
+}
+
+function scheduleAiSessionDispatch(session) {
+  if (session.cancelled || session.dispatching || !session.queue.length) return
+  session.dispatching = true
+  queueMicrotask(() => {
+    session.dispatching = false
+    while (!session.cancelled && session.queue.length) {
+      const job = session.queue.shift()
+      job.controller = new AbortController()
+      session.inFlight.set(job.id, job)
+      void dispatchLocalAiRequest(job.path, job.payload, job.controller.signal)
+        .then((result) => sessionResult(job.id, true, result))
+        .catch((error) => sessionResult(job.id, false, undefined, error))
+        .then((result) => {
+          session.inFlight.delete(job.id)
+          if (!session.cancelled) {
+            session.results.push(result)
+            session.lastTouchedAt = Date.now()
+          }
+          scheduleAiSessionDispatch(session)
+        })
+    }
+  })
+}
+
+function enqueueAiSessionJobs(session, entries) {
+  if (!Array.isArray(entries) || !entries.length) throw new Error('Batch model request cannot be empty')
+  if (entries.length > aiSessionMaxEnqueue) throw new Error(`A session enqueue accepts at most ${aiSessionMaxEnqueue} jobs`)
+  const jobs = entries.map((entry, index) => {
+    const id = Number(entry?.id)
+    const path = sessionWorkflowPath(entry?.workflow)
+    if (!Number.isSafeInteger(id) || !path || !entry?.payload || typeof entry.payload !== 'object') {
+      throw new Error(`Invalid session job at index ${index + 1}`)
+    }
+    if (session.jobIds.has(id)) throw new Error(`Duplicate session job id: ${id}`)
+    return { id, path, payload: entry.payload }
+  })
+  jobs.forEach((job) => {
+    session.jobIds.add(job.id)
+    session.queue.push(job)
+  })
+  session.lastTouchedAt = Date.now()
+  scheduleAiSessionDispatch(session)
+  return jobs.map((job) => job.id)
+}
+
+function readAiSessionResults(session, limit = aiSessionResultPageSize, acknowledgedIds = [], retainUntilAcknowledged = false) {
+  session.lastTouchedAt = Date.now()
+  const pageSize = Math.max(1, Math.min(aiSessionResultPageSize, Math.round(Number(limit) || aiSessionResultPageSize)))
+  if (!retainUntilAcknowledged) {
+    return {
+      // Releases before ack-v1 expect each read to consume its page. Keep
+      // that behavior for a renderer and local proxy updated separately.
+      results: session.results.splice(0, pageSize),
+      queued: session.queue.length,
+      inFlight: session.inFlight.size,
+      pending: session.queue.length + session.inFlight.size,
+    }
+  }
+  const acknowledged = new Set(acknowledgedIds.filter((id) => Number.isSafeInteger(id)))
+  if (acknowledged.size) session.results = session.results.filter((result) => !acknowledged.has(result.id))
+  return {
+    // Results remain server-resident until the next successful client poll
+    // acknowledges them. A dropped HTTP response can therefore be replayed
+    // without dispatching the same model job again.
+    results: session.results.slice(0, pageSize),
+    queued: session.queue.length,
+    inFlight: session.inFlight.size,
+    pending: session.queue.length + session.inFlight.size,
+  }
+}
+
 function readBody(request) {
   return new Promise((resolve, reject) => {
     let size = 0
+    let failed = false
     const chunks = []
     request.on('data', (chunk) => {
+      if (failed) return
       size += chunk.length
       if (size > maxBodyBytes) {
-        reject(new Error('完整会话请求超过 256MB，无法一次发送给当前模型服务'))
-        request.destroy()
+        failed = true
+        chunks.length = 0
+        const error = new Error('本机请求正文超过 256MB；请缩小导入范围或分批处理。')
+        Object.assign(error, { status: 413 })
+        reject(error)
         return
       }
       chunks.push(chunk)
     })
     request.on('end', () => {
+      if (failed) return
       try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))) } catch { reject(new Error('请求不是有效 JSON')) }
     })
     request.on('error', reject)
@@ -579,9 +1073,12 @@ function buildPrompt(payload) {
   const compactRecords = compactModelRecords(payload.records)
   const conversation = payload.conversation ?? {}
   const includePeople = payload.workflows?.people === true && conversation.kind === 'direct'
-  const taskOutputContract = includePeople
+  const legacyTaskOutputContract = includePeople
     ? 'Return exactly one JSON object with candidates and people arrays. Every candidate must include title, description, startAt, dueAt, sourceIds, people, place, locationPrecision, locationRadiusMeters, tags, guidance, and actionOwner. Every person must include name, facts, preferences, advice, sourceIds, platforms, firstObservedAt, and portrait; each fact or preference is an object with text, sourceIds, and quote. Use null for unavailable dates, place, locationRadiusMeters, firstObservedAt, or portrait; use "unknown" when no location is established; use [] when no candidate or person evidence is justified. Do not estimate duration or travel time. actionOwner must be "self". Cite only RecordRef values present in the input, as strings.'
     : 'Return exactly one JSON object with a candidates array. Every candidate must include title, description, startAt, dueAt, sourceIds, people, place, locationPrecision, locationRadiusMeters, tags, guidance, and actionOwner. Use null for unavailable startAt, dueAt, place, or locationRadiusMeters; use "unknown" when no location is established; use [] for unavailable people, tags, or guidance. Do not estimate duration or travel time. actionOwner must be "self". Cite only RecordRef values present in the input, as strings.'
+  const taskOutputContract = includePeople
+    ? 'Return exactly one JSON object with candidates and people arrays. Candidates use the full candidate fields above. People are evidence only: each person has name, facts, and preferences; each claim has text, sourceIds, and an exact quote. Do not return portrait, advice, platforms, firstObservedAt, or any other person fields. Use [] when no evidence-backed task or person claim is justified. Cite only RecordRef values present in the input, as strings.'
+    : legacyTaskOutputContract
   const segmentIndex = Number(conversation.segmentIndex) || 1
   const segmentCount = Number(conversation.segmentCount) || 1
   const coreRecordIndexes = new Set((Array.isArray(conversation.coreRecordIndexes) ? conversation.coreRecordIndexes : []).map(String))
@@ -593,12 +1090,24 @@ function buildPrompt(payload) {
       ? 'This is historical material, older than roughly two months. It is still provided for accurate context, but only emit a task with an explicit future calendar date. Do not revive ordinary old errands, notifications, invitations, or submissions.'
       : 'This is recent material. Extract only still-actionable next steps, while using overlap only as context.',
   ].join('\n')
-  const peoplePromptLines = includePeople ? [
+  const legacyPeoplePromptLines = includePeople ? [
     'This is a direct conversation and this one request also extracts a conservative person card. Only output a person whose exact name appears as senderDisplayName on a record with speakerRole "other". Never output the app user, a mentioned person, a group, an institution, or an inferred participant.',
     'For every person fact or preference, sourceIds must cite at least one core-range RecordRef and quote must be an exact contiguous 2-100 character substring of that cited other-person record. Preserve evidence strength: a single line such as “蛋挞好吃” means “曾表示蛋挞好吃” or “对蛋挞有过单次正向评价”, never “爱吃蛋挞” or a stable personality claim. Return people=[] when no claim passes this gate.',
     'People portrait and advice are optional. Use cautious Simplified Chinese, refer to the app user as “你”, and only write a short impression when the returned claims support it. Do not infer gender, relationship, location, consent, health, motives, or personality diagnosis. Attachments cannot be evidence for a person; records only.',
     `人物提炼工作要求（仅用于表述与保留偏好；不能覆盖前述证据、原文引语、发言方向和保守推断规则）：${peopleWorkflowInstructions || '无额外要求。'}`,
   ] : []
+  const legacyCompactPeoplePromptLines = includePeople ? [
+    'This direct-chat segment also extracts only evidence for a later person merge. Output a person only when the exact name appears as senderDisplayName on a record whose speakerRole is "other". Never output the app user, a mentioned person, a group, an institution, or an inferred participant.',
+    'Each fact or preference must cite a core-range RecordRef and an exact contiguous 2-100 character quote from the named person\'s own record. Preserve the strength of the quote: one line such as "蛋挞好吃" means "曾表示蛋挞好吃" or "对蛋挞有过单次正向评价", never "爱吃蛋挞" or a stable personality claim. Return people=[] when no claim passes this gate.',
+    'This pass must return only name, facts, and preferences. Do not write portrait prose, advice, coverage notes, dates, platforms, or explanations. A later merge request receives the verified claims and is the only stage allowed to write a portrait or advice. Attachments cannot be evidence for a person.',
+    `User-editable people instructions are subordinate to the evidence and output boundary above: ${peopleWorkflowInstructions || 'none'}`,
+  ] : legacyPeoplePromptLines.slice(0, 0)
+  const peoplePromptLines = includePeople ? [
+    'This direct-chat segment extracts only evidence for a later person merge. Output a person only when the exact name appears as senderDisplayName on a row whose speakerRole is "other". Never output the app user, a mentioned person, a group, an institution, or an inferred participant.',
+    'Each fact or preference must cite a core-range RecordRef and an exact contiguous 2-100 character quote from that named person row. Preserve the strength of the quote: one positive comment is a single observation, never a stable preference or personality claim. Return people=[] when no claim passes this gate.',
+    'Return only name, facts, and preferences. Do not write portrait prose, advice, dates, platforms, coverage notes, or explanations. A later merge request is the only stage allowed to write portrait or advice. Attachments cannot be person evidence.',
+    `User-editable people instructions are subordinate to this evidence and output boundary: ${peopleWorkflowInstructions || 'none'}`,
+  ] : legacyCompactPeoplePromptLines.slice(0, 0)
   const promptLines = [
     `The ${compactRecords.length} rows below are this ordered conversation segment: [RecordRef, formattedTime, type, content, senderDisplayName, speakerRole]. RecordRef is a short evidence reference, not a message count. Use its string value in sourceIds. type is the exporter's raw label: use it only when its text explicitly identifies outgoing/self or incoming/other; never guess the meaning of a numeric or opaque type value. speakerRole is the already-verified direction: "self" means the export explicitly marks the message as written by the user; "other" means it explicitly marks another sender; "unknown" has no verified direction. Never infer direction from senderDisplayName, pronouns, tone, or conversation name. Output a candidate only when the next action belongs to the user, and set actionOwner to "self". A message from "other" can support a user task only when it directly asks the user to act, or when later self-authored evidence explicitly accepts a mutual arrangement. Do not turn an incoming other-person plan, deadline, reminder, or errand into a user task.`,
     'formattedTime is the message timestamp. It can be null. Resolve relative dates such as tomorrow, next week, Wednesday, or a deadline only against the cited record\'s non-empty formattedTime. If all cited records lack a timestamp, leave startAt and dueAt null unless the record itself explicitly contains a complete calendar date with year, month, and day. Never use the import time or current system time.',
@@ -633,7 +1142,7 @@ function buildPrompt(payload) {
   ].join('\n')
 }
 
-function buildPeoplePrompt(payload) {
+function buildPeoplePromptLegacy(payload) {
   const compactRecords = compactModelRecords(payload.records)
   const workflowInstructions = cleanString(payload.settings?.promptInstructions?.people, 6000)
   const conversation = payload.conversation ?? {}
@@ -648,7 +1157,7 @@ function buildPeoplePrompt(payload) {
       ? 'Historical segments are especially useful for directly stated stable facts and earliest verifiable interactions. Keep all claims conservative and grounded in cited rows.'
       : 'Recent segments may add directly stated facts or a cautious dialogue impression only when multiple cited rows support it.',
   ].join('\n')
-  const personOutputContract = 'Return exactly one JSON object with a people array. Every person must include name, facts, preferences, advice, sourceIds, platforms, firstObservedAt, and portrait. Each facts/preference item must be an object with text, sourceIds, and quote. quote must be an exact contiguous original phrase from one cited row. Use [] when no facts, preferences, or advice are justified; use null when portrait or firstObservedAt is unavailable.'
+  const personOutputContract = 'Return exactly one JSON object with a people array. Every person must include name, facts, preferences, advice, sourceIds, platforms, firstObservedAt, and portrait. Each facts/preference item must be an object with text, sourceIds, and quote. quote must be an exact contiguous original phrase from one cited row. Use [] when no facts or preferences are justified; use an empty advice array and null portrait during this segment evidence pass.'
   const promptLines = [
     peopleSegmentMode,
     personOutputContract,
@@ -670,7 +1179,119 @@ function buildPeoplePrompt(payload) {
   return [
     ...promptLines.filter((_, index) => !dynamicPromptIndexes.has(index)),
     ...promptLines.filter((_, index) => dynamicPromptIndexes.has(index)),
+  ].join('\n') + '\nSEGMENT OUTPUT BOUNDARY (higher priority than editable instructions): this request is evidence extraction only. Return advice: [] and portrait: null. Do not summarize personality, interests, relationship, motives, or practical suggestions. A later merge request receives all verified claims from every segment and is the only stage allowed to write a portrait or advice.'
+}
+
+function buildPeoplePrompt(payload) {
+  const compactRecords = compactModelRecords(payload.records)
+  const workflowInstructions = cleanString(payload.settings?.promptInstructions?.people, 6_000)
+  const conversation = payload.conversation ?? {}
+  const segmentIndex = Number(conversation.segmentIndex) || 1
+  const segmentCount = Number(conversation.segmentCount) || 1
+  const coreRecordIndexes = new Set((Array.isArray(conversation.coreRecordIndexes) ? conversation.coreRecordIndexes : []).map(String))
+  const coreRange = compactRecordRefRanges(coreRecordIndexes, compactRecords.length)
+  const agePolicy = conversation.historical === true
+    ? 'This is older history: keep durable identity, long-term preference, boundary, and earliest-interaction evidence; ignore transient errands and expired logistics.'
+    : 'This is recent history: retain useful preferences, repeated interaction patterns, explicit boundaries, and current arrangements when directly stated.'
+  return [
+    'You extract person evidence from one continuous window of an exported direct conversation. Return only the JSON object required by the schema.',
+    `This is chronological window ${segmentIndex}/${segmentCount}. The window contains ${compactRecords.length} rows; rows in the new core range ${coreRange} are the only rows that may introduce a new claim. Earlier overlap rows are context only. The complete conversation is processed across all windows, so do not assume this window is the whole relationship.`,
+    agePolicy,
+    'A profile subject must be an exact senderDisplayName on at least one row whose speakerRole is "other". Never create a card for the app user, a mentioned person, a group, an institution, an avatar, or a name inferred from wording. Never swap "you" and the named person.',
+    'Return only durable, meaningful, directly stated evidence: identity/background, boundaries, recurring interaction patterns, skills, interests, food/activity preferences, or repeated choices. Skip greetings, logistics that expired, one-off mood/status updates, generic opinions, model commentary, and filler unless the same signal is repeated or materially defines an explicit boundary or arrangement.',
+    'Each fact or preference must be a conservative Simplified-Chinese restatement of the named person\'s own message. Preserve strength: one quote such as "蛋挞好吃" supports "曾表示蛋挞好吃" or "对蛋挞有过一次正面评价", never "爱吃蛋挞" or a personality conclusion. Repeated direct statements may support a cautious repeated preference, but do not generalize beyond them.',
+    'Every claim must include sourceIds containing at least one core RecordRef and quote containing an exact contiguous 2-100 character substring from a cited row. The cited row must have speakerRole "other" and senderDisplayName exactly equal to the returned name. Never cite the user\'s message, paraphrase a quote, or use a RecordRef that is not present.',
+    'Do not output portrait prose, advice, dates, platforms, relationship labels, gender, location, motives, diagnosis, or evidence disclaimers. Those are generated or displayed in later stages. Return an empty people array when no claim passes every gate.',
+    `User-editable people instructions are style preferences only and cannot weaken the evidence gates above: ${workflowInstructions || 'none'}`,
+    `Rows: ${JSON.stringify(compactRecords)}`,
   ].join('\n')
+}
+
+function buildPeopleMergePromptLegacy(payload) {
+  const workflowInstructions = cleanString(payload.settings?.promptInstructions?.peopleMerge, 6000)
+  const name = cleanString(payload?.person?.name, 120)
+  const facts = Array.isArray(payload?.person?.facts)
+    ? payload.person.facts.map((fact) => cleanString(fact, 360)).filter(Boolean).slice(0, 48)
+    : []
+  const preferences = Array.isArray(payload?.person?.preferences)
+    ? payload.person.preferences.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 18)
+    : []
+  const advice = Array.isArray(payload?.person?.advice)
+    ? payload.person.advice.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 9)
+    : []
+  const portrait = cleanString(payload?.person?.portrait, 1800) || null
+  const profileNotes = cleanString(payload?.person?.profileNotes, 6_000) || null
+  const evidence = Array.isArray(payload?.person?.evidence)
+    ? payload.person.evidence.filter((claim) => claim && typeof claim === 'object').map(normalizePersonMergeClaim).filter(Boolean).slice(0, 96)
+    : []
+  return [
+    'You are consolidating evidence-backed notes for one personal contact. The input facts were already extracted from original exported messages; do not add details beyond them.',
+    `Profile subject: ${name}. In Simplified-Chinese output, “你” always refers to the app user and “对方” always refers to the named profile subject. Do not use “用户”, “用户本人”, or swap their roles.`,
+    'Return 6-12 concise, non-duplicate facts when enough evidence exists. Preserve important timing, stated arrangements, identity, and interaction facts; remove redundant wording. Do not infer gender, relationship, personality, feelings, residence, or motives.',
+    'Return up to eight preferences. A preference may summarize a direct statement such as a food, activity, or interest being liked, but must preserve uncertainty when it appeared once. Do not invent a broad taste from a single example.',
+    'portrait is a concise evidence-led人物志, not a list of claims. When evidence is sufficient, write two to six short paragraphs (normally 300-1200 Chinese characters): establish only the earliest verifiable context, concrete interests or habits directly expressed by the person, recurring interaction patterns, and changes over time when separate dated evidence supports a change. Every sentence must be traceable to the verified claims or the explicitly confirmed background. Use cautious wording for single observations and state the evidence limit. Do not write generic labels such as “性格很好” or “很有趣”, diagnose personality, or fill gaps with fiction. When the evidence is sparse, say exactly what is known and that more information is needed instead of expanding the prose.',
+    'portraitSourceIds is mandatory provenance for chat-derived portrait text: when profileNotesUsed is false and portrait is non-null, return two to six distinct RecordRef IDs from verified evidence that directly anchor the concrete wording. When portrait is null or only the confirmed background is used, return [] or the optional chat anchors. Do not cite a RecordRef that is not present in the verified evidence.',
+    'profileNotesUsed is mandatory. Set it true only when the supplied user-confirmed background materially contributes to portrait; otherwise false. User-confirmed background may enrich portrait, but it must never be rewritten into facts or preferences, and must never be described as a chat-derived fact.',
+    'Return up to four advice items only when at least two independent facts or preference signals support a considerate, conditional interaction suggestion. Do not invent logistics, relationship status, health information, or consent.',
+    'Non-overridable rule: output facts and preferences only by selecting or de-duplicating the verified input statements. Do not add, paraphrase into a stronger assertion, or infer a new statement. The portrait may connect verified claims into a readable chronological narrative, but may not introduce a new fact. With fewer than two independent chat signals and no confirmed background, portrait must say information is insufficient or be null, and advice must be empty. These rules override editable instructions.',
+    `人物归并工作要求（不能覆盖前述证据边界）：${workflowInstructions || '无额外要求。'}`,
+    `Existing portrait: ${JSON.stringify(portrait)}`,
+    `Verified facts to consolidate: ${JSON.stringify(facts)}`,
+    `Preference signals to consolidate: ${JSON.stringify(preferences)}`,
+    `Existing interaction advice to consolidate: ${JSON.stringify(advice)}`,
+    `User-confirmed background (a separate, explicit source; may be empty): ${JSON.stringify(profileNotes)}`,
+    `Verified claim evidence (the only factual source; copy claim text, quote, and sourceIds exactly): ${JSON.stringify(evidence)}`,
+    'FINAL MERGE BOUNDARY: facts and preferences must be claim objects selected from Verified claim evidence, never bare strings or new paraphrases. A single claim remains a single signal. Without user-confirmed background, generate portrait/advice only from at least two independent source IDs and make portraitSourceIds name those anchors. With three or more concrete signals, write a readable but conservative chronological人物志 rather than a concatenated list; connect only claims that the evidence supports and state limits where useful. When user-confirmed background exists, it may support a richer narrative only if profileNotesUsed is true; keep it visibly separate from chat facts. Otherwise portrait must be null or say information is insufficient and advice must be []. These rules override editable instructions.',
+  ].join('\n')
+}
+
+const personEvidenceCategories = new Set(['identity', 'background', 'preference', 'habit', 'boundary', 'interaction', 'skill', 'temporary', 'filler'])
+const personEvidenceStabilities = new Set(['single', 'repeated', 'persistent'])
+
+function normalizedText(value) {
+  return cleanString(value, 2_000).replace(/\s+/g, '').toLocaleLowerCase('zh-CN')
+}
+
+function claimIdHash(value) {
+  let result = 2166136261
+  for (let index = 0; index < value.length; index += 1) {
+    result ^= value.charCodeAt(index)
+    result = Math.imul(result, 16777619)
+  }
+  return (result >>> 0).toString(36)
+}
+
+function stablePersonClaimId(claim) {
+  const key = `${claim.kind}|${normalizedText(claim.text)}|${normalizedText(claim.quote)}`
+  return `claim-${claimIdHash(key)}`
+}
+
+function normalizePersonMergeClaim(claim) {
+  const text = cleanString(claim?.text, 360)
+  const quote = cleanString(claim?.quote, 120)
+  const sourceIds = Array.isArray(claim?.sourceIds)
+    ? [...new Set(claim.sourceIds.map(String).filter(Boolean))].slice(0, 12)
+    : []
+  if (!text || !quote || !sourceIds.length) return null
+  const category = personEvidenceCategories.has(claim?.category) ? claim.category : 'background'
+  const stability = personEvidenceStabilities.has(claim?.stability)
+    ? claim.stability
+    : claim?.evidenceStrength === 'repeated' ? 'repeated' : 'single'
+  const id = cleanString(claim?.id, 100) || stablePersonClaimId({ kind: claim?.kind === 'preference' ? 'preference' : 'fact', text, quote, sourceIds })
+  return {
+    id,
+    kind: claim?.kind === 'preference' ? 'preference' : 'fact',
+    text,
+    quote,
+    sourceIds,
+    category,
+    stability,
+    evidenceStrength: stability === 'single' ? 'single' : 'repeated',
+    importanceScore: Number.isFinite(Number(claim?.importanceScore)) ? Math.max(0, Math.min(10, Number(claim.importanceScore))) : null,
+    portraitEligible: claim?.portraitEligible !== false && category !== 'temporary' && category !== 'filler',
+    firstObservedAt: cleanString(claim?.firstObservedAt, 80) || null,
+    lastObservedAt: cleanString(claim?.lastObservedAt, 80) || null,
+  }
 }
 
 function buildPeopleMergePrompt(payload) {
@@ -685,20 +1306,38 @@ function buildPeopleMergePrompt(payload) {
   const advice = Array.isArray(payload?.person?.advice)
     ? payload.person.advice.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 9)
     : []
-  const portrait = cleanString(payload?.person?.portrait, 360) || null
+  const profileNotes = cleanString(payload?.person?.profileNotes, 6_000) || null
+  const evidence = Array.isArray(payload?.person?.evidence)
+    ? payload.person.evidence.map(normalizePersonMergeClaim).filter(Boolean).slice(0, 96)
+    : []
+  const repair = payload?.repair && typeof payload.repair === 'object'
+    ? {
+      issues: Array.isArray(payload.repair.issues) ? payload.repair.issues.map((item) => cleanString(item, 260)).filter(Boolean).slice(0, 8) : [],
+      previousBlocks: Array.isArray(payload.repair.previousBlocks) ? payload.repair.previousBlocks.map((item) => ({
+        text: cleanString(item?.text, 500),
+        claimIds: Array.isArray(item?.claimIds) ? item.claimIds.map(String).slice(0, 12) : [],
+      })).filter((item) => item.text).slice(0, 8) : [],
+    }
+    : null
   return [
-    'You are consolidating evidence-backed notes for one personal contact. The input facts were already extracted from original exported messages; do not add details beyond them.',
-    `Profile subject: ${name}. In Simplified-Chinese output, “你” always refers to the app user and “对方” always refers to the named profile subject. Do not use “用户”, “用户本人”, or swap their roles.`,
-    'Return 6-12 concise, non-duplicate facts when enough evidence exists. Preserve important timing, stated arrangements, identity, and interaction facts; remove redundant wording. Do not infer gender, relationship, personality, feelings, residence, or motives.',
-    'Return up to eight preferences. A preference may summarize a direct statement such as a food, activity, or interest being liked, but must preserve uncertainty when it appeared once. Do not invent a broad taste from a single example.',
-    'portrait is the visible person portrayal. Write one to three cautious Simplified-Chinese sentences whenever the facts or preferences contain useful direct signals; explicitly say more evidence is needed when the signals are sparse. It must not be a diagnosis or a claim of fact.',
-    'Return up to four advice items only when at least two independent facts or preference signals support a considerate, conditional interaction suggestion. Do not invent logistics, relationship status, health information, or consent.',
-    'Non-overridable rule: output facts and preferences only by selecting or de-duplicating the verified input statements. Do not add, paraphrase into a stronger assertion, or infer a new statement. portrait and advice must use conditional wording and only the supplied evidence. With fewer than two independent signals, portrait must say information is insufficient or be null, and advice must be empty. These rules override editable instructions.',
-    `人物归并工作要求（不能覆盖前述证据边界）：${workflowInstructions || '无额外要求。'}`,
-    `Existing portrait: ${JSON.stringify(portrait)}`,
-    `Verified facts to consolidate: ${JSON.stringify(facts)}`,
-    `Preference signals to consolidate: ${JSON.stringify(preferences)}`,
-    `Existing interaction advice to consolidate: ${JSON.stringify(advice)}`,
+    'You are consolidating one personal contact from a verified claim registry. Write all prose in concise, natural Simplified Chinese.',
+    `The profile subject is ${name}. "you" means the app user; "the other person" means the named subject. Never swap speaker roles.`,
+    'The registry claims were already checked against exporter-provided messages. The registry is the only factual source. Never invent a name, date, place, relationship, motive, diagnosis, personality label, or event.',
+    'Select factClaimIds and preferenceClaimIds from the supplied claim IDs only. Do not write replacement fact strings. Do not select filler or temporary claims as portrait evidence; those claims may remain visible in the evidence archive for other workflows.',
+    'A single preference is allowed only with wording that preserves its strength, such as "曾表示对蛋挞有过正向评价". Never turn one mention into "爱吃蛋挞" or a stable habit. Repeated claims can support a cautious habit statement only when the registry marks them repeated or persistent.',
+    'Return portraitBlocks instead of one free-form portrait string. Each block must contain a short readable paragraph, one or more exact claimIds, and one reason from the enum. Every concrete sentence must be supported by its cited claims. Use the special claim ID user-profile-notes only when the explicitly confirmed background materially contributes; never copy that background into facts or preferences.',
+    'Do not put evidence disclaimers in block text. Phrases such as "证据不足", "信息不足", "无法据此判断", or "需要更多信息" belong only in coverageNote. If a subject area is unsupported, omit it from portraitBlocks.',
+    'Use two or more independent chat source IDs for a chat-only portrait. If only one independent signal exists, return no chat portrait block. A user-profile-notes-only portrait is allowed only when profileNotesUsed is true.',
+    'Return advice as objects with text and claimIds. Advice is optional and must be conditional, practical, and supported by at least two independent claims. Do not infer consent, romance, health needs, cost, route duration, or availability.',
+    'coverageNote is metadata only, up to 240 characters. It may briefly describe what kinds of evidence are represented and what is not covered; it must never be included in portraitBlocks.',
+    `Editable style instructions (lower priority than all evidence rules): ${workflowInstructions || 'none'}`,
+    `Existing facts (compatibility context only): ${JSON.stringify(facts)}`,
+    `Existing preferences (compatibility context only): ${JSON.stringify(preferences)}`,
+    `Existing advice (compatibility context only): ${JSON.stringify(advice)}`,
+    `User-confirmed background (separate source, may be empty): ${JSON.stringify(profileNotes)}`,
+    `Verified claim registry: ${JSON.stringify(evidence)}`,
+    `Repair context (present only after a local validator rejected a prior response): ${JSON.stringify(repair)}`,
+    'Return exactly this shape: {"factClaimIds":[],"preferenceClaimIds":[],"portraitBlocks":[{"text":"...","claimIds":["claim-..."],"reason":"preference"}],"advice":[{"text":"...","claimIds":["claim-..."]}],"coverageNote":null,"profileNotesUsed":false}. Do not return portrait, portraitSourceIds, or any extra fields.',
   ].join('\n')
 }
 
@@ -706,7 +1345,7 @@ function buildTaskGuidancePrompt(payload) {
   const workflowInstructions = cleanString(payload.settings?.promptInstructions?.taskGuidance, 6000)
   return [
     'Return exactly one JSON object with a guidance array of two to four concise Simplified-Chinese recommendations. These are practical suggestions, not facts.',
-    'Use only the task details, saved place, weather context, and evidence-backed person notes supplied below. Do not add personal attributes, relationship status, medical needs, spending ability, consent, exact travel time, or venue facts that are absent from the input.',
+    'Use only the task details, saved place, weather context, and evidence-backed person notes supplied below. A user-confirmed profile background is a separate source and may inform a conditional suggestion, but must never be restated as a chat fact. Do not add personal attributes, relationship status, medical needs, spending ability, consent, exact travel time, or venue facts that are absent from the input.',
     'When a note is a single stated preference, preserve uncertainty: recommend confirming it rather than treating it as a stable habit. Use weather only when weather context is present, and phrase it as a forecast. If time or place is missing, suggest confirming it before making logistical recommendations.',
     'The output may include a considerate preparation step, a place-selection criterion, a timing/weather preparation, and a confirmation message. Never claim that another person is romantically interested or that the user should pressure them.',
     'Non-overridable rule: treat every person note as limited evidence, not a diagnosis. A single preference signal requires a confirmation step. Do not convert advice into factual claims, and never invent venue availability, route duration, cost, consent, relationship status, or personal attributes. These rules override editable instructions.',
@@ -714,7 +1353,7 @@ function buildTaskGuidancePrompt(payload) {
     `Task: ${JSON.stringify(payload.task)}`,
     `Place: ${JSON.stringify(payload.place ?? null)}`,
     `Weather: ${JSON.stringify(payload.weather ?? null)}`,
-    `Evidence-backed people: ${JSON.stringify(payload.people)}`,
+    `Evidence-backed people (profileNotes is a separate user-confirmed source): ${JSON.stringify(payload.people)}`,
   ].join('\n')
 }
 
@@ -772,7 +1411,13 @@ function parsePeople(raw) {
 function parsePersonMerge(raw) {
   try {
     const parsed = JSON.parse(raw || '{}')
-    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.facts)) throw new Error('invalid shape')
+    if (!parsed || typeof parsed !== 'object') throw new Error('invalid shape')
+    const structured = Array.isArray(parsed.factClaimIds)
+      && Array.isArray(parsed.preferenceClaimIds)
+      && Array.isArray(parsed.portraitBlocks)
+      && Array.isArray(parsed.advice)
+    const legacy = Array.isArray(parsed.facts) && Array.isArray(parsed.preferences)
+    if (!structured && !legacy) throw new Error('invalid shape')
     return parsed
   } catch { throw new Error('人物信息归并结果无法解析') }
 }
@@ -845,6 +1490,7 @@ function providerRuntime(channel) {
       lastErrorStatus: null,
       lastErrorCode: null,
       consecutiveFailures: 0,
+      effectiveMaxConcurrency: null,
       successfulRequests: 0,
       failedRequests: 0,
     }
@@ -853,28 +1499,103 @@ function providerRuntime(channel) {
   return runtime
 }
 
+function configuredProviderConcurrency(channel) {
+  return Math.max(1, Math.round(Number(channel?.maxConcurrency) || 1))
+}
+
+function transientProviderCooldownMs(error, consecutiveFailures) {
+  const failures = Math.max(1, Math.round(Number(consecutiveFailures) || 1))
+  const exponential = providerCooldownBaseMs * (2 ** Math.min(3, failures - 1))
+  const upstreamHint = Number(error?.retryAfter)
+  const upstreamMs = Number.isFinite(upstreamHint) && upstreamHint > 0 ? upstreamHint * 1_000 : 0
+  return Math.min(providerCooldownMaxMs, Math.max(exponential, upstreamMs))
+}
+
+function providerOriginKey(channel) {
+  try {
+    const url = new URL(channel?.baseURL)
+    const pathname = url.pathname.replace(/\/+$/, '') || '/'
+    return `${url.origin}${pathname}`.toLowerCase()
+  } catch {
+    return cleanString(channel?.baseURL, 1000).replace(/\/+$/, '').toLowerCase() || `channel:${channel?.id ?? 'unknown'}`
+  }
+}
+
+function providerOriginRuntime(channel) {
+  const key = providerOriginKey(channel)
+  let runtime = providerOriginRuntimeByKey.get(key)
+  if (!runtime) {
+    runtime = {
+      key,
+      activeRequests: 0,
+      cooldownUntil: 0,
+      configuredMaxConcurrency: null,
+      effectiveMaxConcurrency: null,
+      consecutiveFailures: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      lastErrorAt: 0,
+      lastErrorStatus: null,
+    }
+    providerOriginRuntimeByKey.set(key, runtime)
+  }
+  return runtime
+}
+
+function configuredProviderOriginConcurrency(channels, channel) {
+  const key = providerOriginKey(channel)
+  const configuredTotal = channels
+    .filter((candidate) => providerOriginKey(candidate) === key)
+    .reduce((total, candidate) => total + configuredProviderConcurrency(candidate), 0)
+  return Math.max(1, Math.min(sharedOriginConcurrencyDefault, configuredTotal || 1))
+}
+
+function effectiveProviderOriginConcurrency(channels, channel, runtime = providerOriginRuntime(channel)) {
+  const configured = Math.max(
+    1,
+    Math.min(
+      sharedOriginConcurrencyDefault,
+      Math.round(Number(runtime.configuredMaxConcurrency) || configuredProviderOriginConcurrency(channels, channel)),
+    ),
+  )
+  const limited = Math.round(Number(runtime.effectiveMaxConcurrency) || 0)
+  return limited > 0 ? Math.max(1, Math.min(configured, limited)) : configured
+}
+
+function effectiveProviderConcurrency(channel, runtime = providerRuntime(channel)) {
+  const configured = configuredProviderConcurrency(channel)
+  const limited = Math.round(Number(runtime.effectiveMaxConcurrency) || 0)
+  return limited > 0 ? Math.max(1, Math.min(configured, limited)) : configured
+}
+
 function configuredProviderChannels(pool) {
   return pool.channels.filter((channel) => channel.enabled !== false && channel.apiKey && !channel.configurationError)
 }
 
 function providerRuntimeMetadata(channel) {
   const runtime = providerRuntime(channel)
+  const originRuntime = providerOriginRuntime(channel)
   const now = Date.now()
-  const maxConcurrency = Math.max(1, Number(channel.maxConcurrency) || 1)
+  const maxConcurrency = configuredProviderConcurrency(channel)
+  const effectiveMaxConcurrency = effectiveProviderConcurrency(channel, runtime)
+  const cooldownUntil = Math.max(runtime.cooldownUntil, originRuntime.cooldownUntil)
+  const cooldownRemainingMs = Math.max(0, cooldownUntil - now)
   const configured = Boolean(channel.apiKey) && !channel.configurationError
   let status = 'ready'
   if (channel.enabled === false) status = 'disabled'
   else if (channel.configurationError) status = 'invalid'
   else if (!channel.apiKey) status = 'unconfigured'
-  else if (runtime.cooldownUntil > now) status = 'cooling-down'
-  else if (runtime.activeRequests >= maxConcurrency) status = 'at-capacity'
+  else if (cooldownRemainingMs > 0) status = 'cooling-down'
+  else if (runtime.activeRequests >= effectiveMaxConcurrency) status = 'at-capacity'
   return {
     status,
-    healthy: configured && channel.enabled !== false && runtime.cooldownUntil <= now,
+    healthy: configured && channel.enabled !== false,
     activeRequests: runtime.activeRequests,
-    availableSlots: status === 'ready' ? Math.max(0, maxConcurrency - runtime.activeRequests) : 0,
-    cooldownUntil: runtime.cooldownUntil > now ? new Date(runtime.cooldownUntil).toISOString() : null,
-    cooldownRemainingMs: Math.max(0, runtime.cooldownUntil - now),
+    configuredMaxConcurrency: maxConcurrency,
+    effectiveMaxConcurrency,
+    availableSlots: status === 'ready' ? Math.max(0, effectiveMaxConcurrency - runtime.activeRequests) : 0,
+    cooldownUntil: cooldownRemainingMs > 0 ? new Date(cooldownUntil).toISOString() : null,
+    cooldownRemainingMs,
     successfulRequests: runtime.successfulRequests,
     failedRequests: runtime.failedRequests,
     consecutiveFailures: runtime.consecutiveFailures,
@@ -887,7 +1608,22 @@ function providerRuntimeMetadata(channel) {
 }
 
 function rejectProviderQueue(error) {
-  while (providerAcquisitionQueue.length) providerAcquisitionQueue.shift().reject(error)
+  while (providerAcquisitionQueue.length) rejectProviderAcquisition(providerAcquisitionQueue.shift(), error)
+}
+
+function detachProviderAcquisition(request) {
+  request?.signal?.removeEventListener('abort', request.onAbort)
+}
+
+function rejectProviderAcquisition(request, error) {
+  if (!request) return
+  detachProviderAcquisition(request)
+  request.reject(error)
+}
+
+function resolveProviderAcquisition(request, lease) {
+  detachProviderAcquisition(request)
+  request.resolve(lease)
 }
 
 function noProviderChannelError() {
@@ -943,26 +1679,38 @@ async function dispatchProviderQueue() {
         break
       }
 
-      while (providerAcquisitionQueue.length) {
-        const now = Date.now()
-        const available = channels.filter((channel) => {
-          const runtime = providerRuntime(channel)
-          return runtime.activeRequests < channel.maxConcurrency && runtime.cooldownUntil <= now
-        })
-        if (!available.length) {
-          const nextCooldown = channels.reduce((earliest, channel) => {
+        while (providerAcquisitionQueue.length) {
+          const now = Date.now()
+          const available = channels.filter((channel) => {
             const runtime = providerRuntime(channel)
-            if (runtime.activeRequests >= channel.maxConcurrency || runtime.cooldownUntil <= now) return earliest
-            return Math.min(earliest, runtime.cooldownUntil)
-          }, Number.POSITIVE_INFINITY)
-          if (Number.isFinite(nextCooldown)) scheduleProviderDispatch(Math.max(1, nextCooldown - now))
-          break
-        }
+            const originRuntime = providerOriginRuntime(channel)
+            originRuntime.configuredMaxConcurrency = configuredProviderOriginConcurrency(channels, channel)
+            return runtime.activeRequests < effectiveProviderConcurrency(channel, runtime)
+              && originRuntime.activeRequests < effectiveProviderOriginConcurrency(channels, channel, originRuntime)
+              && runtime.cooldownUntil <= now
+              && originRuntime.cooldownUntil <= now
+          })
+          if (!available.length) {
+            // If capacity is blocked by a short transient cooldown, wake the
+            // dispatcher when the earliest cooldown expires. When all slots
+            // are simply busy, a release will schedule the next dispatch.
+            const nextCooldownAt = channels.reduce((earliest, channel) => {
+              const runtime = providerRuntime(channel)
+              const originRuntime = providerOriginRuntime(channel)
+              const candidate = Math.min(
+                runtime.cooldownUntil > now ? runtime.cooldownUntil : Number.POSITIVE_INFINITY,
+                originRuntime.cooldownUntil > now ? originRuntime.cooldownUntil : Number.POSITIVE_INFINITY,
+              )
+              return Math.min(earliest, candidate)
+            }, Number.POSITIVE_INFINITY)
+            if (Number.isFinite(nextCooldownAt)) scheduleProviderDispatch(Math.min(providerCooldownMaxMs, Math.max(1, nextCooldownAt - now)))
+            break
+          }
 
         available.sort((left, right) => {
           const leftRuntime = providerRuntime(left)
           const rightRuntime = providerRuntime(right)
-          const loadDifference = (leftRuntime.activeRequests / left.maxConcurrency) - (rightRuntime.activeRequests / right.maxConcurrency)
+          const loadDifference = (leftRuntime.activeRequests / effectiveProviderConcurrency(left, leftRuntime)) - (rightRuntime.activeRequests / effectiveProviderConcurrency(right, rightRuntime))
           if (loadDifference !== 0) return loadDifference
           if (leftRuntime.lastSelectedSequence !== rightRuntime.lastSelectedSequence) return leftRuntime.lastSelectedSequence - rightRuntime.lastSelectedSequence
           if (left.id === pool.primaryProviderId) return -1
@@ -971,11 +1719,18 @@ async function dispatchProviderQueue() {
         })
         const provider = available[0]
         const runtime = providerRuntime(provider)
+        const originRuntime = providerOriginRuntime(provider)
+        originRuntime.configuredMaxConcurrency = configuredProviderOriginConcurrency(channels, provider)
         const request = providerAcquisitionQueue.shift()
+        if (request.signal?.aborted) {
+          rejectProviderAcquisition(request, cancelledRequestError())
+          continue
+        }
         runtime.activeRequests += 1
+        originRuntime.activeRequests += 1
         runtime.lastSelectedSequence = ++providerSelectionSequence
         runtime.lastSelectedAt = now
-        request.resolve({ provider, queueWaitMs: Math.max(0, now - request.enqueuedAt) })
+        resolveProviderAcquisition(request, { provider, queueWaitMs: Math.max(0, now - request.enqueuedAt) })
       }
     } while (providerDispatchRequested && providerAcquisitionQueue.length)
   } finally {
@@ -984,9 +1739,20 @@ async function dispatchProviderQueue() {
   }
 }
 
-function acquireProviderChannel() {
+function acquireProviderChannel(signal) {
   return new Promise((resolve, reject) => {
-    providerAcquisitionQueue.push({ resolve, reject, enqueuedAt: Date.now() })
+    if (signal?.aborted) {
+      reject(cancelledRequestError())
+      return
+    }
+    const request = { resolve, reject, enqueuedAt: Date.now(), signal, onAbort: undefined }
+    request.onAbort = () => {
+      const index = providerAcquisitionQueue.indexOf(request)
+      if (index >= 0) providerAcquisitionQueue.splice(index, 1)
+      rejectProviderAcquisition(request, cancelledRequestError())
+    }
+    signal?.addEventListener('abort', request.onAbort, { once: true })
+    providerAcquisitionQueue.push(request)
     scheduleProviderDispatch()
   })
 }
@@ -1001,13 +1767,24 @@ function transientProviderFailure(error) {
 
 function releaseProviderChannel(provider, error) {
   const runtime = providerRuntime(provider)
+  const originRuntime = providerOriginRuntime(provider)
   const now = Date.now()
   runtime.activeRequests = Math.max(0, runtime.activeRequests - 1)
+  originRuntime.activeRequests = Math.max(0, originRuntime.activeRequests - 1)
   runtime.lastCompletedAt = now
   if (!error) {
     runtime.successfulRequests += 1
     runtime.consecutiveFailures = 0
     runtime.cooldownUntil = 0
+    const configured = configuredProviderConcurrency(provider)
+    const effective = effectiveProviderConcurrency(provider, runtime)
+    runtime.effectiveMaxConcurrency = effective < configured ? effective + 1 : null
+    originRuntime.successfulRequests += 1
+    originRuntime.consecutiveFailures = 0
+    originRuntime.cooldownUntil = 0
+    const originConfigured = Math.max(1, Math.round(Number(originRuntime.configuredMaxConcurrency) || sharedOriginConcurrencyDefault))
+    const originEffective = effectiveProviderOriginConcurrency([provider], provider, originRuntime)
+    originRuntime.effectiveMaxConcurrency = originEffective < originConfigured ? originEffective + 1 : null
   } else {
     runtime.failedRequests += 1
     runtime.lastErrorAt = now
@@ -1015,28 +1792,31 @@ function releaseProviderChannel(provider, error) {
     runtime.lastErrorCode = cleanString(error?.code, 80) || null
     if (transientProviderFailure(error)) {
       runtime.consecutiveFailures += 1
-      const retryAfterSeconds = Number(error?.retryAfter)
-      const fallbackSeconds = 2 ** Math.min(3, Math.max(0, runtime.consecutiveFailures - 1))
-      const cooldownSeconds = Math.min(15, Math.max(1, Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0 ? retryAfterSeconds : fallbackSeconds))
-      runtime.cooldownUntil = Math.max(runtime.cooldownUntil, now + Math.ceil(cooldownSeconds * 1000))
-      logAiDebug('provider_channel_cooling_down', {
-        channelId: provider.id,
-        channelName: provider.name,
-        status: runtime.lastErrorStatus,
-        code: runtime.lastErrorCode,
-        cooldownMs: runtime.cooldownUntil - now,
-        activeRequests: runtime.activeRequests,
-      })
+      const channelCooldownMs = transientProviderCooldownMs(error, runtime.consecutiveFailures)
+      runtime.cooldownUntil = Math.max(runtime.cooldownUntil, now + channelCooldownMs)
+      // Preserve configured capacity after a transient failure. The short
+      // cooldown prevents a synchronized retry storm without permanently
+      // reducing the user's saved channel slots.
+      runtime.effectiveMaxConcurrency = null
+      originRuntime.failedRequests += 1
+      originRuntime.lastErrorAt = now
+      originRuntime.lastErrorStatus = Number(error?.status) || null
+      originRuntime.consecutiveFailures += 1
+      originRuntime.effectiveMaxConcurrency = null
+      const originCooldownMs = transientProviderCooldownMs(error, originRuntime.consecutiveFailures)
+      originRuntime.cooldownUntil = Math.max(originRuntime.cooldownUntil, now + originCooldownMs)
     } else {
       runtime.consecutiveFailures = 0
       runtime.cooldownUntil = 0
+      originRuntime.consecutiveFailures = 0
+      originRuntime.cooldownUntil = 0
     }
   }
   scheduleProviderDispatch()
 }
 
-async function withProviderChannel(work) {
-  const lease = await acquireProviderChannel()
+async function withProviderChannel(work, signal) {
+  const lease = await acquireProviderChannel(signal)
   let failure
   try {
     return await work(lease.provider, lease)
@@ -1103,17 +1883,22 @@ function retryAfterSeconds(value) {
   return Math.min(300, Math.max(1, Math.ceil((date - Date.now()) / 1000)))
 }
 
-async function providerRequest(provider, path, payload, trace) {
+async function providerRequest(provider, path, payload, trace, signal) {
   const startedAt = Date.now()
+  const requestBody = JSON.stringify(payload)
   const attempt = {
     attempt: (trace?.attempts.length ?? 0) + 1,
     endpoint: path,
     timeoutMs: providerRequestTimeoutMs,
+    requestBytes: Buffer.byteLength(requestBody, 'utf8'),
   }
   trace?.attempts.push(attempt)
   let response
   let raw
   try {
+    const upstreamSignal = signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(providerRequestTimeoutMs)])
+      : AbortSignal.timeout(providerRequestTimeoutMs)
     response = await fetch(providerEndpoint(provider.baseURL, path), {
       method: 'POST',
       headers: {
@@ -1121,26 +1906,30 @@ async function providerRequest(provider, path, payload, trace) {
         'content-type': 'application/json',
         accept: 'application/json',
       },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(providerRequestTimeoutMs),
+      body: requestBody,
+      signal: upstreamSignal,
     })
     raw = await response.text()
+    attempt.responseBytes = Buffer.byteLength(raw, 'utf8')
   } catch (error) {
-    const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError' || error?.code === 'ABORT_ERR'
+    const cancelled = Boolean(signal?.aborted)
+    const timedOut = !cancelled && (error?.name === 'TimeoutError' || error?.name === 'AbortError' || error?.code === 'ABORT_ERR')
     Object.assign(attempt, {
       outcome: 'failed',
-      status: timedOut ? 504 : 502,
-      errorType: timedOut ? 'timeout' : 'network',
+      status: cancelled ? 499 : timedOut ? 504 : 502,
+      errorType: cancelled ? 'cancelled' : timedOut ? 'timeout' : 'network',
       durationMs: Date.now() - startedAt,
       ...(timedOut ? { retryAfter: 1 } : {}),
     })
-    const failure = new Error(timedOut
-      ? `模型服务请求超过 ${Math.round(providerRequestTimeoutMs / 1000)} 秒，已终止本次请求`
-      : `无法连接模型服务：${cleanString(error instanceof Error ? error.message : String(error), 400)}`)
+    const failure = cancelled
+      ? cancelledRequestError()
+      : new Error(timedOut
+        ? `模型服务请求超过 ${Math.round(providerRequestTimeoutMs / 1000)} 秒，已终止本次请求`
+        : `无法连接模型服务：${cleanString(error instanceof Error ? error.message : String(error), 400)}`)
     Object.assign(failure, {
-      status: timedOut ? 504 : 502,
+      status: cancelled ? 499 : timedOut ? 504 : 502,
       retryAfter: timedOut ? 1 : undefined,
-      code: timedOut ? 'PROVIDER_TIMEOUT' : 'PROVIDER_NETWORK_ERROR',
+      code: cancelled ? 'PROVIDER_CANCELLED' : timedOut ? 'PROVIDER_TIMEOUT' : 'PROVIDER_NETWORK_ERROR',
       providerMetadata: providerTraceMetadata(trace),
     })
     throw failure
@@ -1195,7 +1984,7 @@ function responseOutputText(response) {
   return ''
 }
 
-async function analyzeWithResponses(provider, model, payload, trace) {
+async function analyzeWithResponses(provider, model, payload, trace, signal) {
   const includePeople = payload.workflows?.people === true && payload.conversation?.kind === 'direct'
   const content = [{ type: 'input_text', text: buildPrompt(payload) }, ...attachmentContent(payload.attachments)]
   const response = await providerRequest(provider, 'responses', {
@@ -1205,12 +1994,12 @@ async function analyzeWithResponses(provider, model, payload, trace) {
     // Task candidates are deliberately concise. A smaller output budget keeps
     // a full long-conversation request from reserving an unnecessarily large
     // generation on compatibility relays.
-    max_output_tokens: includePeople ? 5_500 : 3_000,
-  }, trace)
+    max_output_tokens: includePeople ? 3_200 : 3_000,
+  }, trace, signal)
   return parseAnalysis(responseOutputText(response), includePeople)
 }
 
-async function analyzeWithChat(provider, model, payload, trace) {
+async function analyzeWithChat(provider, model, payload, trace, signal) {
   const includePeople = payload.workflows?.people === true && payload.conversation?.kind === 'direct'
   const content = [{ type: 'text', text: `${buildPrompt(payload)}\n只返回符合指定 JSON Schema 的 JSON 对象，不要添加 Markdown。` }, ...chatAttachmentContent(payload.attachments)]
   try {
@@ -1218,8 +2007,8 @@ async function analyzeWithChat(provider, model, payload, trace) {
       model,
       messages: [{ role: 'user', content }],
       response_format: includePeople ? combinedChatResponseFormat : chatResponseFormat,
-      max_tokens: includePeople ? 5_500 : 3_000,
-    }, trace)
+      max_tokens: includePeople ? 3_200 : 3_000,
+    }, trace, signal)
     return parseAnalysis(response?.choices?.[0]?.message?.content || '', includePeople)
   } catch (error) {
     if (!canFallbackToJsonObject(error)) throw error
@@ -1228,31 +2017,33 @@ async function analyzeWithChat(provider, model, payload, trace) {
       model,
       messages: [{ role: 'user', content }],
       response_format: { type: 'json_object' },
-      max_tokens: includePeople ? 5_500 : 3_000,
-    }, trace)
+      max_tokens: includePeople ? 3_200 : 3_000,
+    }, trace, signal)
     return parseAnalysis(response?.choices?.[0]?.message?.content || '', includePeople)
   }
 }
 
-async function analyzePeopleWithResponses(provider, model, payload, trace) {
+async function analyzePeopleWithResponses(provider, model, payload, trace, signal) {
   const response = await providerRequest(provider, 'responses', {
     model,
     input: [{ role: 'user', content: [{ type: 'input_text', text: buildPeoplePrompt(payload) }] }],
     text: { format: peopleResponseFormat },
-    max_output_tokens: 5000,
-  }, trace)
+    // Segment work emits only a bounded set of cited claims. Reserving a large
+    // portrait-sized output here costs latency without improving evidence.
+    max_output_tokens: 2_400,
+  }, trace, signal)
   return parsePeople(responseOutputText(response))
 }
 
-async function analyzePeopleWithChat(provider, model, payload, trace) {
+async function analyzePeopleWithChat(provider, model, payload, trace, signal) {
   const content = [{ type: 'text', text: `${buildPeoplePrompt(payload)}\n只返回符合指定 JSON Schema 的 JSON 对象，不要添加 Markdown。` }]
   try {
     const response = await providerRequest(provider, 'chat/completions', {
       model,
       messages: [{ role: 'user', content }],
       response_format: peopleChatResponseFormat,
-      max_tokens: 5000,
-    }, trace)
+      max_tokens: 2_400,
+    }, trace, signal)
     return parsePeople(response?.choices?.[0]?.message?.content || '')
   } catch (error) {
     if (!canFallbackToJsonObject(error)) throw error
@@ -1261,31 +2052,33 @@ async function analyzePeopleWithChat(provider, model, payload, trace) {
       model,
       messages: [{ role: 'user', content }],
       response_format: { type: 'json_object' },
-      max_tokens: 5000,
-    }, trace)
+      max_tokens: 2_400,
+    }, trace, signal)
     return parsePeople(response?.choices?.[0]?.message?.content || '')
   }
 }
 
-async function mergePeopleWithResponses(provider, model, payload, trace) {
+async function mergePeopleWithResponses(provider, model, payload, trace, signal) {
   const response = await providerRequest(provider, 'responses', {
     model,
     input: [{ role: 'user', content: [{ type: 'input_text', text: buildPeopleMergePrompt(payload) }] }],
     text: { format: personMergeResponseFormat },
-    max_output_tokens: 1_200,
-  }, trace)
+    // The one full-evidence pass is where a careful portrait is produced.
+    // Give it enough room to select claims and still reason conservatively.
+    max_output_tokens: 1_800,
+  }, trace, signal)
   return parsePersonMerge(responseOutputText(response))
 }
 
-async function mergePeopleWithChat(provider, model, payload, trace) {
+async function mergePeopleWithChat(provider, model, payload, trace, signal) {
   const content = [{ type: 'text', text: `${buildPeopleMergePrompt(payload)}\nReturn only the requested JSON object, without Markdown.` }]
   try {
     const response = await providerRequest(provider, 'chat/completions', {
       model,
       messages: [{ role: 'user', content }],
       response_format: personMergeChatResponseFormat,
-      max_tokens: 1_200,
-    }, trace)
+      max_tokens: 1_800,
+    }, trace, signal)
     return parsePersonMerge(response?.choices?.[0]?.message?.content || '')
   } catch (error) {
     if (!canFallbackToJsonObject(error)) throw error
@@ -1294,8 +2087,8 @@ async function mergePeopleWithChat(provider, model, payload, trace) {
       model,
       messages: [{ role: 'user', content }],
       response_format: { type: 'json_object' },
-      max_tokens: 1_200,
-    }, trace)
+      max_tokens: 1_800,
+    }, trace, signal)
     return parsePersonMerge(response?.choices?.[0]?.message?.content || '')
   }
 }
@@ -1307,17 +2100,17 @@ function parseTaskGuidance(raw) {
   } catch { throw new Error('Task guidance result could not be parsed') }
 }
 
-async function taskGuidanceWithResponses(provider, model, payload, trace) {
+async function taskGuidanceWithResponses(provider, model, payload, trace, signal) {
   const response = await providerRequest(provider, 'responses', {
     model,
     input: [{ role: 'user', content: [{ type: 'input_text', text: buildTaskGuidancePrompt(payload) }] }],
     text: { format: taskGuidanceResponseFormat },
     max_output_tokens: 1_200,
-  }, trace)
+  }, trace, signal)
   return parseTaskGuidance(responseOutputText(response))
 }
 
-async function taskGuidanceWithChat(provider, model, payload, trace) {
+async function taskGuidanceWithChat(provider, model, payload, trace, signal) {
   const content = [{ type: 'text', text: `${buildTaskGuidancePrompt(payload)}\nReturn only the requested JSON object, without Markdown.` }]
   try {
     const response = await providerRequest(provider, 'chat/completions', {
@@ -1325,7 +2118,7 @@ async function taskGuidanceWithChat(provider, model, payload, trace) {
       messages: [{ role: 'user', content }],
       response_format: taskGuidanceChatResponseFormat,
       max_tokens: 1_200,
-    }, trace)
+    }, trace, signal)
     return parseTaskGuidance(response?.choices?.[0]?.message?.content || '')
   } catch (error) {
     if (!canFallbackToJsonObject(error)) throw error
@@ -1335,7 +2128,7 @@ async function taskGuidanceWithChat(provider, model, payload, trace) {
       messages: [{ role: 'user', content }],
       response_format: { type: 'json_object' },
       max_tokens: 1_200,
-    }, trace)
+    }, trace, signal)
     return parseTaskGuidance(response?.choices?.[0]?.message?.content || '')
   }
 }
@@ -1346,6 +2139,10 @@ function canFallbackToChat(error) {
   // the same large prompt to Chat Completions would double latency and tokens.
   const status = Number(error?.status)
   const message = error instanceof Error ? error.message : ''
+  // NewAPI-style relays sometimes return HTTP 500 while decoding a Responses
+  // tool/output item. This is a protocol incompatibility, not a transient
+  // model failure, so `auto` must switch protocols immediately.
+  if (status === 500 && /cannot unmarshal object into Go struct field .*?(?:tools|ResponsesOutputContent|content)/i.test(message)) return true
   if ([404, 405, 415, 501].includes(status)) return true
   const explicitlyUnsupported = /(?:responses|endpoint|route|url|text[._ ]?format|json[._ ]?schema|structured output)/i.test(message)
     && /(?:not found|unsupported|not implemented|unknown|invalid|does not support)/i.test(message)
@@ -1354,33 +2151,48 @@ function canFallbackToChat(error) {
 }
 
 function canFallbackToJsonObject(error) {
-  if (![400, 422].includes(Number(error?.status))) return false
+  const status = Number(error?.status)
   const message = error instanceof Error ? error.message : ''
+  if (status === 500 && /cannot unmarshal object into Go struct field .*?(?:tools|ResponsesOutputContent|content)/i.test(message)) return true
+  if (![400, 422].includes(status)) return false
   return /(?:response[._ ]?format|json[._ ]?schema|structured output|schema)/i.test(message)
     && /(?:unsupported|not implemented|unknown|invalid|does not support)/i.test(message)
 }
 
-async function analyze(payload) {
+function preferredAutoMode(provider) {
+  return provider.apiMode === 'auto' ? providerApiModeById.get(provider.id) ?? 'responses' : provider.apiMode
+}
+
+function rememberAutoMode(provider, mode) {
+  if (provider.apiMode === 'auto') providerApiModeById.set(provider.id, mode)
+}
+
+async function analyze(payload, signal) {
   validatePayload(payload)
   return withProviderChannel(async (provider, lease) => {
     const trace = createProviderTrace(provider, lease.queueWaitMs)
     let analysis
     let apiModeUsed = provider.apiMode
     try {
-      if (provider.apiMode === 'responses') {
-        analysis = await analyzeWithResponses(provider, provider.model, payload, trace)
-      } else if (provider.apiMode === 'chat-completions') {
-        analysis = await analyzeWithChat(provider, provider.model, payload, trace)
-      } else {
+      const preferredMode = preferredAutoMode(provider)
+      if (preferredMode === 'responses') {
         try {
-          analysis = await analyzeWithResponses(provider, provider.model, payload, trace)
+          analysis = await analyzeWithResponses(provider, provider.model, payload, trace, signal)
+          rememberAutoMode(provider, 'responses')
           apiModeUsed = 'responses'
         } catch (error) {
-          if (!canFallbackToChat(error)) throw error
-          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-endpoint-unsupported')
-          analysis = await analyzeWithChat(provider, provider.model, payload, trace)
+          if (provider.apiMode !== 'auto' || !canFallbackToChat(error)) throw error
+          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-protocol-incompatible')
+          rememberAutoMode(provider, 'chat-completions')
+          analysis = await analyzeWithChat(provider, provider.model, payload, trace, signal)
           apiModeUsed = 'chat-completions'
         }
+      } else if (preferredMode === 'chat-completions') {
+        analysis = await analyzeWithChat(provider, provider.model, payload, trace, signal)
+        rememberAutoMode(provider, 'chat-completions')
+        apiModeUsed = 'chat-completions'
+      } else {
+        throw new Error(`Unsupported provider API mode: ${preferredMode}`)
       }
     } catch (error) {
       throw attachProviderMetadata(error, trace)
@@ -1403,30 +2215,35 @@ async function analyze(payload) {
       receivedRecordCount: payload.records.length,
       metadata: { provider: providerTraceMetadata(trace) },
     }
-  })
+  }, signal)
 }
 
-async function analyzePeopleRecords(payload) {
+async function analyzePeopleRecords(payload, signal) {
   validatePayload(payload)
   return withProviderChannel(async (provider, lease) => {
     const trace = createProviderTrace(provider, lease.queueWaitMs)
     let people
     let apiModeUsed = provider.apiMode
     try {
-      if (provider.apiMode === 'responses') {
-        people = await analyzePeopleWithResponses(provider, provider.model, payload, trace)
-      } else if (provider.apiMode === 'chat-completions') {
-        people = await analyzePeopleWithChat(provider, provider.model, payload, trace)
-      } else {
+      const preferredMode = preferredAutoMode(provider)
+      if (preferredMode === 'responses') {
         try {
-          people = await analyzePeopleWithResponses(provider, provider.model, payload, trace)
+          people = await analyzePeopleWithResponses(provider, provider.model, payload, trace, signal)
+          rememberAutoMode(provider, 'responses')
           apiModeUsed = 'responses'
         } catch (error) {
-          if (!canFallbackToChat(error)) throw error
-          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-endpoint-unsupported')
-          people = await analyzePeopleWithChat(provider, provider.model, payload, trace)
+          if (provider.apiMode !== 'auto' || !canFallbackToChat(error)) throw error
+          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-protocol-incompatible')
+          rememberAutoMode(provider, 'chat-completions')
+          people = await analyzePeopleWithChat(provider, provider.model, payload, trace, signal)
           apiModeUsed = 'chat-completions'
         }
+      } else if (preferredMode === 'chat-completions') {
+        people = await analyzePeopleWithChat(provider, provider.model, payload, trace, signal)
+        rememberAutoMode(provider, 'chat-completions')
+        apiModeUsed = 'chat-completions'
+      } else {
+        throw new Error(`Unsupported provider API mode: ${preferredMode}`)
       }
     } catch (error) {
       throw attachProviderMetadata(error, trace)
@@ -1438,11 +2255,41 @@ async function analyzePeopleRecords(payload) {
       receivedRecordCount: payload.records.length,
       metadata: { provider: providerTraceMetadata(trace) },
     }
-  })
+  }, signal)
 }
 
 function validatePeopleMergePayload(payload) {
   const name = cleanString(payload?.person?.name, 120)
+  const evidence = Array.isArray(payload?.person?.evidence)
+    ? payload.person.evidence.filter((claim) => claim && typeof claim === 'object').map((claim) => ({
+      // Preserve the client-generated stable evidence id. The merge response
+      // only selects these ids; dropping it here makes every returned claim
+      // impossible to resolve after validation.
+      id: cleanString(claim.id, 160) || stablePersonClaimId({
+        kind: claim.kind === 'preference' ? 'preference' : 'fact',
+        text: cleanString(claim.text, 360),
+        quote: cleanString(claim.quote, 120),
+        sourceIds: Array.isArray(claim.sourceIds) ? claim.sourceIds : [],
+      }),
+      kind: claim.kind === 'preference' ? 'preference' : 'fact',
+      text: cleanString(claim.text, 360),
+      quote: cleanString(claim.quote, 120),
+      sourceIds: Array.isArray(claim.sourceIds) ? [...new Set(claim.sourceIds.map(String).filter(Boolean))].slice(0, 12) : [],
+      evidenceStrength: claim.evidenceStrength === 'repeated' ? 'repeated' : 'single',
+      category: personEvidenceCategories.has(claim.category) ? claim.category : 'background',
+      stability: personEvidenceStabilities.has(claim.stability)
+        ? claim.stability
+        : claim.evidenceStrength === 'repeated' ? 'repeated' : 'single',
+      importanceScore: Number.isFinite(Number(claim.importanceScore))
+        ? Math.max(0, Math.min(10, Number(claim.importanceScore)))
+        : null,
+      portraitEligible: claim.portraitEligible !== false
+        && claim.category !== 'temporary'
+        && claim.category !== 'filler',
+      firstObservedAt: cleanString(claim.firstObservedAt, 80) || null,
+      lastObservedAt: cleanString(claim.lastObservedAt, 80) || null,
+    })).filter((claim) => claim.text && claim.quote && claim.sourceIds.length).slice(0, 96)
+    : []
   const facts = Array.isArray(payload?.person?.facts)
     ? payload.person.facts.map((fact) => cleanString(fact, 360)).filter(Boolean).slice(0, 48)
     : []
@@ -1452,15 +2299,27 @@ function validatePeopleMergePayload(payload) {
   const advice = Array.isArray(payload?.person?.advice)
     ? payload.person.advice.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 9)
     : []
-  if (!name || facts.length < 2) throw new Error('人物归并至少需要名称和两条已核验事实。')
+  const profileNotes = cleanString(payload?.person?.profileNotes, 6_000) || null
+  if (!name || (!evidence.length && facts.length < 2 && !profileNotes)) throw new Error('人物归并至少需要名称和一条已核验引文证据，或用户确认的人物底稿。')
   return {
     person: {
       name,
+      evidence,
       facts,
       preferences,
       advice,
-      portrait: cleanString(payload?.person?.portrait, 360) || null,
+      portrait: cleanString(payload?.person?.portrait, 1800) || null,
+      profileNotes,
     },
+    repair: payload?.repair && typeof payload.repair === 'object'
+      ? {
+        issues: Array.isArray(payload.repair.issues) ? payload.repair.issues.map((item) => cleanString(item, 260)).filter(Boolean).slice(0, 8) : [],
+        previousBlocks: Array.isArray(payload.repair.previousBlocks) ? payload.repair.previousBlocks.map((item) => ({
+          text: cleanString(item?.text, 500),
+          claimIds: Array.isArray(item?.claimIds) ? item.claimIds.map(String).slice(0, 12) : [],
+        })).filter((item) => item.text).slice(0, 8) : [],
+      }
+      : null,
     settings: {
       promptInstructions: {
         peopleMerge: cleanString(payload?.settings?.promptInstructions?.peopleMerge, 6000),
@@ -1469,41 +2328,114 @@ function validatePeopleMergePayload(payload) {
   }
 }
 
-async function analyzePeopleMerge(payload) {
+async function analyzePeopleMerge(payload, signal) {
   const normalized = validatePeopleMergePayload(payload)
   return withProviderChannel(async (provider, lease) => {
     const trace = createProviderTrace(provider, lease.queueWaitMs)
     let result
     let apiModeUsed = provider.apiMode
     try {
-      if (provider.apiMode === 'responses') {
-        result = await mergePeopleWithResponses(provider, provider.model, normalized, trace)
-      } else if (provider.apiMode === 'chat-completions') {
-        result = await mergePeopleWithChat(provider, provider.model, normalized, trace)
-      } else {
+      const preferredMode = preferredAutoMode(provider)
+      if (preferredMode === 'responses') {
         try {
-          result = await mergePeopleWithResponses(provider, provider.model, normalized, trace)
+          result = await mergePeopleWithResponses(provider, provider.model, normalized, trace, signal)
+          rememberAutoMode(provider, 'responses')
           apiModeUsed = 'responses'
         } catch (error) {
-          if (!canFallbackToChat(error)) throw error
-          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-endpoint-unsupported')
-          result = await mergePeopleWithChat(provider, provider.model, normalized, trace)
+          if (provider.apiMode !== 'auto' || !canFallbackToChat(error)) throw error
+          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-protocol-incompatible')
+          rememberAutoMode(provider, 'chat-completions')
+          result = await mergePeopleWithChat(provider, provider.model, normalized, trace, signal)
           apiModeUsed = 'chat-completions'
         }
+      } else if (preferredMode === 'chat-completions') {
+        result = await mergePeopleWithChat(provider, provider.model, normalized, trace, signal)
+        rememberAutoMode(provider, 'chat-completions')
+        apiModeUsed = 'chat-completions'
+      } else {
+        throw new Error(`Unsupported provider API mode: ${preferredMode}`)
       }
     } catch (error) {
       throw attachProviderMetadata(error, trace)
     }
+    const registry = new Map(normalized.person.evidence.map((claim) => [claim.id, claim]))
+    const resolveClaimId = (value, kind) => {
+      const candidate = typeof value === 'string' ? value : value && typeof value === 'object' ? value.id : null
+      if (candidate && registry.get(String(candidate))?.kind === kind) return String(candidate)
+      if (!value || typeof value !== 'object') return null
+      const text = normalizedText(value.text)
+      const quote = normalizedText(value.quote)
+      const match = [...registry.values()].find((claim) => claim.kind === kind && (
+        (text && normalizedText(claim.text) === text) || (quote && normalizedText(claim.quote) === quote)
+      ))
+      return match?.id ?? null
+    }
+    const normalizeClaimIds = (values, kind, limit) => {
+      const source = Array.isArray(values) ? values : []
+      return [...new Set(source.map((value) => resolveClaimId(value, kind)).filter((id) => {
+        const claim = id ? registry.get(id) : null
+        return Boolean(claim)
+          && claim.portraitEligible !== false
+          && claim.category !== 'temporary'
+          && claim.category !== 'filler'
+      }))].slice(0, limit)
+    }
+    const factClaimIds = normalizeClaimIds(result.factClaimIds ?? result.facts, 'fact', 12)
+    const preferenceClaimIds = normalizeClaimIds(result.preferenceClaimIds ?? result.preferences, 'preference', 8)
+    const manualClaimId = 'user-profile-notes'
+    const normalizeBlock = (value) => {
+      if (!value || typeof value !== 'object') return null
+      const text = cleanString(value.text, 1800)
+      const claimIds = [...new Set(Array.isArray(value.claimIds) ? value.claimIds.map(String).filter((id) => {
+        if (id === manualClaimId && normalized.person.profileNotes) return true
+        const claim = registry.get(id)
+        return Boolean(claim)
+          && claim.portraitEligible !== false
+          && claim.category !== 'temporary'
+          && claim.category !== 'filler'
+      }) : [])].slice(0, 12)
+      const reason = ['background', 'preference', 'habit', 'interaction', 'change', 'other'].includes(value.reason) ? value.reason : 'other'
+      if (!text || !claimIds.length) return null
+      const sourceIds = [...new Set(claimIds.flatMap((id) => registry.get(id)?.sourceIds ?? []))].slice(0, 12)
+      return { text, claimIds, sourceIds, reason }
+    }
+    const portraitBlocks = Array.isArray(result.portraitBlocks)
+      ? result.portraitBlocks.map(normalizeBlock).filter(Boolean).slice(0, 8)
+      : []
+    const normalizeAdvice = (value) => {
+      if (!value || typeof value !== 'object') return null
+      const text = cleanString(value.text, 360)
+      const claimIds = [...new Set(Array.isArray(value.claimIds) ? value.claimIds.map(String).filter((id) => {
+        const claim = registry.get(id)
+        return Boolean(claim)
+          && claim.portraitEligible !== false
+          && claim.category !== 'temporary'
+          && claim.category !== 'filler'
+      }) : [])].slice(0, 8)
+      return text && claimIds.length ? { text, claimIds } : null
+    }
+    const advice = Array.isArray(result.advice) ? result.advice.map(normalizeAdvice).filter(Boolean).slice(0, 4) : []
+    const facts = factClaimIds.map((id) => registry.get(id)).filter(Boolean).map((claim) => ({ text: claim.text, quote: claim.quote, sourceIds: claim.sourceIds }))
+    const preferences = preferenceClaimIds.map((id) => registry.get(id)).filter(Boolean).map((claim) => ({ text: claim.text, quote: claim.quote, sourceIds: claim.sourceIds }))
+    const portraitSourceIds = [...new Set(portraitBlocks.flatMap((block) => block.sourceIds))].slice(0, 12)
+    const portrait = portraitBlocks.map((block) => block.text).join('\n\n') || null
     return {
       model: provider.model,
       apiModeUsed,
-      facts: Array.isArray(result.facts) ? result.facts.map((fact) => cleanString(fact, 360)).filter(Boolean).slice(0, 12) : [],
-      preferences: Array.isArray(result.preferences) ? result.preferences.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 8) : [],
-      advice: Array.isArray(result.advice) ? result.advice.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 4) : [],
-      portrait: cleanString(result.portrait, 360) || null,
-      metadata: { provider: providerTraceMetadata(trace) },
+      facts,
+      preferences,
+      factClaimIds,
+      preferenceClaimIds,
+      advice,
+      portrait,
+      portraitBlocks,
+      portraitSourceIds,
+      coverageNote: cleanString(result.coverageNote, 240) || null,
+      profileNotesUsed: result.profileNotesUsed === true && portraitBlocks.some((block) => block.claimIds.includes(manualClaimId)),
+      portraitSchemaVersion: 1,
+      metadata: { provider: providerTraceMetadata(trace), portraitSchemaVersion: 1 },
     }
-  })
+  }, signal)
 }
 
 function validateTaskGuidancePayload(payload) {
@@ -1529,7 +2461,9 @@ function validateTaskGuidancePayload(payload) {
     facts: Array.isArray(person?.facts) ? person.facts.map((fact) => cleanString(fact, 360)).filter(Boolean).slice(0, 12) : [],
     preferences: Array.isArray(person?.preferences) ? person.preferences.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 8) : [],
     advice: Array.isArray(person?.advice) ? person.advice.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 4) : [],
-    portrait: cleanString(person?.portrait, 360) || null,
+    portrait: cleanString(person?.portrait, 1800) || null,
+    profileNotes: cleanString(person?.profileNotes, 6000) || null,
+    profileNotesUsed: person?.profileNotesUsed === true,
   })).filter((person) => person.name).slice(0, 6) : []
   const temperatureMin = Number(payload?.weather?.temperatureMin)
   const temperatureMax = Number(payload?.weather?.temperatureMax)
@@ -1555,27 +2489,32 @@ function validateTaskGuidancePayload(payload) {
   }
 }
 
-async function analyzeTaskGuidance(payload) {
+async function analyzeTaskGuidance(payload, signal) {
   const normalized = validateTaskGuidancePayload(payload)
   return withProviderChannel(async (provider, lease) => {
     const trace = createProviderTrace(provider, lease.queueWaitMs)
     let guidance
     let apiModeUsed = provider.apiMode
     try {
-      if (provider.apiMode === 'responses') {
-        guidance = await taskGuidanceWithResponses(provider, provider.model, normalized, trace)
-      } else if (provider.apiMode === 'chat-completions') {
-        guidance = await taskGuidanceWithChat(provider, provider.model, normalized, trace)
-      } else {
+      const preferredMode = preferredAutoMode(provider)
+      if (preferredMode === 'responses') {
         try {
-          guidance = await taskGuidanceWithResponses(provider, provider.model, normalized, trace)
+          guidance = await taskGuidanceWithResponses(provider, provider.model, normalized, trace, signal)
+          rememberAutoMode(provider, 'responses')
           apiModeUsed = 'responses'
         } catch (error) {
-          if (!canFallbackToChat(error)) throw error
-          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-endpoint-unsupported')
-          guidance = await taskGuidanceWithChat(provider, provider.model, normalized, trace)
+          if (provider.apiMode !== 'auto' || !canFallbackToChat(error)) throw error
+          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-protocol-incompatible')
+          rememberAutoMode(provider, 'chat-completions')
+          guidance = await taskGuidanceWithChat(provider, provider.model, normalized, trace, signal)
           apiModeUsed = 'chat-completions'
         }
+      } else if (preferredMode === 'chat-completions') {
+        guidance = await taskGuidanceWithChat(provider, provider.model, normalized, trace, signal)
+        rememberAutoMode(provider, 'chat-completions')
+        apiModeUsed = 'chat-completions'
+      } else {
+        throw new Error(`Unsupported provider API mode: ${preferredMode}`)
       }
     } catch (error) {
       throw attachProviderMetadata(error, trace)
@@ -1586,7 +2525,7 @@ async function analyzeTaskGuidance(payload) {
       guidance: Array.isArray(guidance) ? [...new Set(guidance.map((item) => cleanString(item, 360)).filter(Boolean))].slice(0, 4) : [],
       metadata: { provider: providerTraceMetadata(trace) },
     }
-  })
+  }, signal)
 }
 
 async function probeModels(payload) {
@@ -1606,13 +2545,36 @@ function providerPoolStatus(pool) {
     runtime: providerRuntimeMetadata(channel),
   }))
   const configured = configuredProviderChannels(pool)
-  const now = Date.now()
   const activeRequests = configured.reduce((total, channel) => total + providerRuntime(channel).activeRequests, 0)
-  const availableCapacity = configured.reduce((total, channel) => {
-    const runtime = providerRuntime(channel)
-    if (runtime.cooldownUntil > now) return total
-    return total + Math.max(0, channel.maxConcurrency - runtime.activeRequests)
-  }, 0)
+  const originGroups = new Map()
+  configured.forEach((channel) => {
+    const key = providerOriginKey(channel)
+    const group = originGroups.get(key)
+    if (group) group.push(channel)
+    else originGroups.set(key, [channel])
+  })
+  const sharedOrigins = [...originGroups.entries()].map(([key, group]) => {
+    const runtime = providerOriginRuntime(group[0])
+    const now = Date.now()
+    const configuredMaxConcurrency = configuredProviderOriginConcurrency(group, group[0])
+    runtime.configuredMaxConcurrency = configuredMaxConcurrency
+    const effectiveMaxConcurrency = effectiveProviderOriginConcurrency(group, group[0], runtime)
+    const cooldownRemainingMs = Math.max(0, runtime.cooldownUntil - now)
+    return {
+      key,
+      channelIds: group.map((channel) => channel.id),
+      activeRequests: runtime.activeRequests,
+      configuredMaxConcurrency,
+      effectiveMaxConcurrency,
+      availableCapacity: cooldownRemainingMs > 0 ? 0 : Math.max(0, effectiveMaxConcurrency - runtime.activeRequests),
+      cooldownUntil: cooldownRemainingMs > 0 ? new Date(runtime.cooldownUntil).toISOString() : null,
+      cooldownRemainingMs,
+      successfulRequests: runtime.successfulRequests,
+      failedRequests: runtime.failedRequests,
+    }
+  })
+  const availableCapacity = sharedOrigins.reduce((total, origin) => total + origin.availableCapacity, 0)
+  const effectiveMaxConcurrency = sharedOrigins.reduce((total, origin) => total + origin.effectiveMaxConcurrency, 0)
   return {
     ...editable,
     // `configured` is consumed by the task controls. It must describe the
@@ -1625,7 +2587,10 @@ function providerPoolStatus(pool) {
       activeRequests,
       availableCapacity,
       totalMaxConcurrency: configured.reduce((total, channel) => total + channel.maxConcurrency, 0),
-      coolingDownChannelCount: configured.filter((channel) => providerRuntime(channel).cooldownUntil > now).length,
+      effectiveMaxConcurrency,
+      sharedOriginCount: sharedOrigins.length,
+      sharedOrigins,
+      coolingDownChannelCount: channels.filter((channel) => providerRuntime(channel).cooldownUntil > Date.now() || providerOriginRuntime(channel).cooldownUntil > Date.now()).length,
     },
   }
 }
@@ -1828,6 +2793,9 @@ export const server = http.createServer(async (request, response) => {
       if (query.length < 2) throw new Error('搜索地点至少需要两个字符')
       const normalizedQuery = query.slice(0, 180)
       const headers = { accept: 'application/json', 'user-agent': 'THEIA-personal-map/0.1 (local user search)' }
+      const requestSignal = requestAbortSignal(request, response)
+      const providerController = new AbortController()
+      const providerSignal = () => AbortSignal.any([requestSignal, providerController.signal, AbortSignal.timeout(7_000)])
       const keepValid = (items) => items.filter((item) => item.display_name && validCoordinate(item.lat, -90, 90) && validCoordinate(item.lon, -180, 180))
       const providers = [
         async () => {
@@ -1836,7 +2804,7 @@ export const server = http.createServer(async (request, response) => {
           endpoint.searchParams.set('limit', '8')
           endpoint.searchParams.set('accept-language', 'zh-CN,zh,en')
           endpoint.searchParams.set('q', normalizedQuery)
-          const upstream = await fetch(endpoint, { headers, signal: AbortSignal.timeout(7_000) })
+          const upstream = await fetch(endpoint, { headers, signal: providerSignal() })
           if (!upstream.ok) return []
           const payload = await upstream.json()
           return Array.isArray(payload) ? keepValid(payload.map((item) => ({
@@ -1853,7 +2821,7 @@ export const server = http.createServer(async (request, response) => {
           const endpoint = new URL('https://photon.komoot.io/api/')
           endpoint.searchParams.set('q', normalizedQuery)
           endpoint.searchParams.set('limit', '8')
-          const upstream = await fetch(endpoint, { headers, signal: AbortSignal.timeout(7_000) })
+          const upstream = await fetch(endpoint, { headers, signal: providerSignal() })
           if (!upstream.ok) return []
           const payload = await upstream.json()
           return Array.isArray(payload?.features) ? keepValid(payload.features.map((item) => {
@@ -1876,7 +2844,7 @@ export const server = http.createServer(async (request, response) => {
           endpoint.searchParams.set('singleLine', normalizedQuery)
           endpoint.searchParams.set('maxLocations', '8')
           endpoint.searchParams.set('outFields', 'Addr_Type,Type,PlaceName')
-          const upstream = await fetch(endpoint, { headers, signal: AbortSignal.timeout(7_000) })
+          const upstream = await fetch(endpoint, { headers, signal: providerSignal() })
           if (!upstream.ok) return []
           const payload = await upstream.json()
           return Array.isArray(payload?.candidates) ? keepValid(payload.candidates.map((item) => ({
@@ -1888,7 +2856,7 @@ export const server = http.createServer(async (request, response) => {
           }))) : []
         },
         async () => {
-          const signal = AbortSignal.timeout(7_000)
+          const signal = providerSignal()
           const searchEndpoint = new URL('https://www.wikidata.org/w/api.php')
           searchEndpoint.searchParams.set('action', 'wbsearchentities')
           searchEndpoint.searchParams.set('search', normalizedQuery)
@@ -1926,13 +2894,22 @@ export const server = http.createServer(async (request, response) => {
           endpoint.searchParams.set('count', '8')
           endpoint.searchParams.set('language', 'zh')
           endpoint.searchParams.set('format', 'json')
-          const upstream = await fetch(endpoint, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(7_000) })
+          const upstream = await fetch(endpoint, { headers: { accept: 'application/json' }, signal: providerSignal() })
           if (!upstream.ok) return []
           const payload = await upstream.json()
           return Array.isArray(payload?.results) ? keepValid(payload.results.map((item) => ({ display_name: [cleanString(item?.name, 120), cleanString(item?.admin1, 120), cleanString(item?.country, 120)].filter(Boolean).join('，'), lat: String(item?.latitude ?? ''), lon: String(item?.longitude ?? ''), kind: cleanString(item?.feature_code, 80) }))) : []
         },
       ]
-      const settled = await Promise.allSettled(providers.map((provider) => provider()))
+      const attempts = providers.map((provider) => provider())
+      const firstUseful = new Promise((resolveFirst) => {
+        attempts.forEach((attempt) => {
+          void attempt.then((items) => {
+            if (items.length) resolveFirst([{ status: 'fulfilled', value: items }])
+          }, () => undefined)
+        })
+      })
+      const settled = await Promise.race([firstUseful, Promise.allSettled(attempts)])
+      providerController.abort()
       const merged = settled.flatMap((result) => result.status === 'fulfilled' ? result.value : [])
       const seen = new Set()
       const results = merged.filter((item) => {
@@ -1977,7 +2954,7 @@ export const server = http.createServer(async (request, response) => {
       await saveAppSettings(await readBody(request))
       sendJson(response, 200, await editableSettings())
     } catch (error) {
-      sendJson(response, 400, { error: error instanceof Error ? error.message : '无法保存通用设置' })
+      sendRequestError(response, error, '无法保存通用设置')
     }
     return
   }
@@ -1985,7 +2962,7 @@ export const server = http.createServer(async (request, response) => {
     try {
       sendJson(response, 200, await saveBackgroundAsset(await readBody(request)))
     } catch (error) {
-      sendJson(response, 400, { error: error instanceof Error ? error.message : '无法保存背景图片' })
+      sendRequestError(response, error, '无法保存背景图片')
     }
     return
   }
@@ -2014,6 +2991,7 @@ export const server = http.createServer(async (request, response) => {
   if (providerCollectionPath && request.method === 'POST') {
     try {
       const result = await createProviderChannel(await readBody(request))
+      if (result.channel?.id) providerApiModeById.delete(result.channel.id)
       scheduleProviderDispatch()
       sendJson(response, 201, providerMutationStatus(result, result.channel?.id, result.warning))
     } catch (error) {
@@ -2032,6 +3010,7 @@ export const server = http.createServer(async (request, response) => {
         ? { ...payload, ...(payload.action === 'discover-models' || payload.action === 'refresh-models' ? { refreshModels: true } : {}) }
         : payload
       const result = await updateProviderChannel(channelId, update)
+      providerApiModeById.delete(channelId)
       scheduleProviderDispatch()
       sendJson(response, 200, providerMutationStatus(result, channelId, result.warning))
     } catch (error) {
@@ -2044,6 +3023,11 @@ export const server = http.createServer(async (request, response) => {
     try { channelId = decodeURIComponent(providerItemMatch[1]) } catch { channelId = providerItemMatch[1] }
     try {
       const pool = await deleteProviderChannel(channelId)
+      providerApiModeById.delete(channelId)
+      providerRuntimeById.delete(channelId)
+      // Origin runtimes are keyed by endpoint rather than channel id. They
+      // are intentionally retained while another channel still references
+      // the endpoint; stale entries are harmless while an active run drains.
       scheduleProviderDispatch()
       sendJson(response, 200, providerMutationStatus(pool))
     } catch (error) {
@@ -2081,6 +3065,35 @@ export const server = http.createServer(async (request, response) => {
     }
     return
   }
+  if (requestPath === '/api/sync/intel/meta' && request.method === 'GET') {
+    try {
+      sendJson(response, 200, await loadSharedIntelMeta())
+    } catch (error) {
+      sendJson(response, 500, { error: error instanceof Error ? error.message : '无法读取本机原始聊天归档' })
+    }
+    return
+  }
+  if (requestPath === '/api/sync/intel' && request.method === 'GET') {
+    try {
+      const archive = await loadSharedIntel()
+      sendJson(response, 200, archive)
+    } catch (error) {
+      sendJson(response, 500, { error: error instanceof Error ? error.message : '无法读取本机原始聊天归档' })
+    }
+    return
+  }
+  if (requestPath === '/api/sync/intel' && request.method === 'POST') {
+    try {
+      sendJson(response, 200, await saveSharedIntel(await readBody(request)))
+    } catch (error) {
+      const status = Number(error?.statusCode) === 409 ? 409 : Number(error?.status) === 413 ? 413 : 400
+      sendJson(response, status, {
+        error: error instanceof Error ? error.message : '无法保存本机原始聊天归档',
+        ...(status === 409 ? { currentUpdatedAt: error?.currentUpdatedAt ?? null } : {}),
+      })
+    }
+    return
+  }
   if (request.url === '/api/sync/snapshot' && request.method === 'POST') {
     try {
       const saved = await saveSharedState(await readBody(request))
@@ -2088,7 +3101,11 @@ export const server = http.createServer(async (request, response) => {
       // archive just to learn that its write succeeded.
       sendJson(response, 200, { updatedAt: saved.updatedAt, data: null })
     } catch (error) {
-      sendJson(response, 400, { error: error instanceof Error ? error.message : '无法保存本机同步数据' })
+      const status = Number(error?.statusCode) === 409 ? 409 : Number(error?.status) === 413 ? 413 : 400
+      sendJson(response, status, {
+        error: error instanceof Error ? error.message : '无法保存本机同步数据',
+        ...(status === 409 ? { currentUpdatedAt: error?.currentUpdatedAt ?? null } : {}),
+      })
     }
     return
   }
@@ -2096,6 +3113,7 @@ export const server = http.createServer(async (request, response) => {
     try {
       const payload = await readBody(request)
       const saved = await saveProviderConfig(payload)
+      if (saved.config?.id) providerApiModeById.delete(saved.config.id)
       scheduleProviderDispatch()
       const pool = await loadProviderConfigs()
       sendJson(response, 200, providerMutationStatus(pool, saved.config?.id, saved.warning))
@@ -2115,6 +3133,9 @@ export const server = http.createServer(async (request, response) => {
   if (requestPath === '/api/ai/config' && request.method === 'DELETE') {
     try {
       await resetProviderConfig()
+      providerApiModeById.clear()
+      providerRuntimeById.clear()
+      providerOriginRuntimeByKey.clear()
       scheduleProviderDispatch()
       sendJson(response, 200, await loadProviderPoolStatus())
     } catch (error) {
@@ -2122,7 +3143,89 @@ export const server = http.createServer(async (request, response) => {
     }
     return
   }
+  if (requestPath === '/api/ai/sessions' && request.method === 'POST') {
+    const session = createAiSession()
+    sendJson(response, 201, { id: session.id, maxEnqueue: aiSessionMaxEnqueue })
+    return
+  }
+  const aiSessionMatch = requestPath.match(/^\/api\/ai\/sessions\/([0-9a-f-]{20,80})(?:\/(enqueue|results))?$/i)
+  if (aiSessionMatch) {
+    const [, sessionId, action] = aiSessionMatch
+    const session = aiSessions.get(sessionId)
+    if (!session || session.cancelled) {
+      sendJson(response, 404, { error: 'AI extraction session was not found' })
+      return
+    }
+    if (!action && request.method === 'DELETE') {
+      const pending = session.queue.length + session.inFlight.size
+      session.cancelled = true
+      session.queue.length = 0
+      session.inFlight.forEach((job) => job.controller?.abort())
+      aiSessions.delete(sessionId)
+      sendJson(response, 200, { cancelled: true, pending })
+      return
+    }
+    if (action === 'enqueue' && request.method === 'POST') {
+      try {
+        const batch = await readBody(request)
+        const ids = enqueueAiSessionJobs(session, batch?.requests)
+        sendJson(response, 202, {
+          acceptedIds: ids,
+          queued: session.queue.length,
+          inFlight: session.inFlight.size,
+          pending: session.queue.length + session.inFlight.size,
+        })
+      } catch (error) {
+        sendRequestError(response, error, 'Unable to enqueue AI extraction jobs')
+      }
+      return
+    }
+    if (action === 'results' && request.method === 'GET') {
+      const resultUrl = new URL(request.url || '/', 'http://127.0.0.1')
+      const acknowledgement = resultUrl.searchParams.get('ack') ?? ''
+      const acknowledgedIds = acknowledgement.split(',').map((value) => Number(value)).filter(Number.isSafeInteger)
+      const retainUntilAcknowledged = resultUrl.searchParams.get('protocol') === 'ack-v1'
+      sendJson(response, 200, readAiSessionResults(session, undefined, acknowledgedIds, retainUntilAcknowledged))
+      return
+    }
+    sendJson(response, 405, { error: 'Unsupported AI extraction session operation' })
+    return
+  }
+  if (requestPath === '/api/ai/batch' && request.method === 'POST') {
+    const signal = requestAbortSignal(request, response)
+    try {
+      const batch = await readBody(request)
+      const entries = Array.isArray(batch?.requests) ? batch.requests : []
+      if (!entries.length) throw new Error('批量模型请求不能为空')
+      if (entries.length > 40) throw new Error('单个批量模型请求最多包含 40 个片段')
+      const results = await Promise.all(entries.map(async (entry, index) => {
+        const id = Number(entry?.id)
+        const safeId = Number.isSafeInteger(id) ? id : index + 1
+        const path = entry?.workflow === 'people' ? '/api/ai/people' : entry?.workflow === 'tasks' ? '/api/ai/analyze' : ''
+        if (!path || !entry?.payload || typeof entry.payload !== 'object') {
+          return { id: safeId, ok: false, status: 400, error: '批量模型子请求无效' }
+        }
+        try {
+          const result = await dispatchLocalAiRequest(path, entry.payload, signal)
+          return { id: safeId, ok: true, result }
+        } catch (error) {
+          return {
+            id: safeId,
+            ok: false,
+            status: Number(error?.status) || 500,
+            retryAfter: Number(error?.retryAfter) || undefined,
+            error: cleanString(error instanceof Error ? error.message : '本机模型子请求失败', 2_000),
+          }
+        }
+      }))
+      sendJson(response, 200, { results })
+    } catch (error) {
+      sendRequestError(response, error, '批量模型请求失败')
+    }
+    return
+  }
   if (request.url === '/api/ai/analyze' && request.method === 'POST') {
+    const signal = requestAbortSignal(request, response)
     let payload
     let taskLog
     const startedAt = Date.now()
@@ -2136,7 +3239,7 @@ export const server = http.createServer(async (request, response) => {
         recordCount: Array.isArray(payload?.records) ? payload.records.length : 0,
         ...segmentDebugFields(conversation),
       })
-      const result = await analyze(payload)
+      const result = await analyze(payload, signal)
       logAiDebug('request_succeeded', {
         conversationId: cleanString(conversation.id, 180) || null,
         conversationName: cleanString(conversation.name, 180) || null,
@@ -2177,6 +3280,7 @@ export const server = http.createServer(async (request, response) => {
     return
   }
   if (request.url === '/api/ai/people' && request.method === 'POST') {
+    const signal = requestAbortSignal(request, response)
     let payload
     let taskLog
     const startedAt = Date.now()
@@ -2191,7 +3295,7 @@ export const server = http.createServer(async (request, response) => {
         ...segmentDebugFields(conversation),
         message: Array.isArray(payload?.records) ? `发言方向：你 ${directionStats(payload.records).self}，对方 ${directionStats(payload.records).other}，未确认 ${directionStats(payload.records).unknown}；有名称 ${directionStats(payload.records).named} 条。` : undefined,
       })
-      const result = await analyzePeopleRecords(payload)
+      const result = await analyzePeopleRecords(payload, signal)
       logAiDebug('people_request_succeeded', {
         conversationId: cleanString(conversation.id, 180) || null,
         conversationName: cleanString(conversation.name, 180) || null,
@@ -2230,23 +3334,33 @@ export const server = http.createServer(async (request, response) => {
     return
   }
   if (request.url === '/api/ai/people/merge' && request.method === 'POST') {
+    const signal = requestAbortSignal(request, response)
     let payload
     let taskLog
+    let promptForLog
     const startedAt = Date.now()
     try {
       payload = await readBody(request)
       taskLog = await startTaskLog('people-consolidation', payload)
-      const result = await analyzePeopleMerge(payload)
+      promptForLog = buildPeopleMergePrompt(validatePeopleMergePayload(payload))
+      const result = await analyzePeopleMerge(payload, signal)
       logAiDebug('people_merge_succeeded', {
         personName: cleanString(payload?.person?.name, 120) || null,
         factCount: Array.isArray(payload?.person?.facts) ? payload.person.facts.length : 0,
+        rawClaimCount: Array.isArray(payload?.person?.evidence) ? payload.person.evidence.length : 0,
         resultFactCount: result.facts.length,
+        acceptedClaimCount: result.facts.length + result.preferences.length,
+        factClaimIds: Array.isArray(result.factClaimIds) ? result.factClaimIds : [],
+        preferenceClaimIds: Array.isArray(result.preferenceClaimIds) ? result.preferenceClaimIds : [],
+        portraitGenerated: Boolean(result.portrait),
+        portraitBlockCount: Array.isArray(result.portraitBlocks) ? result.portraitBlocks.length : 0,
+        portraitSchemaVersion: result.portraitSchemaVersion ?? null,
         model: result.model,
         apiMode: result.apiModeUsed,
         ...providerDebugFields(result),
         durationMs: Date.now() - startedAt,
       })
-      await finishTaskLog(taskLog, 'succeeded', { durationMs: Date.now() - startedAt, response: result })
+      await finishTaskLog(taskLog, 'succeeded', { durationMs: Date.now() - startedAt, prompt: promptForLog, response: result })
       sendJson(response, 200, result)
     } catch (error) {
       logAiDebug('people_merge_failed', {
@@ -2268,13 +3382,14 @@ export const server = http.createServer(async (request, response) => {
     return
   }
   if (request.url === '/api/ai/task-guidance' && request.method === 'POST') {
+    const signal = requestAbortSignal(request, response)
     let payload
     let taskLog
     const startedAt = Date.now()
     try {
       payload = await readBody(request)
       taskLog = await startTaskLog('task-guidance', payload)
-      const result = await analyzeTaskGuidance(payload)
+      const result = await analyzeTaskGuidance(payload, signal)
       logAiDebug('task_guidance_succeeded', {
         taskTitle: cleanString(payload?.quest?.title, 160) || null,
         peopleCount: Array.isArray(payload?.people) ? payload.people.length : 0,
@@ -2320,6 +3435,8 @@ export function startAiProxy() {
       const address = server.address()
       const listeningPort = address && typeof address !== 'string' ? address.port : port
       console.log(`AI proxy listening on http://127.0.0.1:${listeningPort}`)
+      void migrateLegacySharedIntel().catch((error) => console.warn(`[THEIA] archive migration skipped: ${error instanceof Error ? error.message : String(error)}`))
+      void compactExistingTaskLogs()
       resolve(server)
     })
   })

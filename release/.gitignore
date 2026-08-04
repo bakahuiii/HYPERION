@@ -1,12 +1,19 @@
 # Mutable local data
 data/state.json
 data/chat-archive.json
+data/chat-archive.json.gz
+data/chat-archive.json.gz.tmp
+data/chat-archive.json.gz.*.tmp
+data/chat-archive.json.gz.lock
+data/chat-archive.meta.json
 data/settings.ini
 data/legacy-provider.json
 data/electron/
 data/runtime/
 logs/*.jsonl
+logs/*.jsonl.*
 logs/tasks/*.jsonl
+logs/tasks/*.jsonl.gz
 assets/img/avatars/*
 assets/img/backgrounds/*
 !assets/img/avatars/.gitkeep

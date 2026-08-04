@@ -1,8 +1,23 @@
 import type { IntelItem } from '../types'
 
 const HISTORY_WINDOW_MS = 61 * 24 * 60 * 60 * 1000
-const MAX_OVERLAP_RECORDS = 24
-const MAX_OVERLAP_CHARS = 4_000
+// Keep each provider request well below the context/timeout edge of
+// compatibility relays. The prompt contains a sizeable fixed instruction
+// block and reserves output tokens, so the record budget must stay conservative
+// even when a conversation has short messages. Full coverage is preserved by
+// sending more ordered segments rather than one oversized request.
+const MAX_SEGMENT_CORE_RECORDS = 48
+const MAX_SEGMENT_CORE_CHARS = 4_000
+const MAX_OVERLAP_RECORDS = 6
+const MAX_OVERLAP_CHARS = 1_000
+
+// Person extraction needs a wider chronological view than task extraction.
+// Keep this budget independent: changing task segmentation must not silently
+// make portraits less contextual or make the task request larger.
+const PEOPLE_SEGMENT_CORE_RECORDS = 320
+const PEOPLE_SEGMENT_CORE_CHARS = 24_000
+const PEOPLE_OVERLAP_RECORDS = 16
+const PEOPLE_OVERLAP_CHARS = 3_000
 
 export interface ConversationAnalysisJob {
   /** Stable parent conversation ID, not a per-segment surrogate. */
@@ -68,23 +83,27 @@ function conversationName(item: IntelItem) {
   return `${item.source} - ${month}`
 }
 
-function conversationKind(item: IntelItem): NonNullable<IntelItem['conversationKind']> {
-  return item.conversationKind ?? 'unknown'
+export function inferConversationKind(item: Pick<IntelItem, 'conversationId' | 'conversationKind' | 'conversationName'>): NonNullable<IntelItem['conversationKind']> {
+  if (item.conversationKind && item.conversationKind !== 'unknown') return item.conversationKind
+  const label = `${item.conversationName ?? ''}/${item.conversationId ?? ''}`
+  if (/(?:群聊|群组|群消息|group|groups|chatroom)/i.test(label)) return 'group'
+  if (/(?:私聊|单聊|好友|friend|direct|personal)/i.test(label)) return 'direct'
+  return 'unknown'
 }
 
 function recordSize(item: IntelItem) {
-  // This is deliberately a conservative character estimate. It includes the
-  // compact JSON row scaffolding and avoids a brittle fixed message-count cap.
-  return Math.max(96, (item.content || item.summary || '').length + (item.capturedAt || '').length + (item.speaker || '').length + (item.messageType || '').length + 72)
-}
-
-function parentCharacterBudget(records: IntelItem[]) {
-  const total = records.reduce((sum, record) => sum + recordSize(record), 0)
-  // Longer conversations receive smaller requests on a logarithmic curve. The
-  // entire conversation is still covered by sequential core ranges; this only
-  // controls the size of an individual provider request.
-  const scale = Math.log2(Math.max(2, total / 55_000))
-  return Math.round(Math.max(14_000, Math.min(34_000, 48_000 / Math.max(1, scale))))
+  // Mirror the six-field compact row sent by aiClient/server instead of only
+  // counting message text. This includes sender labels, role metadata, JSON
+  // punctuation, and the timestamp in the segment budget.
+  const compactRow = [
+    0,
+    item.capturedAt || null,
+    item.messageType || null,
+    item.content || item.summary || '',
+    item.speaker || null,
+    item.speakerRole || 'unknown',
+  ]
+  return Math.max(96, JSON.stringify(compactRow).length + 8)
 }
 
 function orderedRecords(records: IntelItem[]) {
@@ -98,13 +117,13 @@ function orderedRecords(records: IntelItem[]) {
   })
 }
 
-function precedingOverlap(records: IntelItem[], coreStart: number) {
+function precedingOverlap(records: IntelItem[], coreStart: number, overlapRecords: number, overlapChars: number) {
   let start = coreStart
   let count = 0
   let chars = 0
-  while (start > 0 && count < MAX_OVERLAP_RECORDS) {
+  while (start > 0 && count < overlapRecords) {
     const previousSize = recordSize(records[start - 1])
-    if (count > 0 && chars + previousSize > MAX_OVERLAP_CHARS) break
+    if (count > 0 && chars + previousSize > overlapChars) break
     start -= 1
     count += 1
     chars += previousSize
@@ -112,8 +131,15 @@ function precedingOverlap(records: IntelItem[], coreStart: number) {
   return start
 }
 
-function buildSegments(id: string, name: string, kind: ConversationAnalysisJob['kind'], records: IntelItem[], now: number) {
-  const budget = parentCharacterBudget(records)
+function buildSegments(
+  id: string,
+  name: string,
+  kind: ConversationAnalysisJob['kind'],
+  records: IntelItem[],
+  now: number,
+  options: { coreRecords: number; coreChars: number; overlapRecords: number; overlapChars: number },
+) {
+  const budget = options.coreChars
   const drafts: Array<{
     records: IntelItem[]
     coreRecordIds: string[]
@@ -129,12 +155,13 @@ function buildSegments(id: string, name: string, kind: ConversationAnalysisJob['
     let usedChars = 0
     while (coreEnd < records.length) {
       const nextSize = recordSize(records[coreEnd])
-      if (coreEnd > coreStart && usedChars + nextSize > budget) break
+      const coreCount = coreEnd - coreStart
+      if (coreEnd > coreStart && (coreCount >= options.coreRecords || usedChars + nextSize > budget)) break
       usedChars += nextSize
       coreEnd += 1
     }
 
-    const inputStart = precedingOverlap(records, coreStart)
+    const inputStart = precedingOverlap(records, coreStart, options.overlapRecords, options.overlapChars)
     const core = records.slice(coreStart, coreEnd)
     const latestCoreTime = Math.max(...core.map((item) => capturedAtTime(item.capturedAt)).filter(Number.isFinite))
     const historical = Number.isFinite(latestCoreTime) && latestCoreTime < now - HISTORY_WINDOW_MS
@@ -167,7 +194,24 @@ function buildSegments(id: string, name: string, kind: ConversationAnalysisJob['
   }))
 }
 
-export function buildConversationAnalysisPlan(items: IntelItem[], now = Date.now()): ConversationAnalysisPlan {
+export interface ConversationAnalysisPlanOptions {
+  coreRecords?: number
+  coreChars?: number
+  overlapRecords?: number
+  overlapChars?: number
+}
+
+export function buildConversationAnalysisPlan(
+  items: IntelItem[],
+  now = Date.now(),
+  options: ConversationAnalysisPlanOptions = {},
+): ConversationAnalysisPlan {
+  const segmentOptions = {
+    coreRecords: Math.max(1, Math.floor(options.coreRecords ?? MAX_SEGMENT_CORE_RECORDS)),
+    coreChars: Math.max(256, Math.floor(options.coreChars ?? MAX_SEGMENT_CORE_CHARS)),
+    overlapRecords: Math.max(0, Math.floor(options.overlapRecords ?? MAX_OVERLAP_RECORDS)),
+    overlapChars: Math.max(0, Math.floor(options.overlapChars ?? MAX_OVERLAP_CHARS)),
+  }
   const groups = new Map<string, IntelItem[]>()
   items.forEach((item) => {
     const key = conversationKey(item)
@@ -184,7 +228,7 @@ export function buildConversationAnalysisPlan(items: IntelItem[], now = Date.now
       skippedConversations += 1
       continue
     }
-    jobs.push(...buildSegments(id, conversationName(records[0]), conversationKind(records[0]), ordered, now))
+    jobs.push(...buildSegments(id, conversationName(records[0]), inferConversationKind(records[0]), ordered, now, segmentOptions))
   }
   // Recent segments run first. Historical segments still run after them and
   // remain part of the same full-conversation coverage.
@@ -196,4 +240,18 @@ export function buildConversationAnalysisPlan(items: IntelItem[], now = Date.now
     skippedConversations,
     recordCount: jobs.reduce((count, job) => count + job.coreRecordCount, 0),
   }
+}
+
+/**
+ * Person evidence is merged after all windows have completed, so it benefits
+ * from fewer, wider chronological requests. Every core record is still sent
+ * exactly once; overlap is context only and is removed from coverage counts.
+ */
+export function buildPeopleConversationAnalysisPlan(items: IntelItem[], now = Date.now()) {
+  return buildConversationAnalysisPlan(items, now, {
+    coreRecords: PEOPLE_SEGMENT_CORE_RECORDS,
+    coreChars: PEOPLE_SEGMENT_CORE_CHARS,
+    overlapRecords: PEOPLE_OVERLAP_RECORDS,
+    overlapChars: PEOPLE_OVERLAP_CHARS,
+  })
 }

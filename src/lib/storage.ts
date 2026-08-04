@@ -1,15 +1,16 @@
-import { seedData } from '../seed'
-import type { AiSettings, AppData } from '../types'
+import { createSeedData, seedData } from '../seed'
+import type { AiAnalysisWatermarks, AiExtractionCheckpoint, AiSettings, AppData } from '../types'
 import { normalizeAppearance } from './appearance'
 import { summarizeArchive } from './archiveSummary'
 import { DEFAULT_AI_CONCURRENCY, normalizeAiConcurrency } from './aiConcurrency'
+import { recoverArray } from './storageRecovery'
 
 const STORAGE_KEY = 'theia:v1'
 
 export const defaultPromptInstructions = {
   task: '优先保留仍需你处理、具体可执行的安排。约见、返校、报名、缴费、回复、预约、截止事项优先；闲聊、历史通知、已过期事项不输出。',
   people: '只提取对方自己明确说过的信息。偏好要保留证据强度：单次表达只是“曾有正向评价”，不是稳定习惯或性格。',
-  peopleMerge: '仅根据已核验事实收敛人物刻画。结论不足时明确说需要更多信息，不要用套话补齐。',
+  peopleMerge: '将已核验聊天事实按时间线收敛成简洁的人物志：只写原文能支持的经历、明确偏好、重复互动模式和有证据的变化；单次表达保留单次强度。允许使用人物底稿，但必须与聊天事实分开，不能补写未知背景。证据不足时明确说明边界。',
   taskGuidance: '建议要具体、尊重边界，优先给出可执行的准备、确认和备选方案。不足时建议优先补充时间、地点或对方偏好。',
 }
 
@@ -24,25 +25,113 @@ export const defaultAiSettings: AiSettings = {
   promptInstructions: defaultPromptInstructions,
 }
 
+function normalizeWatermarkGroup(value: unknown) {
+  if (!value || typeof value !== 'object') return undefined
+  const entries: Array<[string, string]> = Object.entries(value as Record<string, unknown>)
+    .filter((entry): entry is [string, string] => entry[0].length > 0 && entry[0].length <= 240 && typeof entry[1] === 'string' && entry[1].length <= 160)
+    .slice(-20_000)
+  return entries.length ? Object.fromEntries(entries) : undefined
+}
+
+function normalizeAnalysisWatermarks(value: unknown): AiAnalysisWatermarks | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const input = value as Partial<AiAnalysisWatermarks>
+  const tasks = normalizeWatermarkGroup(input.tasks)
+  const people = normalizeWatermarkGroup(input.people)
+  return tasks || people ? { ...(tasks ? { tasks } : {}), ...(people ? { people } : {}) } : undefined
+}
+
+function normalizeInterruptedRun(value: unknown): AiExtractionCheckpoint | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const checkpoint = value as Partial<AiExtractionCheckpoint>
+  if (checkpoint.version !== 1 || !['tasks', 'people'].includes(String(checkpoint.stage))) return undefined
+  const targets = {
+    tasks: checkpoint.targets?.tasks === true,
+    people: checkpoint.targets?.people === true,
+  }
+  if (!targets.tasks && !targets.people) return undefined
+  const conversationIds = Array.isArray(checkpoint.conversationIds)
+    ? [...new Set(checkpoint.conversationIds.filter((id): id is string => typeof id === 'string' && id.length > 0).slice(-10_000))]
+    : []
+  if (!conversationIds.length) return undefined
+  const allowedIds = new Set(conversationIds)
+  const completedConversationIds = Array.isArray(checkpoint.completedConversationIds)
+    ? [...new Set(checkpoint.completedConversationIds.filter((id): id is string => typeof id === 'string' && allowedIds.has(id)).slice(-10_000))]
+    : []
+  const scope = ['unprocessed', 'new', 'all'].includes(String(checkpoint.scope)) ? checkpoint.scope as AiExtractionCheckpoint['scope'] : 'all'
+  const timelineMode = ['last-chat', 'strict-window'].includes(String(checkpoint.timelineMode)) ? checkpoint.timelineMode as AiExtractionCheckpoint['timelineMode'] : 'last-chat'
+  const date = (candidate: unknown) => typeof candidate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(candidate) ? candidate : undefined
+  return {
+    version: 1,
+    stage: checkpoint.stage as AiExtractionCheckpoint['stage'],
+    targets,
+    scope,
+    timelineMode,
+    ...(date(checkpoint.timelineStart) ? { timelineStart: date(checkpoint.timelineStart) } : {}),
+    ...(date(checkpoint.timelineEnd) ? { timelineEnd: date(checkpoint.timelineEnd) } : {}),
+    ...(typeof checkpoint.conversationId === 'string' && allowedIds.has(checkpoint.conversationId) ? { conversationId: checkpoint.conversationId } : {}),
+    conversationIds,
+    completedConversationIds,
+    startedAt: typeof checkpoint.startedAt === 'string' ? checkpoint.startedAt.slice(0, 80) : new Date().toISOString(),
+    ...(typeof checkpoint.pausedAt === 'string' ? { pausedAt: checkpoint.pausedAt.slice(0, 80) } : {}),
+  }
+}
+
 export function loadData(): AppData {
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
-    if (!saved) return seedData
-    const parsed = JSON.parse(saved) as AppData
-    // Version 3 intentionally discards prior model cards. They did not retain
-    // per-claim original quotes, so their wording cannot be verified safely.
-    const isModelPeople = parsed.peopleModelVersion === 3
+    if (!saved) return createSeedData()
+    const parsed = JSON.parse(saved) as Omit<AppData, 'peopleModelVersion'> & { peopleModelVersion?: number }
+    // Version 5 invalidates free-form portraits. Only structured paragraphs
+    // with claim IDs survive; verified claims, avatars, and profile notes stay.
+    const isModelPeople = [3, 4, 5].includes(Number(parsed.peopleModelVersion))
+    const people = isModelPeople && Array.isArray(parsed.people)
+      ? parsed.people.map((person) => {
+        const hasStructuredPortrait = Number(person?.portraitSchemaVersion) === 1 && Array.isArray(person?.portraitBlocks) && person.portraitBlocks.length > 0
+        const hasProfileBasis = hasStructuredPortrait && Boolean(person?.profileNotes?.trim()) && person?.profileNotesUsed === true && Boolean(person?.portrait?.trim())
+        const hasChatBasis = Array.isArray(person?.evidence) && person.evidence.length > 0
+        // Preserve only the new structured portrait; old prose is regenerated.
+        if (hasProfileBasis) return person
+        if (hasStructuredPortrait && hasChatBasis && person.portrait && Array.isArray(person.portraitSourceIds) && person.portraitSourceIds.length >= 2) return person
+        return { ...person, portrait: undefined, portraitBlocks: [], portraitCoverage: undefined, portraitSchemaVersion: undefined, portraitSourceIds: [], profileNotesUsed: undefined, advice: [], portraitEvidenceSignature: undefined }
+      })
+      : []
+    const peopleIds = new Set(people.map((person) => person.id))
+    const quests = Array.isArray(parsed.quests)
+      ? parsed.quests.map((quest) => {
+        const existingIds = Array.isArray(quest.characterIds) ? quest.characterIds : []
+        const characterIds = existingIds
+          .filter((id): id is string => typeof id === 'string' && peopleIds.has(id))
+        return Array.isArray(quest.characterIds) && characterIds.length === existingIds.length ? quest : { ...quest, characterIds }
+      })
+      : []
+    const interruptedRun = normalizeInterruptedRun(parsed.aiSettings?.interruptedRun)
+    const analysisWatermarks = normalizeAnalysisWatermarks(parsed.aiSettings?.analysisWatermarks)
+    const promptInstructions = {
+      ...defaultPromptInstructions,
+      ...(parsed.aiSettings?.promptInstructions ?? {}),
+    }
+    if (promptInstructions.peopleMerge === '仅根据已核验事实收敛人物刻画。结论不足时明确说需要更多信息，不要用套话补齐。') promptInstructions.peopleMerge = defaultPromptInstructions.peopleMerge
     return {
       ...parsed,
       // Old versions derived a person card from every sender/alias while importing.
       // This can be both misleading and prohibitively expensive for large exports.
-      people: isModelPeople && Array.isArray(parsed.people) ? parsed.people : [],
+      people,
+      // Repair tasks that still point at cards deleted by an older build.
+      quests,
       dismissedPersonConversationIds: Array.isArray(parsed.dismissedPersonConversationIds)
         ? parsed.dismissedPersonConversationIds.filter((id): id is string => typeof id === 'string').slice(-10_000)
         : [],
-      peopleModelVersion: 3,
+      // Version 5 removes legacy person-card suppression state. Keep the
+      // stored marker so the one-time migration does not run on every launch.
+      peopleDismissalVersion: Number(parsed.peopleDismissalVersion) >= 5
+        ? 5
+        : Number(parsed.peopleDismissalVersion) >= 3 ? Number(parsed.peopleDismissalVersion) : undefined,
+      peopleModelVersion: 5,
       archive: parsed.archive?.version === 1 ? parsed.archive : summarizeArchive(Array.isArray(parsed.intel) ? parsed.intel : []),
-      aiCandidates: Array.isArray(parsed.aiCandidates) ? parsed.aiCandidates : [],
+      // Created candidates are a temporary review archive. Their source IDs
+      // are already stored on the quest, so do not restore this duplicate list.
+      aiCandidates: Array.isArray(parsed.aiCandidates) ? parsed.aiCandidates.filter((candidate) => candidate?.status !== 'created') : [],
       aiSettings: {
         ...defaultAiSettings,
         ...(parsed.aiSettings ?? {}),
@@ -50,10 +139,9 @@ export function loadData(): AppData {
         recencyPolicy: ['strict', 'balanced', 'broad'].includes(parsed.aiSettings?.recencyPolicy) ? parsed.aiSettings.recencyPolicy : 'balanced',
         concurrency: normalizeAiConcurrency(parsed.aiSettings?.concurrency),
         feedback: Array.isArray(parsed.aiSettings?.feedback) ? parsed.aiSettings.feedback.slice(-80) : [],
-        promptInstructions: {
-          ...defaultPromptInstructions,
-          ...(parsed.aiSettings?.promptInstructions ?? {}),
-        },
+        promptInstructions,
+        ...(analysisWatermarks ? { analysisWatermarks } : {}),
+        ...(interruptedRun ? { interruptedRun } : {}),
       },
       appearance: normalizeAppearance(parsed.appearance),
       atlas: {
@@ -65,7 +153,10 @@ export function loadData(): AppData {
           return [[category, { x: Math.min(93, Math.max(7, x)), y: Math.min(92, Math.max(8, y)) }]]
         })),
       },
-      places: parsed.places.map((place) => {
+      // A partially written or very old browser cache may not have a places
+      // array. Recover the remaining task/person state instead of throwing and
+      // replacing the entire workspace with demo data.
+      places: recoverArray(parsed.places, seedData.places).map((place) => {
         const fallback = seedData.places.find((item) => item.id === place.id) ?? seedData.places[0]
         return {
           ...place,
@@ -77,17 +168,59 @@ export function loadData(): AppData {
       }),
     }
   } catch {
-    return seedData
+    return createSeedData()
   }
 }
 
+function compactPeopleForQuota(data: AppData): AppData {
+  const compactPeople = data.people.map((person) => {
+    const evidence = Array.isArray(person.evidence)
+      ? person.evidence.slice(-120).map((claim) => ({
+        ...claim,
+        text: claim.text.trim().slice(0, 360),
+        quote: claim.quote.trim().slice(0, 140),
+        sourceIds: [...new Set(Array.isArray(claim.sourceIds) ? claim.sourceIds : [])].slice(0, 12),
+      }))
+      : []
+    const portraitBlocks = Array.isArray(person.portraitBlocks)
+      ? person.portraitBlocks.slice(0, 8).map((block) => ({
+        ...block,
+        text: block.text.trim().slice(0, 1800),
+        claimIds: [...new Set(block.claimIds)].slice(0, 12),
+        sourceIds: [...new Set(block.sourceIds)].slice(0, 12),
+      }))
+      : []
+    return {
+      ...person,
+      evidence,
+      facts: (Array.isArray(person.facts) ? person.facts : []).slice(0, 48),
+      preferences: (person.preferences ?? []).slice(0, 24),
+      advice: (person.advice ?? []).slice(0, 9),
+      sourceIds: [...new Set([...(Array.isArray(person.sourceIds) ? person.sourceIds : []), ...evidence.flatMap((claim) => Array.isArray(claim.sourceIds) ? claim.sourceIds : [])])].slice(0, 120),
+      portraitBlocks,
+      portrait: person.portrait?.trim().slice(0, 3_600),
+      portraitFailure: person.portraitFailure?.trim().slice(0, 360),
+      profileNotes: person.profileNotes?.trim().slice(0, 6_000),
+    }
+  })
+  return { ...data, people: compactPeople }
+}
+
 export function saveData(data: AppData) {
+  const payload = { ...data, intel: [] }
   try {
     // Chat exports can be thousands of records long. Keep the lightweight
     // dashboard state in localStorage; the raw intel queue lives in IndexedDB.
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...data, intel: [] }))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
   } catch {
-    console.warn('本地存储空间不足，本次会话数据仍可使用，但刷新后可能无法完整恢复。')
+    // Browser quotas are commonly 5 MB. Retry once with bounded evidence
+    // strings and source arrays before reporting a persistence failure; the
+    // normal in-memory model is unchanged.
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...compactPeopleForQuota(data), intel: [] }))
+    } catch {
+      console.warn('本地存储空间不足，本次会话数据仍可使用，但刷新后可能无法完整恢复。')
+    }
   }
 }
 

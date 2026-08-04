@@ -1,7 +1,7 @@
 import { BookOpenText, Clock3, ListTodo, Map, RadioTower, RefreshCw, RotateCcw, Settings2, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { getAtlasQuote, type AtlasQuote } from '../lib/quotes'
-import { avatarImageUrl } from '../lib/mediaProxy'
+import { AvatarImage } from './AvatarImage'
 import type { Profile, ViewId } from '../types'
 
 const navItems: { id: ViewId; label: string; icon: typeof ListTodo }[] = [
@@ -71,7 +71,7 @@ export function Sidebar({ profile, active, open, onChange, onClose, onReset, new
         </nav>
 
         <div className="sidebar-profile">
-          <div className="sidebar-profile-avatar">{profile.avatarUrl && <img src={avatarImageUrl(profile.avatarUrl)} alt="" onError={(event) => { event.currentTarget.style.display = 'none' }} />}<i>{profile.name.replace(/\s+/g, '').slice(-2) || '你'}</i></div>
+          <div className="sidebar-profile-avatar"><AvatarImage source={profile.avatarUrl} alt="" /><i>{profile.name.replace(/\s+/g, '').slice(-2) || '你'}</i></div>
           <div><span>THEIA USER</span><strong>{profile.name}</strong></div>
         </div>
 

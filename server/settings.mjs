@@ -1,9 +1,10 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import process from 'node:process'
 import { runtimePaths } from './runtimePaths.mjs'
 
 const { settingsPath, legacyProviderPath, backgroundDirectoryPath: backgroundDirectory } = runtimePaths
+let settingsWriteQueue = Promise.resolve()
 const supportedModes = new Set(['auto', 'responses', 'chat-completions'])
 const themes = new Set(['verdant', 'nocturne', 'paper', 'sakura'])
 const analysisModes = new Set(['balanced', 'action', 'planning', 'review'])
@@ -18,7 +19,7 @@ const imageTypes = new Map([
 const defaultPromptInstructions = {
   task: '优先保留仍需你处理、具体可执行的安排。约见、返校、报名、缴费、回复、预约、截止事项优先；闲聊、历史通知、已过期事项不输出。',
   people: '只提取对方自己明确说过的信息。偏好要保留证据强度：单次表达只是“曾有正向评价”，不是稳定习惯或性格。',
-  peopleMerge: '仅根据已核验事实收敛人物刻画。结论不足时明确说需要更多信息，不要用套话补齐。',
+  peopleMerge: '将已核验聊天事实按时间线收敛成简洁的人物志：只写原文能支持的经历、明确偏好、重复互动模式和有证据的变化；单次表达保留单次强度。允许使用人物底稿，但必须与聊天事实分开，不能补写未知背景。证据不足时明确说明边界。',
   taskGuidance: '建议要具体、尊重边界，优先给出可执行的准备、确认和备选方案。不足时建议优先补充时间、地点或对方偏好。',
 }
 
@@ -141,6 +142,34 @@ function normalizeAppearance(input, fallback) {
   }
 }
 
+function normalizeAiCheckpoint(value) {
+  if (!value || typeof value !== 'object' || value.version !== 1) return undefined
+  if (!['tasks', 'people'].includes(value.stage)) return undefined
+  const targets = { tasks: value.targets?.tasks === true, people: value.targets?.people === true }
+  if (!targets.tasks && !targets.people) return undefined
+  const conversationIds = [...new Set((Array.isArray(value.conversationIds) ? value.conversationIds : [])
+    .filter((id) => typeof id === 'string' && id.length > 0).slice(-10_000))]
+  if (!conversationIds.length) return undefined
+  const allowed = new Set(conversationIds)
+  const completedConversationIds = [...new Set((Array.isArray(value.completedConversationIds) ? value.completedConversationIds : [])
+    .filter((id) => typeof id === 'string' && allowed.has(id)).slice(-10_000))]
+  const date = (candidate) => typeof candidate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(candidate) ? candidate : undefined
+  return {
+    version: 1,
+    stage: value.stage,
+    targets,
+    scope: ['unprocessed', 'new', 'all'].includes(value.scope) ? value.scope : 'all',
+    timelineMode: ['last-chat', 'strict-window'].includes(value.timelineMode) ? value.timelineMode : 'last-chat',
+    ...(date(value.timelineStart) ? { timelineStart: date(value.timelineStart) } : {}),
+    ...(date(value.timelineEnd) ? { timelineEnd: date(value.timelineEnd) } : {}),
+    ...(typeof value.conversationId === 'string' && allowed.has(value.conversationId) ? { conversationId: value.conversationId } : {}),
+    conversationIds,
+    completedConversationIds,
+    startedAt: text(value.startedAt, 80) || new Date().toISOString(),
+    ...(text(value.pausedAt, 80) ? { pausedAt: text(value.pausedAt, 80) } : {}),
+  }
+}
+
 function normalizeAiSettings(input, fallback) {
   // Keep the local review history useful to the user. Request builders apply
   // their own much smaller model-context limit.
@@ -160,16 +189,37 @@ function normalizeAiSettings(input, fallback) {
       createdAt: text(item?.createdAt, 80) || new Date().toISOString(),
     }]
   }) : []
+  const promptInstructions = Object.fromEntries(Object.entries(defaultPromptInstructions).map(([key, fallbackValue]) => [key, text(input?.promptInstructions?.[key], 6000) || fallbackValue]))
+  const normalizeWatermarkGroup = (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+    const entries = Object.entries(value)
+      .filter(([key, item]) => key.length > 0 && key.length <= 240 && typeof item === 'string' && item.length <= 160)
+      .slice(-20_000)
+    return entries.length ? Object.fromEntries(entries) : undefined
+  }
+  const tasksWatermarks = normalizeWatermarkGroup(input?.analysisWatermarks?.tasks)
+  const peopleWatermarks = normalizeWatermarkGroup(input?.analysisWatermarks?.people)
+  // Migrate only the exact previous built-in value. A genuinely edited prompt
+  // is user data and must remain untouched.
+  if (promptInstructions.peopleMerge === '仅根据已核验事实收敛人物刻画。结论不足时明确说需要更多信息，不要用套话补齐。') promptInstructions.peopleMerge = defaultPromptInstructions.peopleMerge
   return {
     mode: analysisModes.has(input?.mode) ? input.mode : fallback.mode,
     instructions: text(input?.instructions, 4000) || fallback.instructions,
     autoEnabled: input?.autoEnabled === true,
     intervalHours: clamp(input?.intervalHours, 24, 24 * 30, fallback.intervalHours),
     recencyPolicy: ['strict', 'balanced', 'broad'].includes(input?.recencyPolicy) ? input.recencyPolicy : fallback.recencyPolicy,
-    concurrency: Math.round(clamp(input?.concurrency, 1, 32, Math.round(clamp(fallback?.concurrency, 1, 32, 4)))),
+    concurrency: Math.round(clamp(input?.concurrency, 1, 64, Math.round(clamp(fallback?.concurrency, 1, 64, 4)))),
     feedback,
-    promptInstructions: Object.fromEntries(Object.entries(defaultPromptInstructions).map(([key, fallbackValue]) => [key, text(input?.promptInstructions?.[key], 6000) || fallbackValue])),
+    promptInstructions,
+    ...(tasksWatermarks || peopleWatermarks ? {
+      analysisWatermarks: {
+        ...(tasksWatermarks ? { tasks: tasksWatermarks } : {}),
+        ...(peopleWatermarks ? { people: peopleWatermarks } : {}),
+      },
+    } : {}),
     ...(text(input?.lastRunAt, 80) ? { lastRunAt: text(input.lastRunAt, 80) } : {}),
+    ...(text(input?.lastPeopleFollowupAt, 80) ? { lastPeopleFollowupAt: text(input.lastPeopleFollowupAt, 80) } : {}),
+    ...(normalizeAiCheckpoint(input?.interruptedRun) ? { interruptedRun: normalizeAiCheckpoint(input.interruptedRun) } : {}),
   }
 }
 
@@ -255,7 +305,10 @@ function serializeSettings(settings) {
     `concurrency=${encode(settings.aiSettings.concurrency)}`,
     `feedback=${encode(JSON.stringify(settings.aiSettings.feedback))}`,
     `promptInstructions=${encode(JSON.stringify(settings.aiSettings.promptInstructions))}`,
+    `analysisWatermarks=${encode(JSON.stringify(settings.aiSettings.analysisWatermarks ?? null))}`,
     `lastRunAt=${encode(settings.aiSettings.lastRunAt ?? '')}`,
+    `lastPeopleFollowupAt=${encode(settings.aiSettings.lastPeopleFollowupAt ?? '')}`,
+    `interruptedRun=${encode(JSON.stringify(settings.aiSettings.interruptedRun ?? null))}`,
     '',
     '[provider]',
     `id=${encode(settings.provider.id)}`,
@@ -297,7 +350,10 @@ function fromIni(raw) {
       concurrency: value(parsed, 'ai', 'concurrency'),
       feedback: jsonValue(parsed, 'ai', 'feedback', []),
       promptInstructions: jsonValue(parsed, 'ai', 'promptInstructions', {}),
+      analysisWatermarks: jsonValue(parsed, 'ai', 'analysisWatermarks', undefined),
       lastRunAt: value(parsed, 'ai', 'lastRunAt'),
+      lastPeopleFollowupAt: value(parsed, 'ai', 'lastPeopleFollowupAt'),
+      interruptedRun: jsonValue(parsed, 'ai', 'interruptedRun', undefined),
     },
     provider: {
       id: value(parsed, 'provider', 'id'),
@@ -344,30 +400,48 @@ export async function loadSettings() {
     if (error?.code !== 'ENOENT') throw error
     const migrated = await migrateLegacyProvider()
     if (migrated) {
-      await writeSettings(migrated)
+      await writeSettingsFile(migrated)
       return { settings: migrated, initialized: true }
     }
     return { settings: defaultSettings(), initialized: false }
   }
 }
 
-export async function writeSettings(input) {
+async function writeSettingsFile(input) {
   const settings = normalizeSettings(input)
-  const temporaryPath = `${settingsPath}.tmp`
+  const temporaryPath = `${settingsPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 10)}.tmp`
   await mkdir(dirname(settingsPath), { recursive: true, mode: 0o700 })
-  await writeFile(temporaryPath, serializeSettings(settings), { encoding: 'utf8', mode: 0o600 })
-  await rename(temporaryPath, settingsPath)
+  try {
+    await writeFile(temporaryPath, serializeSettings(settings), { encoding: 'utf8', mode: 0o600 })
+    await rename(temporaryPath, settingsPath)
+  } finally {
+    await unlink(temporaryPath).catch((error) => {
+      if (error?.code !== 'ENOENT') throw error
+    })
+  }
   return settings
 }
 
-export async function saveAppSettings(input) {
-  const { settings } = await loadSettings()
-  return writeSettings({
-    ...settings,
-    appSettingsInitialized: true,
-    profile: input?.profile ?? settings.profile,
-    appearance: input?.appearance ?? settings.appearance,
-    aiSettings: input?.aiSettings ?? settings.aiSettings,
+function enqueueSettingsWrite(work) {
+  const write = settingsWriteQueue.then(work)
+  settingsWriteQueue = write.catch(() => undefined)
+  return write
+}
+
+export function writeSettings(input) {
+  return enqueueSettingsWrite(() => writeSettingsFile(input))
+}
+
+export function saveAppSettings(input) {
+  return enqueueSettingsWrite(async () => {
+    const { settings } = await loadSettings()
+    return writeSettingsFile({
+      ...settings,
+      appSettingsInitialized: true,
+      profile: input?.profile ?? settings.profile,
+      appearance: input?.appearance ?? settings.appearance,
+      aiSettings: input?.aiSettings ?? settings.aiSettings,
+    })
   })
 }
 
@@ -386,25 +460,29 @@ export async function loadProviderChannelSettings() {
   }
 }
 
-export async function saveProviderSettings(provider) {
-  const { settings } = await loadSettings()
-  const merged = { ...settings.provider, ...provider, id: settings.primaryProviderId }
-  const providers = settings.providers.map((channel) => channel.id === settings.primaryProviderId ? merged : channel)
-  const next = await writeSettings({ ...settings, provider: merged, providers, primaryProviderId: settings.primaryProviderId })
-  return { ...next.provider, source: 'settings-ini' }
+export function saveProviderSettings(provider) {
+  return enqueueSettingsWrite(async () => {
+    const { settings } = await loadSettings()
+    const merged = { ...settings.provider, ...provider, id: settings.primaryProviderId }
+    const providers = settings.providers.map((channel) => channel.id === settings.primaryProviderId ? merged : channel)
+    const next = await writeSettingsFile({ ...settings, provider: merged, providers, primaryProviderId: settings.primaryProviderId })
+    return { ...next.provider, source: 'settings-ini' }
+  })
 }
 
-export async function saveProviderChannelSettings(input) {
-  const { settings } = await loadSettings()
-  const channels = Array.isArray(input?.channels) && input.channels.length ? input.channels : settings.providers
-  const primaryProviderId = text(input?.primaryProviderId, 80) || settings.primaryProviderId
-  const provider = channels.find((channel) => channel?.id === primaryProviderId) ?? channels[0]
-  const next = await writeSettings({ ...settings, provider, providers: channels, primaryProviderId: provider?.id })
-  return {
-    primaryProviderId: next.primaryProviderId,
-    channels: next.providers.map((channel) => ({ ...channel, source: 'settings-ini' })),
-    source: 'settings-ini',
-  }
+export function saveProviderChannelSettings(input) {
+  return enqueueSettingsWrite(async () => {
+    const { settings } = await loadSettings()
+    const channels = Array.isArray(input?.channels) && input.channels.length ? input.channels : settings.providers
+    const primaryProviderId = text(input?.primaryProviderId, 80) || settings.primaryProviderId
+    const provider = channels.find((channel) => channel?.id === primaryProviderId) ?? channels[0]
+    const next = await writeSettingsFile({ ...settings, provider, providers: channels, primaryProviderId: provider?.id })
+    return {
+      primaryProviderId: next.primaryProviderId,
+      channels: next.providers.map((channel) => ({ ...channel, source: 'settings-ini' })),
+      source: 'settings-ini',
+    }
+  })
 }
 
 export async function saveBackgroundAsset({ mimeType, data }) {

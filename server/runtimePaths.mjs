@@ -23,7 +23,9 @@ const releasePaths = {
 export const runtimePaths = releaseLayoutEnabled ? {
   workspace: runtimeRoot,
   sharedStatePath: resolve(releasePaths.dataDirectory, 'state.json'),
-  sharedIntelPath: resolve(releasePaths.dataDirectory, 'chat-archive.json'),
+  sharedIntelPath: resolve(releasePaths.dataDirectory, 'chat-archive.json.gz'),
+  sharedIntelMetaPath: resolve(releasePaths.dataDirectory, 'chat-archive.meta.json'),
+  sharedIntelLegacyPath: resolve(releasePaths.dataDirectory, 'chat-archive.json'),
   settingsPath: resolve(releasePaths.dataDirectory, 'settings.ini'),
   legacyProviderPath: resolve(releasePaths.dataDirectory, 'legacy-provider.json'),
   aiDebugLogPath: resolve(releasePaths.logDirectory, 'ai-debug.jsonl'),
@@ -36,7 +38,9 @@ export const runtimePaths = releaseLayoutEnabled ? {
 } : {
   workspace: applicationRoot,
   sharedStatePath: resolve(applicationRoot, '.theia-shared-state.json'),
-  sharedIntelPath: resolve(applicationRoot, '.theia-shared-intel.json'),
+  sharedIntelPath: resolve(applicationRoot, '.theia-shared-intel.json.gz'),
+  sharedIntelMetaPath: resolve(applicationRoot, '.theia-shared-intel.meta.json'),
+  sharedIntelLegacyPath: resolve(applicationRoot, '.theia-shared-intel.json'),
   settingsPath: resolve(applicationRoot, '.theia-settings.ini'),
   legacyProviderPath: resolve(applicationRoot, '.ai-provider.json'),
   aiDebugLogPath: resolve(applicationRoot, '.theia-ai-debug.log'),

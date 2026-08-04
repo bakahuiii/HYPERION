@@ -8,7 +8,7 @@ export function archiveConversationKey(item: IntelItem) {
   return `legacy:${item.source}:${month}`
 }
 
-export function summarizeArchive(items: IntelItem[]): ArchiveSummary {
+export function summarizeArchive(items: IntelItem[], fileCount?: number): ArchiveSummary {
   const identified = new Set<string>()
   let messagesWithoutConversation = 0
   for (const item of items) {
@@ -18,6 +18,7 @@ export function summarizeArchive(items: IntelItem[]): ArchiveSummary {
   const fallbackConversations = new Set(items.filter((item) => !item.conversationId).map(archiveConversationKey)).size
   return {
     version: 1,
+    ...(Number.isFinite(fileCount) && Number(fileCount) >= 0 ? { fileCount: Math.floor(Number(fileCount)) } : {}),
     messageCount: items.length,
     conversationCount: identified.size + fallbackConversations,
     identifiedConversationCount: identified.size,

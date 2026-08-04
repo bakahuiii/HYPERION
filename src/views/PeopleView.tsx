@@ -1,6 +1,6 @@
-import { FileText, MessageCircle, Search, Send, Trash2, Users, X } from 'lucide-react'
+import { FileText, MessageCircle, Search, Send, Trash2, Users, X, Save } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { avatarImageUrl } from '../lib/mediaProxy'
+import { AvatarImage } from '../components/AvatarImage'
 import type { IntelItem, Person, Quest } from '../types'
 
 interface PeopleViewProps {
@@ -10,6 +10,8 @@ interface PeopleViewProps {
   onSelect: (id: string) => void
   onGoIntel: () => void
   onDismiss: (ids: string[]) => void
+  onUpdateProfileNotes: (id: string, notes: string) => void
+  onRetryPortrait: (id: string) => void
   intelCount: number
   intel: IntelItem[]
 }
@@ -49,20 +51,24 @@ function formatChatTime(value?: string) {
     : value
 }
 
-function isLocalVerificationFact(value: string) {
-  return /\u6700\u65e9\u53ef\u6838\u5b9e\u79c1\u804a\u4e92\u52a8|\u6700\u8fd1\u53ef\u6838\u5b9e\u79c1\u804a\u4e92\u52a8|\u5bfc\u51fa\u76ee\u5f55\u660e\u786e\u6807\u8bb0/.test(value)
-}
-
 function portraitFor(person: Person) {
-  const modelPortrait = person.portrait?.replace(/^\u5bf9\u8bdd\u5370\u8c61[\uff1a:]/, '').trim()
-  if (modelPortrait) return modelPortrait
-  const facts = person.facts.filter((fact) => !isLocalVerificationFact(fact)).slice(0, 3)
-  const preferences = (person.preferences ?? []).slice(0, 3)
-  const signals = [...facts, ...preferences]
-  return signals.length ? `${signals.join('\uff1b')}\u3002` : ''
+  const portrait = person.portrait?.trim() ?? ''
+  if (!portrait) return ''
+  const hasConfirmedBackground = Boolean(person.profileNotes?.trim()) && person.profileNotesUsed === true
+  const hasChatProvenance = (person.portraitSourceIds?.length ?? 0) >= 2
+    && (person.evidence?.length ?? 0) > 0
+  return hasConfirmedBackground || hasChatProvenance ? portrait : ''
 }
 
-export function PeopleView({ people, quests, selectedId, onSelect, onGoIntel, onDismiss, intelCount, intel }: PeopleViewProps) {
+function PersonProfileEditor({ person, onSave }: { person: Person; onSave: (notes: string) => void }) {
+  const [draft, setDraft] = useState(person.profileNotes ?? '')
+  return <section className="person-profile-editor">
+    <label><span>人物底稿 <small>仅填写你本人确认的背景、经历或长期观察；不会写入聊天事实。</small></span><textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows={6} maxLength={6000} placeholder="例如：与此人于 2024 年秋认识；她目前在准备考研。只填写你确认过的内容。" /></label>
+    <div className="person-profile-editor-actions"><small>{draft.length}/6000</small><button type="button" className="secondary-button" onClick={() => onSave(draft)} disabled={draft.trim() === (person.profileNotes ?? '').trim()}><Save size={14} />保存并重写人物志</button></div>
+  </section>
+}
+
+export function PeopleView({ people, quests, selectedId, onSelect, onGoIntel, onDismiss, onUpdateProfileNotes, onRetryPortrait, intelCount, intel }: PeopleViewProps) {
   const [scrollTop, setScrollTop] = useState(0)
   const [query, setQuery] = useState('')
   const [selectedPeopleIds, setSelectedPeopleIds] = useState<Set<string>>(() => new Set())
@@ -93,15 +99,32 @@ export function PeopleView({ people, quests, selectedId, onSelect, onGoIntel, on
   }, [orderedPeople, query])
   const selected = visiblePeople.find((person) => person.id === selectedId) ?? visiblePeople[0]
   const selectedPortrait = selected ? portraitFor(selected) : ''
+  const portraitFailed = selected?.portraitStatus === 'failed'
+  const selectedFacts = selected?.evidence?.filter((claim) => claim.kind === 'fact').slice(0, 12) ?? []
+  const selectedPreferences = selected?.evidence?.filter((claim) => claim.kind === 'preference').slice(0, 8) ?? []
   const selectedAdvice = selected?.advice ?? []
   const linked = quests.filter((quest) => selected && quest.characterIds.includes(selected.id))
+  const intelIndexes = useMemo(() => {
+    const byId = new Map<string, IntelItem>()
+    const byConversation = new Map<string, IntelItem[]>()
+    for (const item of intel) {
+      byId.set(item.id, item)
+      if (!item.conversationId) continue
+      const records = byConversation.get(item.conversationId)
+      if (records) records.push(item)
+      else byConversation.set(item.conversationId, [item])
+    }
+    return { byId, byConversation }
+  }, [intel])
   const conversationIds = useMemo(() => {
     if (!selected) return []
-    const cited = new Set(selected.sourceIds)
-    return [...new Set([...(selected.conversationIds ?? []), ...intel.filter((item) => cited.has(item.id) && item.conversationId).map((item) => item.conversationId as string)])]
-  }, [intel, selected])
+    const citedConversationIds = selected.sourceIds
+      .map((id) => intelIndexes.byId.get(id)?.conversationId)
+      .filter((id): id is string => Boolean(id))
+    return [...new Set([...(selected.conversationIds ?? []), ...citedConversationIds])]
+  }, [intelIndexes, selected])
   const personConversations = useMemo(() => conversationIds.map((id) => {
-    const records = intel.filter((item) => item.conversationId === id).sort((left, right) => {
+    const records = [...intelIndexes.byConversation.get(id) ?? []].sort((left, right) => {
       const leftTime = new Date(left.capturedAt).getTime()
       const rightTime = new Date(right.capturedAt).getTime()
       if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) return leftTime - rightTime
@@ -115,7 +138,7 @@ export function PeopleView({ people, quests, selectedId, onSelect, onGoIntel, on
       name: records[0]?.conversationName || selected?.name || '原始对话',
       source: records[0]?.source || '导入记录',
     }
-  }).filter((conversation) => conversation.records.length), [conversationIds, intel, selected?.name])
+  }).filter((conversation) => conversation.records.length), [conversationIds, intelIndexes, selected?.name])
   const openConversation = personConversations.find((conversation) => conversation.id === openConversationId)
   const openConversationRecords = openConversation?.records ?? []
   const safeConversationScrollTop = Math.min(conversationScrollTop, Math.max(0, openConversationRecords.length * CONVERSATION_ROW_HEIGHT - conversationViewportHeight))
@@ -222,7 +245,7 @@ export function PeopleView({ people, quests, selectedId, onSelect, onGoIntel, on
                 return <article className={`person-card-row ${selectedForDeletion ? 'is-marked' : ''}`} style={{ height: `${PERSON_ROW_HEIGHT}px` }} key={person.id}>
                   <label className="person-select"><input type="checkbox" checked={selectedForDeletion} onChange={() => togglePersonSelection(person.id)} aria-label={`选择 ${person.name}`} /><span /></label>
                   <button type="button" className={`person-card ${selected?.id === person.id ? 'is-selected' : ''}`} onClick={() => onSelect(person.id)}>
-                    <div className="portrait" style={{ '--portrait-color': color } as CSSProperties}>{person.avatarUrl && <img src={avatarImageUrl(person.avatarUrl)} alt="" loading="lazy" onError={(event) => { event.currentTarget.style.display = 'none' }} />}<span>{initialsFor(person.name)}</span><i /></div>
+                    <div className="portrait" style={{ '--portrait-color': color } as CSSProperties}><AvatarImage source={person.avatarUrl} alt="" loading="lazy" /><span>{initialsFor(person.name)}</span><i /></div>
                     <div className="person-summary"><span>模型核验 · {person.platforms.join(' / ') || '来源平台未标注'}</span><h3>{person.name}</h3><div className="person-record-count"><FileText size={13} />{person.sourceIds.length} 条引用记录</div></div>
                   </button>
                 </article>
@@ -237,11 +260,14 @@ export function PeopleView({ people, quests, selectedId, onSelect, onGoIntel, on
       {selected && (
         <aside className="person-detail">
           <div className="person-hero" style={{ '--portrait-color': portraitColorFor(selected) } as CSSProperties}>
-          <div className="person-hero-identity"><div className="large-monogram">{selected.avatarUrl && <img src={avatarImageUrl(selected.avatarUrl)} alt="" loading="lazy" onError={(event) => { event.currentTarget.style.display = 'none' }} />}<span>{initialsFor(selected.name)}</span></div><div><span>MODEL-VERIFIED PERSON</span><h2>{selected.name}</h2></div></div>
+          <div className="person-hero-identity"><div className="large-monogram"><AvatarImage source={selected.avatarUrl} alt="" loading="lazy" /><span>{initialsFor(selected.name)}</span></div><div><span>MODEL-VERIFIED PERSON</span><h2>{selected.name}</h2></div></div>
             <button type="button" className="person-delete" aria-label={`删除 ${selected.name}`} title="删除此人物条目" onClick={() => onDismiss([selected.id])}><Trash2 size={16} /></button>
           </div>
           <div className="person-observed"><span>最早可核实互动</span><strong>{formatFirstObserved(selected.firstObservedAt)}</strong></div>
-          <div className={`person-portrait-note ${selectedPortrait ? '' : 'is-insufficient'}`}><span>人物刻画</span><p>{selectedPortrait || '需要更多信息源，暂不足以形成可靠的描述。'}</p><small>{selectedPortrait ? '只整合对方明确表达的偏好与可核验互动；单次表达会保留不确定性。' : '系统会在后续接入足够的可核验记录后补充描述。'}</small></div>
+          <div className={`person-portrait-note ${selectedPortrait ? '' : 'is-insufficient'}`}><span>人物刻画 {selected?.profileNotesUsed && selected.profileNotes?.trim() ? '· 已确认底稿参与' : ''}</span><p>{selectedPortrait || (portraitFailed ? '人物刻画生成失败，系统没有保存未经证据校验的内容。' : '当前没有通过证据校验的人物志。请补充更多授权来源，或在下方填写你确认的人物底稿。')}</p><small>{selectedPortrait ? (selected.profileNotesUsed ? '人物志综合了你确认的人物底稿；聊天事实仍单独列在下方，不会被底稿伪装成聊天结论。' : '人物志只综合多条可追溯聊天证据，并保留证据边界。') : (portraitFailed ? `${selected.portraitFailure || '模型未通过校验。'} 可手动重试。` : '没有可靠画像时不会用事实列表拼接成假想性格。')}</small>{portraitFailed && <button type="button" className="secondary-button" onClick={() => onRetryPortrait(selected.id)}>重试人物刻画</button>}</div>
+          <PersonProfileEditor key={selected.id} person={selected} onSave={(notes) => onUpdateProfileNotes(selected.id, notes)} />
+          {!!selectedFacts.length && <section className="person-evidence-section"><span className="subsection-label">已核验事实</span>{selectedFacts.map((claim, index) => <div key={`${selected.id}-fact-${index}`}><p>{claim.text}</p><small>原话：“{claim.quote}” · {claim.sourceIds.join('、')}</small></div>)}</section>}
+          {!!selectedPreferences.length && <section className="person-evidence-section person-evidence-section--preference"><span className="subsection-label">偏好线索</span>{selectedPreferences.map((claim, index) => <div key={`${selected.id}-preference-${index}`}><p>{claim.text}</p><small>原话：“{claim.quote}” · {claim.sourceIds.join('、')}</small></div>)}</section>}
           {!!selectedAdvice.length && <div className="person-interaction-advice"><span>相处建议</span>{selectedAdvice.map((item, index) => <p key={`${selected.id}-advice-${index}`}>{item}</p>)}</div>}
           <div className="person-detail-actions"><button type="button" className="secondary-button" onClick={() => personConversations[0] && openChat(personConversations[0].id)} disabled={!personConversations.length}><MessageCircle size={15} />查看聊天记录{personConversations.length > 1 ? ` · ${personConversations.length}` : ''}</button><small>{personConversations.length ? '在当前页面打开该人物卡引用的原始对话，不会跳转。' : '当前人物卡尚无可打开的对话目录。'}</small></div>
           <div className="source-id-list">

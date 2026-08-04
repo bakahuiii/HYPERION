@@ -1,5 +1,5 @@
 import { Menu, Plus } from 'lucide-react'
-import { avatarImageUrl } from '../lib/mediaProxy'
+import { AvatarImage } from './AvatarImage'
 import type { Profile, ViewId } from '../types'
 
 const titles: Record<ViewId, { eyebrow: string; title: string }> = {
@@ -33,7 +33,7 @@ export function Topbar({ view, profile, onMenu, onNewQuest }: TopbarProps) {
       </div>
 
       <div className="topbar-actions">
-        <span className="topbar-avatar">{profile.avatarUrl && <img src={avatarImageUrl(profile.avatarUrl)} alt="" onError={(event) => { event.currentTarget.style.display = 'none' }} />}<i>{profile.name.replace(/\s+/g, '').slice(-2) || '你'}</i></span>
+        <span className="topbar-avatar"><AvatarImage source={profile.avatarUrl} alt="" /><i>{profile.name.replace(/\s+/g, '').slice(-2) || '你'}</i></span>
         <strong className="profile-name">{profile.name}</strong>
         <button type="button" className="primary-button" onClick={onNewQuest} aria-label="新任务">
           <Plus size={17} />

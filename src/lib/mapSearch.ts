@@ -12,10 +12,11 @@ function validBounds(value: unknown): value is [number, number, number, number] 
     && value.every((item) => Number.isFinite(Number(item)))
 }
 
-export async function searchMapPlaces(query: string) {
+export async function searchMapPlaces(query: string, signal?: AbortSignal) {
   const endpoint = new URL(apiUrl('/api/map/search'), window.location.href)
   endpoint.searchParams.set('q', query.trim())
-  const response = await fetch(endpoint, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(20_000) })
+  const timeout = AbortSignal.timeout(20_000)
+  const response = await fetch(endpoint, { headers: { accept: 'application/json' }, signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
   const payload = await response.json().catch(() => null) as MapSearchResult[] | { error?: string } | null
   if (!response.ok) {
     const detail = payload && !Array.isArray(payload) && typeof payload.error === 'string' ? payload.error : `搜索服务返回 ${response.status}`

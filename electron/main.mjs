@@ -46,7 +46,6 @@ if (softwareRendering) {
   app.commandLine.appendSwitch('enable-zero-copy')
   app.commandLine.appendSwitch('enable-features', 'CanvasOopRasterization')
 }
-app.commandLine.appendSwitch('disable-http-cache')
 app.setPath('userData', userDataPath)
 app.setPath('sessionData', resolve(userDataPath, 'session'))
 
@@ -177,7 +176,7 @@ async function registerPackagedProtocol() {
 
 function createWindow(apiBase) {
   const pageUrl = app.isPackaged ? 'theia://app/index.html' : apiBase
-  mainWindow = new BrowserWindow({
+  const window = new BrowserWindow({
     title: 'THEIA',
     icon: resolve(import.meta.dirname, 'app-icon.png'),
     width: 1600,
@@ -195,12 +194,32 @@ function createWindow(apiBase) {
       additionalArguments: app.isPackaged ? [`--theia-api-base=${apiBase}`] : [],
     },
   })
-  mainWindow.setMenuBarVisibility(false)
-  mainWindow.setAutoHideMenuBar(true)
-  mainWindow.webContents.on('before-input-event', (event, input) => {
+  mainWindow = window
+  window.setMenuBarVisibility(false)
+  window.setAutoHideMenuBar(true)
+  window.webContents.on('before-input-event', (event, input) => {
     if ((input.key === 'Alt' || input.key === 'F10') && !input.control && !input.meta) event.preventDefault()
   })
-  void mainWindow.loadURL(pageUrl)
+  let closeReady = false
+  let closeInProgress = false
+  window.on('close', (event) => {
+    if (closeReady || window.webContents.isDestroyed()) return
+    event.preventDefault()
+    if (closeInProgress) return
+    closeInProgress = true
+    let closeTimeout
+    const timeout = new Promise((resolveTimeout) => { closeTimeout = setTimeout(resolveTimeout, 8_000) })
+    void Promise.race([
+      window.webContents.executeJavaScript('window.theiaFlush ? window.theiaFlush() : Promise.resolve()'),
+      timeout,
+    ]).finally(() => {
+      clearTimeout(closeTimeout)
+      closeReady = true
+      if (!window.isDestroyed()) window.close()
+    })
+  })
+  window.on('closed', () => { if (mainWindow === window) mainWindow = undefined })
+  void window.loadURL(pageUrl)
 }
 
 if (hasSingleInstanceLock) app.whenReady().then(async () => {
@@ -222,7 +241,10 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => {
+// Keep loopback persistence services alive while BrowserWindow's close handler
+// awaits window.theiaFlush(). `before-quit` fires before windows close, whereas
+// `will-quit` runs after their close handlers have completed.
+app.on('will-quit', () => {
   clearDesktopPid()
   void viteServer?.close()
   if (ownsAiProxy && server.listening) server.close()

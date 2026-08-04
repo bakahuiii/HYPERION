@@ -8,6 +8,13 @@ import {
 
 const supportedModes = new Set(['auto', 'responses', 'chat-completions'])
 const modelDiscoveryTimeoutMs = 15_000
+let providerMutationQueue = Promise.resolve()
+
+function enqueueProviderMutation(work) {
+  const mutation = providerMutationQueue.then(work)
+  providerMutationQueue = mutation.catch(() => undefined)
+  return mutation
+}
 
 function text(value, max = 500) {
   return typeof value === 'string' ? value.trim().slice(0, max) : ''
@@ -50,7 +57,9 @@ function providerName(baseURL) {
 }
 
 function pickModel(models, requested) {
-  if (requested && (!models.length || models.includes(requested))) return requested
+  // Model discovery is advisory. Relays can expose incomplete or stale model
+  // lists, so an explicit user selection must always win and be persisted.
+  if (requested) return requested
   const preferred = ['gpt-5-mini', 'gpt-4.1-mini', 'gpt-4o-mini', 'deepseek-chat']
   for (const candidate of preferred) if (models.includes(candidate)) return candidate
   const suitable = models.find((id) => !/(embedding|audio|transcri|tts|image|moderation|realtime)/i.test(id))
@@ -205,7 +214,7 @@ async function prepareChannel(input, current, options = {}) {
   }
 }
 
-export async function saveProviderConfig(input) {
+async function saveProviderConfigUnlocked(input) {
   const current = await loadProviderConfig()
   const legacyInput = { ...input, key: text(input?.key, 1000) || current.apiKey }
   const prepared = await prepareChannel(legacyInput, current, { discoverModels: true })
@@ -214,7 +223,11 @@ export async function saveProviderConfig(input) {
   return { config: stored, warning }
 }
 
-export async function createProviderChannel(input) {
+export function saveProviderConfig(input) {
+  return enqueueProviderMutation(() => saveProviderConfigUnlocked(input))
+}
+
+async function createProviderChannelUnlocked(input) {
   const pool = await loadProviderConfigs()
   const requestedId = providerId(input?.id, `channel-${randomUUID().slice(0, 8)}`)
   if (pool.channels.some((channel) => channel.id === requestedId)) throw providerError(`通道 ID “${requestedId}” 已存在`, 409)
@@ -232,7 +245,11 @@ export async function createProviderChannel(input) {
   return { pool: saved, channel: saved.channels.find((item) => item.id === requestedId), warning }
 }
 
-export async function updateProviderChannel(id, input) {
+export function createProviderChannel(input) {
+  return enqueueProviderMutation(() => createProviderChannelUnlocked(input))
+}
+
+async function updateProviderChannelUnlocked(id, input) {
   const pool = await loadProviderConfigs()
   const channelId = providerId(id, '')
   const index = pool.channels.findIndex((channel) => channel.id === channelId)
@@ -246,7 +263,11 @@ export async function updateProviderChannel(id, input) {
   return { pool: saved, channel: saved.channels.find((item) => item.id === channelId), warning }
 }
 
-export async function deleteProviderChannel(id) {
+export function updateProviderChannel(id, input) {
+  return enqueueProviderMutation(() => updateProviderChannelUnlocked(id, input))
+}
+
+async function deleteProviderChannelUnlocked(id) {
   const pool = await loadProviderConfigs()
   const channelId = providerId(id, '')
   if (!pool.channels.some((channel) => channel.id === channelId)) throw providerError('模型通道不存在', 404)
@@ -256,7 +277,11 @@ export async function deleteProviderChannel(id) {
   return normalizeStoredPool(await saveProviderChannelSettings({ channels, primaryProviderId }))
 }
 
-export async function resetProviderConfig() {
+export function deleteProviderChannel(id) {
+  return enqueueProviderMutation(() => deleteProviderChannelUnlocked(id))
+}
+
+async function resetProviderConfigUnlocked() {
   const current = await loadProviderConfig()
   const stored = await saveProviderSettings({
     ...current,
@@ -267,4 +292,8 @@ export async function resetProviderConfig() {
     models: [],
   })
   return normalizeStoredProvider(stored)
+}
+
+export function resetProviderConfig() {
+  return enqueueProviderMutation(() => resetProviderConfigUnlocked())
 }

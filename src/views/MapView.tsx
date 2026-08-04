@@ -185,6 +185,8 @@ export function MapView({ places, quests, selectedPlaceId, onSelect, onUpdatePla
   const mapRef = useRef<L.Map | null>(null)
   const markerLayerRef = useRef<L.LayerGroup | null>(null)
   const fittedRef = useRef(false)
+  const invalidateFrameRef = useRef(0)
+  const searchControllerRef = useRef<AbortController | null>(null)
   const [adding, setAdding] = useState(false)
   const [draft, setDraft] = useState<PlaceDraft | null>(null)
   const [editingPlaceId, setEditingPlaceId] = useState('')
@@ -201,7 +203,11 @@ export function MapView({ places, quests, selectedPlaceId, onSelect, onUpdatePla
     if (!map) return
     map.stop()
     map.setView([lat, lng], zoom, { animate: false })
-    window.requestAnimationFrame(() => map.invalidateSize({ pan: false }))
+    if (invalidateFrameRef.current) window.cancelAnimationFrame(invalidateFrameRef.current)
+    invalidateFrameRef.current = window.requestAnimationFrame(() => {
+      invalidateFrameRef.current = 0
+      if (mapRef.current === map) map.invalidateSize({ pan: false })
+    })
   }, [])
 
   const focusPlace = useCallback((place: Place, zoom = 14) => {
@@ -219,8 +225,14 @@ export function MapView({ places, quests, selectedPlaceId, onSelect, onUpdatePla
     L.control.zoom({ position: 'bottomright' }).addTo(map)
     markerLayerRef.current = L.layerGroup().addTo(map)
     mapRef.current = map
-    window.requestAnimationFrame(() => map.invalidateSize({ pan: false }))
+    invalidateFrameRef.current = window.requestAnimationFrame(() => {
+      invalidateFrameRef.current = 0
+      if (mapRef.current === map) map.invalidateSize({ pan: false })
+    })
     return () => {
+      if (invalidateFrameRef.current) window.cancelAnimationFrame(invalidateFrameRef.current)
+      invalidateFrameRef.current = 0
+      searchControllerRef.current?.abort()
       map.remove()
       mapRef.current = null
       markerLayerRef.current = null
@@ -334,18 +346,26 @@ export function MapView({ places, quests, selectedPlaceId, onSelect, onUpdatePla
   const searchPlaces = async (event: FormEvent) => {
     event.preventDefault()
     const query = searchQuery.trim()
-    if (query.length < 2 || searching) return
+    if (query.length < 2) return
+    searchControllerRef.current?.abort()
+    const controller = new AbortController()
+    searchControllerRef.current = controller
     setSearching(true)
     setSearchMessage('正在搜索开放地点数据…')
     try {
-      const usable = await searchMapPlaces(query)
+      const usable = await searchMapPlaces(query, controller.signal)
+      if (searchControllerRef.current !== controller) return
       setSearchResults(usable)
       setSearchMessage(usable.length ? `找到 ${usable.length} 个地点，请选择一个结果。` : '没有找到匹配地点。可尝试“城市 + 地点全名”，或直接在地图上添加标记。')
     } catch (error) {
+      if (controller.signal.aborted || searchControllerRef.current !== controller) return
       setSearchResults([])
       setSearchMessage(error instanceof Error ? error.message : '地点搜索失败，请稍后重试。')
     } finally {
-      setSearching(false)
+      if (searchControllerRef.current === controller) {
+        searchControllerRef.current = null
+        setSearching(false)
+      }
     }
   }
 
@@ -376,7 +396,7 @@ export function MapView({ places, quests, selectedPlaceId, onSelect, onUpdatePla
       <div className="map-search-panel">
         <form className="map-search-form" onSubmit={searchPlaces}>
           <Search size={15} aria-hidden="true" />
-          <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索现实地点、校园或地址" aria-label="搜索现实地点" />
+          <input value={searchQuery} onChange={(event) => { searchControllerRef.current?.abort(); setSearchResults([]); setSearchQuery(event.target.value) }} placeholder="搜索现实地点、校园或地址" aria-label="搜索现实地点" />
           <button type="submit" className="icon-button" aria-label="搜索地点" title="搜索地点" disabled={searching || searchQuery.trim().length < 2}><Search size={15} /></button>
         </form>
         {searchMessage && <p className="map-search-message" role="status">{searchMessage}</p>}

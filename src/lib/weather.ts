@@ -24,7 +24,7 @@ function weatherCondition(code: number) {
 }
 
 /** Uses Open-Meteo's public, no-key daily forecast only for nearby future dates. */
-export async function fetchTaskWeather(place: Pick<Place, 'lat' | 'lng'> | undefined, scheduledAt?: string): Promise<WeatherContext | undefined> {
+export async function fetchTaskWeather(place: Pick<Place, 'lat' | 'lng'> | undefined, scheduledAt?: string, signal?: AbortSignal): Promise<WeatherContext | undefined> {
   if (!place || !scheduledAt) return undefined
   const date = scheduledAt.slice(0, 10)
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return undefined
@@ -40,7 +40,10 @@ export async function fetchTaskWeather(place: Pick<Place, 'lat' | 'lng'> | undef
       start_date: date,
       end_date: date,
     })
-    const response = await fetch(`https://api.open-meteo.com/v1/forecast?${query}`)
+    const timeout = AbortSignal.timeout(8_000)
+    const response = await fetch(`https://api.open-meteo.com/v1/forecast?${query}`, {
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    })
     const payload = await response.json() as { daily?: { weather_code?: number[]; temperature_2m_max?: number[]; temperature_2m_min?: number[]; precipitation_probability_max?: number[] } }
     if (!response.ok || !payload.daily) return undefined
     const code = Number(payload.daily.weather_code?.[0])

@@ -1,5 +1,5 @@
 import type { AppData } from './types'
-import { defaultAppearance } from './lib/appearance'
+import { defaultAppearance } from './lib/appearance.ts'
 
 /**
  * Entirely fictional first-run data. It gives a new user a coherent task,
@@ -35,7 +35,7 @@ export const seedData: AppData = {
     },
   ],
   dismissedPersonConversationIds: [],
-  peopleModelVersion: 3,
+  peopleModelVersion: 5,
   quests: [
     {
       id: 'q-demo-campus',
@@ -193,4 +193,9 @@ export const seedData: AppData = {
   },
   appearance: defaultAppearance,
   atlas: { categoryPositions: {} },
+}
+
+/** Return an isolated demo workspace for recovery and the reset action. */
+export function createSeedData(): AppData {
+  return structuredClone(seedData)
 }
