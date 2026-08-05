@@ -50,6 +50,12 @@ async function copyDirectory(source, target, filter) {
 
 const excludedNames = new Set(['node_modules', 'dist', '.git', '.npm-cache', '.theia-user-data'])
 const sourceFilter = (entry) => !excludedNames.has(basename(entry))
+const privatePlanningDocs = new Set([
+  'PROJECT_VISION.md',
+  'PROJECT_VISION.en.md',
+  'THEIA_PROJECT_VISION_BILINGUAL.docx',
+])
+const releaseDocsFilter = (entry) => !privatePlanningDocs.has(basename(entry))
 
 await mkdir(appDestination, { recursive: true })
 for (const directory of appDirectories) {
@@ -64,7 +70,8 @@ await copyDirectory(resolve(sourceRoot, 'release', 'data'), resolve(destination,
 await copyDirectory(resolve(sourceRoot, 'release', 'logs'), resolve(destination, 'logs'))
 // The repository docs directory is canonical. Keeping a second hand-edited
 // release copy caused installation requirements and model behavior to drift.
-await copyDirectory(resolve(sourceRoot, 'docs'), resolve(destination, 'docs'))
+// Internal product-planning documents stay in the source workspace.
+await copyDirectory(resolve(sourceRoot, 'docs'), resolve(destination, 'docs'), releaseDocsFilter)
 for (const file of ['README.md', '启动 THEIA 桌面版.cmd', '启动 THEIA 浏览器版.cmd', '.gitignore', 'LICENSE']) {
   await cp(resolve(sourceRoot, 'release', file), resolve(destination, file))
 }

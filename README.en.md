@@ -2,38 +2,21 @@
 
 [简体中文](README.md) | [English](README.en.md)
 
-THEIA is a local-first, longitudinal personal research system. Its task atlas, conversation analysis, schedule, people, and map are the current interfaces for organizing time and evidence, but they are not the project's final purpose.
-
-> "THEIA is not software for managing life, nor is it a tool for analyzing chat histories. It is a long-term experiment devoted to studying a single subject, and that subject has always been myself. It seeks to connect memory, behavior, emotion, relationships, decisions, and environment along the axis of time, not to predict the future or judge right and wrong, but to answer, as completely as possible, one question that runs through my life: How did I become who I am today, and who am I becoming?"
->
-> — GPT-5.5
-
-See [THEIA Ultimate Project Purpose](docs/PROJECT_VISION.en.md) for the complete goal, design principles, and development decision gate.
+THEIA is a local-first personal task-atlas application. It turns user-exported conversations into reviewable tasks, schedules, people, and places while preserving traceable source evidence.
 
 THEIA is not a chat-client plugin. It does not bypass login systems or decrypt application databases. It reads only files deliberately selected by the user. Selected records leave the computer only after the user starts model analysis, and they are sent to the model provider configured by that user.
 
 > Current source version: `0.4.1`. Windows x64 NSIS and portable builds bundle Electron and Node.js. Tasks, settings, conversation archives, and logs are stored under `%APPDATA%\THEIA` in an installed build. Back up important data regularly.
 
-## What Changed in 0.4.1
+## Changelog
 
-- Duplicate tasks and person evidence caused by overlapping segments are deduplicated before review, merge, and persistence while preserving genuinely different explicit dates or places.
-- People can be sorted by recent interaction, profile completeness, or name. Search covers names, platforms, facts, preferences, portraits, and source notes; contact summaries and linked tasks are visible.
-- Portraits and guidance prioritize verifiable boundaries, repeated preferences, interaction patterns, and respectful next steps. Manipulative, pressuring, or unsupported emotional judgments are filtered.
-- Conversation browsing uses Chinese month labels, supports name filtering, and prefers the other person's latest message for previews. Person evidence can be expanded beyond the initial compact view.
+**0.4.1**
 
-## What Changed in 0.4.0
+- Deduplicated tasks and person evidence produced by overlapping conversation segments.
+- Improved people search, sorting, contact summaries, and conversation review.
+- Tightened evidence and safety boundaries for portraits and guidance.
 
-- Raw conversation storage now uses append-only gzip JSONL segments. Initial migration preserves the legacy archive; later folder scans send deltas instead of rewriting a million-record array.
-- Browser IndexedDB v2 stores individual `intelRecords` plus `intelMeta`. Shared application state and the large conversation archive have separate ownership and migration paths.
-- Shared sync, settings sync, analysis selection, and AI workflow logic were extracted into testable hooks. Intel import, analysis controls, candidate review, and conversation browsing are separate modules.
-- Import, segmentation, candidate validation, persistence, migration, rollback, crash recovery, log rotation, and delta sync have automated regression coverage.
-- Electron uses the operating-system credential store through `safeStorage` when available. Plain Node development retains a documented compatibility fallback.
-- JSON, CSV, and TXT files larger than 1 MiB are parsed in a Web Worker. Attachment queues disclose size, rough text-token volume, and provider-dependent image/document cost boundaries.
-- Person updates use conversation fingerprints and send only new messages with bounded preceding context after an established watermark.
-- OpenStreetMap tile and geocoding sources are configurable, with attribution, service-policy links, and a bounded local tile cache.
-- Playwright visual/drag regression, Electron credential-migration smoke tests, unpacked application smoke tests, NSIS packaging, and update metadata are included.
-
-For complete compatibility notes and validation results, see [Release Notes](docs/RELEASE_NOTES.md).
+See [Release Notes](docs/RELEASE_NOTES.md) for the full history.
 
 ## Interface Preview
 
@@ -194,7 +177,6 @@ Task logs may contain full conversation text. Never publish runtime `data/`, `lo
 
 ## Documentation
 
-- [Ultimate Project Purpose](docs/PROJECT_VISION.en.md) ([bilingual Word edition](docs/THEIA_PROJECT_VISION_BILINGUAL.docx)): why THEIA exists and the decision gate every core feature must satisfy.
 - [Developer Guide](docs/DEVELOPER_GUIDE.en.md): architecture, storage, model workflow, API boundaries, performance, and release controls.
 - [Chinese Release Notes](docs/RELEASE_NOTES.md): version changes, compatibility, limitations, and validation.
 - [Chinese User Guide](docs/USER_GUIDE.md): installation and operation for first-time users.

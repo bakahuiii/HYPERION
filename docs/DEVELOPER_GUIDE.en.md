@@ -1,32 +1,12 @@
 # THEIA Developer Guide
 
-[简体中文](DEVELOPER_GUIDE.md) | [English](DEVELOPER_GUIDE.en.md) | [Ultimate Project Purpose](PROJECT_VISION.en.md)
+[简体中文](DEVELOPER_GUIDE.md) | [English](DEVELOPER_GUIDE.en.md)
 
 This guide is for engineers who maintain, review, extend, or package THEIA. It describes source version `0.4.1` and treats `package-lock.json`, `server/index.mjs`, and the current implementation as authoritative. Planned capabilities are not described as complete. For field-level local HTTP, upstream model JSON, session batching, and log formats, use [API_PROTOCOL.md](API_PROTOCOL.md) alongside this guide.
 
-## 1. Purpose and Engineering Boundary
+## 1. System and Engineering Boundary
 
-### 1.1 Ultimate purpose: understanding how the self develops
-
-> "THEIA is not software for managing life, nor is it a tool for analyzing chat histories. It is a long-term experiment devoted to studying a single subject, and that subject has always been myself. It seeks to connect memory, behavior, emotion, relationships, decisions, and environment along the axis of time, not to predict the future or judge right and wrong, but to answer, as completely as possible, one question that runs through my life: How did I become who I am today, and who am I becoming?"
->
-> — GPT-5.5
-
-This is THEIA's highest product objective and architectural constraint. The current task atlas, conversation importer, person cards, schedule, map, model workflows, and storage migrations are infrastructure for that objective. Success is not measured by producing more tasks, longer profiles, higher engagement, or scores assigned to people.
-
-Before implementing a major feature, field, or model workflow, answer:
-
-1. What evidence does it connect across time?
-2. How does it help the user understand continuity, change, turning points, and context?
-3. Does it distinguish raw observation, model inference, user reflection, and later revision?
-4. Can the user inspect provenance, correct conclusions, reverse changes, and export the data?
-5. If it does not help answer how the user became who they are and who they are becoming, does it belong in the core product?
-
-Engineering must therefore preserve time, provenance, speaker direction, and revision. Inference must not masquerade as fact. Person descriptions must not turn isolated temporary states into stable labels. Guidance must not become prediction, scoring, manipulation, or moral judgment. See [PROJECT_VISION.en.md](PROJECT_VISION.en.md) for the complete decision framework.
-
-### 1.2 Current system boundary
-
-THEIA is currently a single-user, local-first longitudinal research application. The user deliberately supplies exported files. The browser parses and selects locally. The loopback Node.js service persists state, proxies controlled media requests, and forwards selected content to user-configured model providers.
+THEIA is currently a single-user, local-first personal task-atlas application. The user deliberately supplies exported files. The browser parses and selects locally. The loopback Node.js service persists state, proxies controlled media requests, and forwards selected content to user-configured model providers. Engineering must preserve time, provenance, speaker direction, and revision. Inference must not masquerade as fact. Person descriptions must not turn isolated temporary states into stable labels. Guidance must not become prediction, scoring, manipulation, or moral judgment.
 
 The project does not implement:
 
