@@ -85,12 +85,23 @@ async function discardBody(request) {
   for await (const _chunk of request) { /* consume the request */ }
 }
 
+async function readBodyText(request) {
+  const chunks = []
+  for await (const chunk of request) chunks.push(chunk)
+  return Buffer.concat(chunks).toString('utf8')
+}
+
 function createFakeProvider(name) {
-  const state = { modelRequests: 0, analysisRequests: 0, activeRequests: 0, peakActiveRequests: 0, failNext: 0 }
+  const state = { modelRequests: 0, modelAuthFailNext: 0, analysisRequests: 0, activeRequests: 0, peakActiveRequests: 0, failNext: 0, authFailNext: 0, requestBodies: [] }
   const server = http.createServer(async (request, response) => {
     const path = new URL(request.url, 'http://127.0.0.1').pathname
     if (request.method === 'GET' && path === '/v1/models') {
       state.modelRequests += 1
+      if (state.modelAuthFailNext > 0) {
+        state.modelAuthFailNext -= 1
+        sendJson(response, 401, { error: { message: `${name} simulated invalid model-list credential` } })
+        return
+      }
       sendJson(response, 200, { data: [{ id: 'test-model' }] })
       return
     }
@@ -98,8 +109,13 @@ function createFakeProvider(name) {
       state.analysisRequests += 1
       state.activeRequests += 1
       state.peakActiveRequests = Math.max(state.peakActiveRequests, state.activeRequests)
-      await discardBody(request)
+      state.requestBodies.push(await readBodyText(request))
       try {
+        if (state.authFailNext > 0) {
+          state.authFailNext -= 1
+          sendJson(response, 401, { error: { message: `${name} simulated invalid token` } })
+          return
+        }
         if (state.failNext > 0) {
           state.failNext -= 1
           sendJson(response, 502, { error: { message: `${name} simulated gateway failure` } })
@@ -373,6 +389,51 @@ test('provider pool balances requests and isolates a failing channel', async () 
     assert.equal(primary.state.analysisRequests, 1)
     assert.equal(secondary.state.analysisRequests, 1)
 
+    // One bad credential must not consume the request assigned to it. The
+    // scheduler quarantines only that channel and transparently reroutes the
+    // request through the remaining provider capacity.
+    const resetPrimaryRuntime = await requestJson(baseUrl, '/api/ai/channels/primary', { body: { model: 'test-model' } })
+    assert.equal(resetPrimaryRuntime.response.status, 200)
+    primary.state.authFailNext = 1
+    const authFailover = await Promise.all([
+      requestJson(baseUrl, '/api/ai/task-guidance', { body: guidancePayload }),
+      requestJson(baseUrl, '/api/ai/task-guidance', { body: guidancePayload }),
+    ])
+    assert.deepEqual(authFailover.map(({ response }) => response.status), [200, 200])
+    assert.equal(authFailover.every(({ payload }) => payload.metadata.provider.channelId === 'secondary'), true)
+    const authStatus = await requestJson(baseUrl, '/api/ai/status')
+    const authFailedPrimary = authStatus.payload.channels.find((channel) => channel.id === 'primary')
+    assert.equal(authFailedPrimary.runtime.status, 'authentication-failed')
+    assert.equal(authFailedPrimary.runtime.healthy, false)
+    assert.equal(authStatus.payload.scheduler.authenticationFailedChannelCount, 1)
+    assert.equal(authStatus.payload.scheduler.totalMaxConcurrency, 1)
+
+    // Saving the channel is the explicit recovery boundary. It clears the
+    // runtime quarantine without requiring a proxy restart.
+    const recoveredPrimary = await requestJson(baseUrl, '/api/ai/channels/primary', { body: { model: 'test-model' } })
+    assert.equal(recoveredPrimary.response.status, 200)
+    assert.notEqual(recoveredPrimary.payload.channel.runtime.status, 'authentication-failed')
+
+    // A credential rejected by /models must be removed before any chat
+    // segment is sent through that channel. This prevents a full concurrency
+    // wave of identical 401 failures at the beginning of a large run.
+    primary.state.modelAuthFailNext = 1
+    const resetPrimaryPreflight = await requestJson(baseUrl, '/api/ai/channels/primary', { body: { model: 'test-model' } })
+    assert.equal(resetPrimaryPreflight.response.status, 200)
+    const primaryAnalysisBeforePreflight = primary.state.analysisRequests
+    const preflightFailover = await requestJson(baseUrl, '/api/ai/task-guidance', { body: guidancePayload })
+    assert.equal(preflightFailover.response.status, 200)
+    assert.equal(preflightFailover.payload.metadata.provider.channelId, 'secondary')
+    assert.equal(primary.state.analysisRequests, primaryAnalysisBeforePreflight)
+    const preflightStatus = await requestJson(baseUrl, '/api/ai/status')
+    const preflightFailedPrimary = preflightStatus.payload.channels.find((channel) => channel.id === 'primary')
+    assert.equal(preflightFailedPrimary.runtime.status, 'authentication-failed')
+    assert.equal(preflightFailedPrimary.runtime.lastErrorCode, 'PROVIDER_AUTHENTICATION_FAILED')
+
+    const recoveredPreflightPrimary = await requestJson(baseUrl, '/api/ai/channels/primary', { body: { model: 'test-model' } })
+    assert.equal(recoveredPreflightPrimary.response.status, 200)
+    assert.notEqual(recoveredPreflightPrimary.payload.channel.runtime.status, 'authentication-failed')
+
     primary.state.failNext = 1
     const failed = await requestJson(baseUrl, '/api/ai/task-guidance', { body: guidancePayload })
     assert.equal(failed.response.status, 502)
@@ -403,6 +464,58 @@ test('provider pool balances requests and isolates a failing channel', async () 
     assert.deepEqual(analysis.payload.candidates, [])
     assert.equal(analysis.payload.metadata.provider.attemptCount >= 1, true)
     assert.equal(primary.state.analysisRequests + secondary.state.analysisRequests, requestsBeforeAnalysis + 1)
+
+    const compactAnalysisPayload = {
+      ...analysisPayload,
+      conversation: {
+        ...analysisPayload.conversation,
+        recordFormat: 'compact-v2',
+        analysisAsOf: '2026-08-05T12:00:00.000Z',
+        timeZone: 'Asia/Shanghai',
+        utcOffsetMinutes: 480,
+        counterpartName: 'Regression test contact',
+      },
+      records: [
+        { id: 'record-1', sentAt: '2026-07-31T10:00:00.000Z', content: '明天下午一起喝咖啡吗？', speakerRole: 'other' },
+        { id: 'record-2', sentAt: '2026-07-31T10:01:00.000Z', content: '可以，地点稍后确认。', speakerRole: 'self' },
+      ],
+    }
+    const compactAnalysis = await requestJson(baseUrl, '/api/ai/analyze', { body: compactAnalysisPayload })
+    assert.equal(compactAnalysis.response.status, 200)
+    const compactProviderBody = secondary.state.requestBodies.at(-1) ?? primary.state.requestBodies.at(-1) ?? ''
+    assert.match(compactProviderBody, /RecordRef, sentAt, content, speakerRole/)
+    assert.match(compactProviderBody, /analysisAsOf=2026-08-05T12:00:00\.000Z/)
+    assert.match(compactProviderBody, /Asia\/Shanghai/)
+    assert.match(compactProviderBody, /UTC\+08:00/)
+    assert.match(compactProviderBody, /direct-conversation counterpart is Regression test contact/)
+    assert.doesNotMatch(compactProviderBody, /senderDisplayName/)
+    assert.doesNotMatch(compactProviderBody, /\[RecordRef, formattedTime, type, content/)
+
+    const compactPeople = await requestJson(baseUrl, '/api/ai/people', { body: compactAnalysisPayload })
+    assert.equal(compactPeople.response.status, 200)
+    const compactPeopleBody = secondary.state.requestBodies.at(-1) ?? ''
+    assert.match(compactPeopleBody, /counterpartName: Regression test contact/)
+    assert.match(compactPeopleBody, /RecordRef, sentAt, content, speakerRole/)
+    assert.doesNotMatch(compactPeopleBody, /senderDisplayName/)
+
+    const summaryOnlyPayload = {
+      ...analysisPayload,
+      conversation: {
+        ...analysisPayload.conversation,
+        totalRecords: 1,
+        recordCount: 1,
+        coreRecordIndexes: [1],
+        analysisAsOf: 'not-a-date',
+        timeZone: 'invalid/zone',
+      },
+      records: [{ id: 'summary-only', summary: 'summary-only evidence', speakerRole: 'other' }],
+    }
+    const summaryOnly = await requestJson(baseUrl, '/api/ai/analyze', { body: summaryOnlyPayload })
+    assert.equal(summaryOnly.response.status, 200)
+    const summaryOnlyBody = secondary.state.requestBodies.at(-1) ?? primary.state.requestBodies.at(-1) ?? ''
+    assert.match(summaryOnlyBody, /summary-only evidence/)
+    assert.doesNotMatch(summaryOnlyBody, /not-a-date/)
+    assert.doesNotMatch(summaryOnlyBody, /invalid\/zone/)
 
     await delay(50)
     const logDirectory = join(runtimeRoot, 'logs')
@@ -816,13 +929,14 @@ test('auto mode learns a Responses protocol incompatibility and reuses Chat Comp
 
 test('people consolidation preserves structured evidence claims for renderer verification', async () => {
   const runtimeRoot = sharedRuntimeRoot
+  let mergeRequestBody = ''
   const provider = http.createServer(async (request, response) => {
     const path = new URL(request.url, 'http://127.0.0.1').pathname
     if (request.method === 'GET' && path === '/v1/models') {
       sendJson(response, 200, { data: [{ id: 'test-model' }] })
       return
     }
-    await discardBody(request)
+    mergeRequestBody = await readBodyText(request)
     if (request.method === 'POST' && path === '/v1/responses') {
       sendJson(response, 200, {
         output_text: JSON.stringify({
@@ -834,7 +948,11 @@ test('people consolidation preserves structured evidence claims for renderer ver
           profileNotesUsed: false,
           factClaimIds: ['claim-fact'],
           preferenceClaimIds: ['claim-preference'],
-          portraitBlocks: [{ text: '对蛋挞有过单次正向评价', claimIds: ['claim-fact', 'claim-preference'], reason: 'preference' }],
+          portraitBlocks: [{ text: '对蛋挞有过单次正向评价', claimIds: ['claim-fact', 'claim-preference'], reason: 'preference' }, {
+            text: '2026年5月27日，对方曾提醒你不要继续吃坏掉的荔枝；此后仍有可核实互动。',
+            claimIds: ['claim-event', 'claim-fact'],
+            reason: 'trajectory',
+          }],
           coverageNote: null,
           // Exercise the new strict merge contract without legacy fields.
           ...{ facts: undefined, preferences: undefined, portrait: undefined, portraitSourceIds: undefined },
@@ -869,6 +987,8 @@ test('people consolidation preserves structured evidence claims for renderer ver
             quote: '蛋挞好吃',
             sourceIds: ['record-1'],
             evidenceStrength: 'single',
+            firstObservedAt: '2026-07-30T12:00:00.000Z',
+            lastObservedAt: '2026-07-30T12:00:00.000Z',
           }, {
             id: 'claim-preference',
             kind: 'preference',
@@ -876,21 +996,49 @@ test('people consolidation preserves structured evidence claims for renderer ver
             quote: '蛋挞好吃',
             sourceIds: ['record-1'],
             evidenceStrength: 'single',
+            firstObservedAt: '2026-07-30T12:00:00.000Z',
+            lastObservedAt: '2026-07-30T12:00:00.000Z',
+          }, {
+            id: 'claim-event',
+            kind: 'event',
+            text: '2026年5月27日，对方曾提醒你不要继续吃坏掉的荔枝',
+            quote: '你拍一张我看看',
+            sourceIds: ['record-may-27'],
+            evidenceStrength: 'single',
+            category: 'interaction',
+            stability: 'single',
+            portraitEligible: true,
+            firstObservedAt: '2026-05-27T12:00:00.000Z',
+            lastObservedAt: '2026-05-27T12:00:00.000Z',
           }],
           facts: ['曾表示蛋挞好吃'],
           preferences: ['对蛋挞有过单次正向评价'],
           advice: [],
           portrait: null,
+          profileNotes: '2026年6月曾删除好友，之后重新添加。',
         },
+        analysisAsOf: '2026-08-05T12:00:00.000Z',
+        latestInteractionAt: '2026-08-02T12:00:00.000Z',
       },
     })
     assert.equal(result.response.status, 200)
     assert.deepEqual(result.payload.preferences, [{ text: '对蛋挞有过单次正向评价', quote: '蛋挞好吃', sourceIds: ['record-1'] }])
     assert.deepEqual(result.payload.facts, [{ text: '曾表示蛋挞好吃', quote: '蛋挞好吃', sourceIds: ['record-1'] }])
     assert.deepEqual(result.payload.advice, [])
-    assert.deepEqual(result.payload.portraitSourceIds, ['record-1'])
-    assert.equal(result.payload.portraitBlocks.length, 1)
+    assert.deepEqual(result.payload.portraitSourceIds, ['record-1', 'record-may-27'])
+    assert.equal(result.payload.portraitBlocks.length, 2)
+    assert.equal(result.payload.portraitBlocks[0].temporalScope, 'recent')
+    assert.equal(result.payload.portraitBlocks[0].observedTo, '2026-07-30T12:00:00.000Z')
+    assert.equal(result.payload.portraitBlocks[1].temporalScope, 'change')
+    assert.equal(result.payload.portraitBlocks[1].reason, 'trajectory')
+    assert.equal(result.payload.portraitSchemaVersion, 5)
     assert.equal(result.payload.profileNotesUsed, false)
+    const mergeEnvelope = JSON.parse(mergeRequestBody)
+    const mergePrompt = mergeEnvelope.input[0].content[0].text
+    assert.match(mergePrompt, /temporalScope/)
+    assert.match(mergePrompt, /2026-07-06T12:00:00\.000Z/)
+    assert.match(mergePrompt, /\"kind\":\"event\"/)
+    assert.match(mergePrompt, /2026年6月曾删除好友，之后重新添加/)
   } finally {
     await Promise.allSettled([close(proxy), close(provider)])
     await cleanupRuntimeRoot(runtimeRoot)

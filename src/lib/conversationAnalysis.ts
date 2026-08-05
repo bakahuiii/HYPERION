@@ -92,18 +92,17 @@ export function inferConversationKind(item: Pick<IntelItem, 'conversationId' | '
 }
 
 function recordSize(item: IntelItem) {
-  // Mirror the six-field compact row sent by aiClient/server instead of only
-  // counting message text. This includes sender labels, role metadata, JSON
-  // punctuation, and the timestamp in the segment budget.
+  // Mirror the four-field compact-v2 row sent by aiClient/server instead of
+  // counting local audit fields that never enter the model prompt.
+  const content = [item.content, item.summary, item.title]
+    .find((value): value is string => typeof value === 'string' && value.trim().length > 0)
   const compactRow = [
     0,
     item.capturedAt || null,
-    item.messageType || null,
-    item.content || item.summary || '',
-    item.speaker || null,
+    content?.trim().slice(0, 3_000) || '[non-text message]',
     item.speakerRole || 'unknown',
   ]
-  return Math.max(96, JSON.stringify(compactRow).length + 8)
+  return Math.max(64, JSON.stringify(compactRow).length + 8)
 }
 
 function orderedRecords(records: IntelItem[]) {

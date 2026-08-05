@@ -2,7 +2,7 @@
 
 [简体中文](DEVELOPER_GUIDE.md) | [English](DEVELOPER_GUIDE.en.md)
 
-本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.4.1` 源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 的逐字段定义为准。
+本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.4.2` 源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 的逐字段定义为准。
 
 ## 1. 项目定位与工程边界
 
@@ -269,8 +269,12 @@ AppData（React 内存）
 每条估算大小：
 
 ```text
-max(96, content.length + capturedAt.length + speaker.length + type.length + 72)
+max(64, JSON.stringify([RecordRef, sentAt, content.slice(0, 3000), speakerRole]).length + 8)
 ```
+
+这个估算与实际 `compact-v2` 行一致。计算分段大小时不能再计入
+`messageType`、`speaker` 等本地审计字段，否则规划器会在请求实际还没到
+上限前过早切段，增加不必要的 overlap 和重复上下文开销。
 
 父会话预算使用对数曲线：
 
@@ -295,11 +299,12 @@ budget = clamp(round(48,000 / max(1, scale)), 14,000, 34,000)
 
 ### 9.1 本地客户端
 
-`src/lib/aiClient.ts` 将 `ConversationAnalysisJob` 转换为请求，保留：
+`src/lib/aiClient.ts` 将 `ConversationAnalysisJob` 转换为请求。完整字段只在本地保留；发给模型的请求只保留会影响时间、正文、证据引用和发言方向的字段：
 
 - 会话 ID、名称、类型和父会话总记录数；
 - 段号、段总数、核心记录索引、历史标记；
-- 每条记录的原始 ID、时间、类型、正文、发言人和方向；
+- 每条记录的短期稳定引用、`sentAt`、正文和已在本地确认的 `speakerRole`；
+- direct 会话的会话级 `counterpartName`，以及本次请求的 `analysisAsOf`、`timeZone` 和 `utcOffsetMinutes`；
 - AI 模式、时效策略、自定义提示和最近磨合记录；
 - 第一段附件。
 
@@ -320,10 +325,10 @@ budget = clamp(round(48,000 / max(1, scale)), 14,000, 34,000)
 模型输入把每条记录压缩为：
 
 ```json
-["RecordRef", "formattedTime", "type", "content", "senderDisplayName", "speakerRole"]
+["RecordRef", "sentAt", "content", "speakerRole"]
 ```
 
-短 `RecordRef` 减少重复长 ID 和 JSON 键名的 token 开销。模型响应返回引用号后，服务端恢复原始 ID。
+短 `RecordRef` 减少重复长 ID 和 JSON 键名的 token 开销。`type` 和 `senderDisplayName` 仍属于本地审计字段，但不再占用模型上下文。模型响应返回引用号后，服务端恢复原始 ID。`analysisAsOf` 只参与时效判断，不能为缺失消息时间补日期；`timeZone`/`utcOffsetMinutes` 说明无偏移 `sentAt` 使用的本地时钟；`counterpartName` 是 direct 人物主体的会话级身份来源。
 
 ### 9.3 提示词层次
 
@@ -344,6 +349,25 @@ budget = clamp(round(48,000 / max(1, scale)), 14,000, 34,000)
 Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `response_format: json_schema`。兼容通道返回明确的 schema 400/422 时降级为 `json_object`，随后仍在本地规范化和验证。
 
 任务-only 输出上限 3,000 tokens；任务+人物联合输出 3,200；人物证据接口 2,400；人物归并 1,800；任务建议 1,200。
+
+### 9.4.1 从导出记录到可审核对象
+
+```text
+导出文件
+  -> 本地递归解析与去重
+  -> 本地确定 conversationId / kind / speakerRole / avatar
+  -> 按会话排序并切成连续核心段 + overlap
+  -> 生成 compact-v2 模型 JSON
+  -> 模型返回结构化候选和 RecordRef
+  -> 服务端恢复本地消息 ID
+  -> 客户端校验执行者、时间、来源、过期状态和重复项
+  -> 候选进入审核队列（不会直接创建正式任务）
+  -> 用户确认后持久化为任务图节点
+```
+
+任务阶段只回答一个问题：**聊天中是否存在仍需要“你”执行的下一步？** 核心段必须提供新候选的证据；overlap 只能消解“这件事/那里/明天”等指代，不能单独产生新候选。`sourceIds` 在模型侧是 `RecordRef`，恢复后才是本地消息 ID。客户端会再次核对每个引用的实际正文和 `speakerRole`，并按信息源时间与明确目标时间区分“来源时间”和“目标时间”。同一事项跨 overlap 重复返回时，客户端以规范化标题、时间、地点和来源集合去重，不会因为分段而创建重复任务。
+
+人物阶段与任务阶段分离：任务使用较小核心段以保持行动判断清晰，人物使用 direct 会话的宽窗口以保留偏好和跨时间上下文。人物模型只返回 claim-level 证据（`text`、`quote`、`sourceIds`），不在分段阶段写画像或建议；只有所有段完成并通过本地引用校验后，才进入归并阶段生成 portrait/advice。这样可以把“原文事实”“人物刻画”“交互建议”分开审核，也避免单段上下文不足时写出确定性性格结论。
 
 ### 9.5 API 模式回退
 
@@ -388,9 +412,30 @@ Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `respon
 - 记录方向为 self 时只可用于关系上下文，不可当成对方事实；
 - 同名人物只有在会话 ID 或证据重叠时合并，不只靠名称合并。
 
+每个人物证据请求的模型行仍是 `[RecordRef, sentAt, content, speakerRole]`。direct 会话在 envelope 中额外携带 `counterpartName`、`timeZone` 和 `utcOffsetMinutes`；主体由本地 `speakerRole=other` 的稳定名称或会话名称确认。模型不得从正文、称呼、头像或关系词另造人物。每条 claim 的最低闭环是：
+
+```json
+{
+  "text": "曾表示蛋挞好吃",
+  "quote": "蛋挞好吃",
+  "sourceIds": ["local-message-id"],
+  "speakerRole": "other"
+}
+```
+
+其中 `quote` 必须是被引用消息的连续原文子串，`sourceIds` 必须来自当前核心段；self 消息只能作为互动背景，不能成为人物事实的证据。单次“蛋挞好吃”只能保留为一次表达，不能自动升级成“爱吃蛋挞”。重复、持久的同类表达才可以在归并阶段收敛为保守偏好。
+
 ### 10.2 归并
 
-人物 facts 是最多 48 条的内部证据缓冲，UI 主要显示收敛后的 portrait/preferences/advice。自动更新有三层增量边界：会话 fingerprint 只选择已发生变化的私聊；`incrementalConversationRecords` 只提交新增消息及每条新增消息之前最多 16 条上下文；`mergePersonEvidence` 按已核验 claim/source 去重，只有 evidence signature 改变才失效并重新生成 portrait。归并仍读取该人物的完整已核验证据，以免局部文本覆盖旧画像，但不会重发原始聊天；请求期间新写入的证据会使旧响应失效并重新排队。每个人最多自动重试 3 次，避免无限归并循环。
+人物的已核验 facts/preferences/events 全量保存在本地证据归档中，不再按固定 48/12/8 条截断；为控制单次画像请求大小，模型工作集按时间、关键事件、月份锚点和证据价值选择最多 96 条。自动更新有三层增量边界：会话 fingerprint 只选择已发生变化的私聊；`incrementalConversationRecords` 只提交新增消息及每条新增消息之前最多 16 条上下文；`mergePersonEvidence` 按已核验 claim/source 去重，只有 evidence signature 改变才失效并重新生成 portrait。归并仍读取该人物的完整已核验证据，以免局部文本覆盖旧画像，但不会重发原始聊天；请求期间新写入的证据会使旧响应失效并重新排队。每个人最多自动重试 3 次，避免无限归并循环。
+
+归并输入只允许使用已通过 quote、source ID 和发言方向校验的 claims，以及用户明确填写的 `profileNotes`。归并输出必须区分三层：
+
+1. `facts/preferences`：可逐条追溯的事实或偏好，不得新增输入中没有的断言；
+2. `portrait`：把多条已核验信号组织成可读叙述，证据不足时直接省略该方面，不把“证据不足”写进正文；
+3. `advice`：只有至少两条独立信号支持时才给出，并且必须是可撤销、尊重边界的条件式建议。
+
+每次归并完成后，客户端会检查人物仍有有效 claim 或明确的用户背景；空画像不会被标记为永久成功，失败会保留重试入口。删除人物会清理其当前内容、旧模型引用和归并签名，但不会屏蔽未来新证据重新建立人物卡。
 
 ### 10.3 头像
 
@@ -487,9 +532,10 @@ Leaflet 请求本地 `/api/map/tiles/{z}/{x}/{y}.png?provider=&cacheMaxMb=`。�
 
 INI v4 分为 `[meta]`、`[profile]`、`[appearance]`、`[ai]`、`[map]`、兼容主通道 `[provider]` 和通道池 `[providers]`。`[providers] channels` 保存通道数组，`primaryId` 保存主通道；桌面版通道只写 `credentialRef`，密钥密文放在凭据容器。所有值 URL encode，JSON 子对象再整体编码。写入前做长度、枚举、URL 和数值归一化。
 
-启动优先级：已有 INI > 一次性迁移 legacy provider > 环境变量默认值。环境变量：
+启动优先级：已有 INI > 一次性迁移 legacy provider > 显式启用的环境变量默认值。桌面版默认忽略父进程中继承的 `OPENAI_*`，防止 IDE、Codex 或终端宿主的凭据污染用户通道；只有设置 `THEIA_USE_ENV_PROVIDER=1` 才读取环境通道。环境变量：
 
 ```text
+THEIA_USE_ENV_PROVIDER=1
 OPENAI_API_KEY
 OPENAI_BASE_URL
 OPENAI_MODEL
@@ -566,7 +612,7 @@ node --check electron/main.mjs
 ### 18.2 打包器
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.4.1\THEIA-release-0.4.1
+node release-tools/package-release.mjs ..\staging\v0.4.2\THEIA-release-0.4.2
 ```
 
 打包器要求目标在源码目录之外且不存在，避免误覆盖。它复制必要源码、锁文件、发布文档、默认资源和虚构示例，并生成 `RELEASE_MANIFEST.json`。明确排除：
@@ -617,7 +663,7 @@ GH_TOKEN=<仅发布 GitHub Release 时使用>
 
 ## 20. 已知风险与后续优先级
 
-`0.4.1` 在 `0.4.0` 的存储与可靠性基础上，增加了重叠分段安全去重、以人为中心的人物搜索与排序、联系概览、来源感知的对话预览和受约束的人际建议。仍需继续处理：
+`0.4.2` 在 `0.4.1` 的人际信息基础上，补齐紧凑模型协议、会话级人物主体识别、时间边界、人物关键事件、结构化连续画像和多通道恢复能力。人物归并由证据提炼完成后统一启动，避免分段到达时反复取消；画像版本、持久化与服务端日志统一升级，旧画像会安全重写。仍需继续处理：
 
 - 将 `App.tsx` 中人物归并、任务建议和领域 reducer 继续拆成可单测模块；
 - 为地图缓存加入命中率/清理统计和显式“清空地图缓存”；

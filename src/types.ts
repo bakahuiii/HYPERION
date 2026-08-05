@@ -68,7 +68,7 @@ export interface Place {
   radiusMeters?: number
 }
 
-export type PersonEvidenceKind = 'fact' | 'preference'
+export type PersonEvidenceKind = 'fact' | 'preference' | 'event'
 
 /**
  * A claim's role in a profile. Temporary and filler claims stay available for
@@ -119,7 +119,8 @@ export interface PersonEvidence {
   origin?: PersonEvidenceOrigin
 }
 
-export type PersonPortraitBlockReason = 'background' | 'preference' | 'habit' | 'interaction' | 'change' | 'other'
+export type PersonPortraitBlockReason = 'background' | 'preference' | 'habit' | 'interaction' | 'change' | 'trajectory' | 'other'
+export type PersonPortraitBlockTemporalScope = 'recent' | 'historical' | 'change' | 'undated'
 
 export interface PersonPortraitBlock {
   id: string
@@ -127,6 +128,10 @@ export interface PersonPortraitBlock {
   claimIds: string[]
   sourceIds: string[]
   reason?: PersonPortraitBlockReason
+  /** Derived locally from cited claim timestamps; the model cannot choose it. */
+  temporalScope?: PersonPortraitBlockTemporalScope
+  observedFrom?: string
+  observedTo?: string
 }
 
 export interface PersonPortraitCoverage {
@@ -136,6 +141,17 @@ export interface PersonPortraitCoverage {
   firstObservedAt?: string
   lastObservedAt?: string
   categories: PersonEvidenceCategory[]
+  /** Absolute generation reference used to classify recent versus historical evidence. */
+  analysisAsOf?: string
+  recentWindowDays?: number
+  recentCutoffAt?: string
+  recentClaimCount?: number
+  historicalClaimCount?: number
+  undatedClaimCount?: number
+  recentSourceCount?: number
+  historicalSourceCount?: number
+  latestEvidenceAgeDays?: number
+  recentEvidenceStatus?: 'none' | 'limited' | 'available'
   /** Generated metadata, kept separate from the readable portrait text. */
   note?: string
 }

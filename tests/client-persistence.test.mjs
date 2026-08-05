@@ -20,9 +20,17 @@ import { buildConversationAnalysisPlan, buildPeopleConversationAnalysisPlan } fr
 import { summarizeArchive } from '../src/lib/archiveSummary.ts'
 import { aiTaskCandidatesDuplicate, mergeAiTaskCandidates } from '../src/lib/aiCandidateDedup.ts'
 import { personEvidenceIdentityKey } from '../src/lib/personEvidenceIdentity.ts'
+import { canStartPersonConsolidation } from '../src/lib/peopleConsolidation.ts'
 import { createSeedData } from '../src/seed.ts'
 
 const file = (path, signature) => ({ path, signature })
+
+test('portrait consolidation waits for the evidence extraction fence', () => {
+  assert.equal(canStartPersonConsolidation(false, true), false)
+  assert.equal(canStartPersonConsolidation(false, false, true), false)
+  assert.equal(canStartPersonConsolidation(true, false), false)
+  assert.equal(canStartPersonConsolidation(false, false), true)
+})
 
 test('archive summary counts distinct direct and group conversations', () => {
   const record = (id, conversationId, conversationKind) => ({

@@ -3,6 +3,7 @@ import type { AiAnalysisWatermarks, AiExtractionCheckpoint, AiSettings, AppData 
 import { normalizeAppearance } from './appearance.ts'
 import { summarizeArchive } from './archiveSummary.ts'
 import { DEFAULT_AI_CONCURRENCY, normalizeAiConcurrency } from './aiConcurrency.ts'
+import { PERSON_PORTRAIT_PIPELINE_VERSION } from './personTemporal.ts'
 import { recoverArray } from './storageRecovery.ts'
 import { APP_STORAGE_SCHEMA, unwrapAppStorage, wrapAppStorage } from './storageSchema.ts'
 
@@ -12,7 +13,7 @@ const STORAGE_ROLLBACK_KEY = 'theia:v1:rollback'
 export const defaultPromptInstructions = {
   task: '优先保留仍需你处理、具体可执行的安排。约见、返校、报名、缴费、回复、预约、截止事项优先；闲聊、历史通知、已过期事项不输出。',
   people: '只提取对方自己明确说过的信息。优先保留能帮助你更好相处的明确边界、沟通方式、重复偏好和长期变化。偏好要保留证据强度：单次表达只是“曾有正向评价”，不是稳定习惯或性格。',
-  peopleMerge: '把已核验事实整理成自然、有人味但克制的人物理解：优先写对方如何沟通、明确在意或拒绝什么、重复出现的偏好、互动方式和有证据的变化；不要写关系分数、心理诊断或武断性格标签。建议必须帮助你尊重对方选择、先确认再行动、留出拒绝空间，并且每条都能回到至少两条证据。允许使用人物底稿，但必须与聊天事实分开。证据覆盖不到的方面直接省略。',
+  peopleMerge: '把已核验事实与关键互动事件整理成自然、有人味但克制的人物理解：优先写对方如何沟通、明确在意或拒绝什么、重复出现的偏好、重要的一次性事件、互动方式和有证据的变化或延续；不要写关系分数、心理诊断或武断性格标签。建议必须帮助你尊重对方选择、先确认再行动、留出拒绝空间，并且每条都能回到证据。允许使用人物底稿与日期明确的时间线注记，但必须与聊天事实分开。证据覆盖不到的方面直接省略。',
   taskGuidance: '建议要具体、尊重边界，优先给出可执行的准备、确认、倾听和备选方案。涉及他人时先保护对方选择权，避免催促、试探和操控。不足时建议优先补充时间、地点或对方当前偏好。',
 }
 
@@ -96,7 +97,11 @@ export function loadData(): AppData {
     const isModelPeople = [3, 4, 5].includes(Number(parsed.peopleModelVersion))
     const people = isModelPeople && Array.isArray(parsed.people)
       ? parsed.people.map((person) => {
-        const hasStructuredPortrait = Number(person?.portraitSchemaVersion) === 1 && Array.isArray(person?.portraitBlocks) && person.portraitBlocks.length > 0
+        const portraitSchemaVersion = Number(person?.portraitSchemaVersion)
+        const hasStructuredPortrait = portraitSchemaVersion >= 1
+          && portraitSchemaVersion <= PERSON_PORTRAIT_PIPELINE_VERSION
+          && Array.isArray(person?.portraitBlocks)
+          && person.portraitBlocks.length > 0
         const hasProfileBasis = hasStructuredPortrait && Boolean(person?.profileNotes?.trim()) && person?.profileNotesUsed === true && Boolean(person?.portrait?.trim())
         const hasChatBasis = Array.isArray(person?.evidence) && person.evidence.length > 0
         // Preserve only the new structured portrait; old prose is regenerated.
@@ -195,7 +200,7 @@ export function loadData(): AppData {
 function compactPeopleForQuota(data: AppData): AppData {
   const compactPeople = data.people.map((person) => {
     const evidence = Array.isArray(person.evidence)
-      ? person.evidence.slice(-120).map((claim) => ({
+      ? person.evidence.map((claim) => ({
         ...claim,
         text: claim.text.trim().slice(0, 360),
         quote: claim.quote.trim().slice(0, 140),
@@ -213,10 +218,10 @@ function compactPeopleForQuota(data: AppData): AppData {
     return {
       ...person,
       evidence,
-      facts: (Array.isArray(person.facts) ? person.facts : []).slice(0, 48),
-      preferences: (person.preferences ?? []).slice(0, 24),
+      facts: Array.isArray(person.facts) ? person.facts : [],
+      preferences: person.preferences ?? [],
       advice: (person.advice ?? []).slice(0, 9),
-      sourceIds: [...new Set([...(Array.isArray(person.sourceIds) ? person.sourceIds : []), ...evidence.flatMap((claim) => Array.isArray(claim.sourceIds) ? claim.sourceIds : [])])].slice(0, 120),
+      sourceIds: [...new Set([...(Array.isArray(person.sourceIds) ? person.sourceIds : []), ...evidence.flatMap((claim) => Array.isArray(claim.sourceIds) ? claim.sourceIds : [])])],
       portraitBlocks,
       portrait: person.portrait?.trim().slice(0, 3_600),
       portraitFailure: person.portraitFailure?.trim().slice(0, 360),
@@ -233,9 +238,9 @@ export function saveData(data: AppData) {
     // dashboard state in localStorage; the raw intel queue lives in IndexedDB.
     localStorage.setItem(STORAGE_KEY, JSON.stringify(wrapAppStorage(payload)))
   } catch {
-    // Browser quotas are commonly 5 MB. Retry once with bounded evidence
-    // strings and source arrays before reporting a persistence failure; the
-    // normal in-memory model is unchanged.
+    // Browser quotas are commonly 5 MB. Retry once with compact claim text,
+    // while preserving the complete fact/preference/evidence arrays; the
+    // server snapshot remains the authoritative large-data store.
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(wrapAppStorage({ ...compactPeopleForQuota(data), intel: [] })))
     } catch {

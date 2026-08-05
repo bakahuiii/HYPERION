@@ -110,6 +110,7 @@ function channelStatusLabel(channel: AiProviderChannel) {
   const runtime = channel.runtime
   if (!channel.enabled) return '已停用'
   if (!channel.configured) return channel.configurationError || '未配置'
+  if (runtime?.status === 'authentication-failed') return '认证失败'
   if (runtime?.status === 'cooling-down') {
     const remaining = Math.max(1, Math.ceil((runtime.cooldownRemainingMs || 0) / 100)) / 10
     return `短暂冷却 ${remaining.toFixed(1)}s`
@@ -121,6 +122,7 @@ function channelStatusLabel(channel: AiProviderChannel) {
 
 function channelStatusClass(channel: AiProviderChannel) {
   if (!channel.enabled || !channel.configured) return 'is-muted'
+  if (channel.runtime?.status === 'authentication-failed') return 'is-warn'
   if (channel.runtime?.status === 'cooling-down') return 'is-warn'
   if (channel.runtime?.status === 'at-capacity') return 'is-warn'
   return 'is-ready'
@@ -496,7 +498,7 @@ export function AiProviderPool({ globalConcurrency, onGlobalConcurrencyChange }:
 
   return <section className="options-section provider-pool-section">
     <div className="options-heading">
-      <div><ServerCog size={18} /><div><h3>模型通道池</h3><p>多个 API 会按各自容量持续分流；429、502、503 或超时只记录失败，不暂停或降低已保存的通道容量。Key 明文保存在本机通用 INI，不写入日志。</p></div></div>
+      <div><ServerCog size={18} /><div><h3>模型通道池</h3><p>多个 API 会按各自容量持续分流；429、502、503 或超时只记录失败，不暂停或降低已保存的通道容量。Key 由当前系统账户加密保存，不写入日志。</p></div></div>
       <div className="provider-pool-heading-actions"><span className={`ai-status ${status?.configured ? 'is-ready' : ''}`}>{status?.configuredChannelCount ?? channels.filter((channel) => channel.enabled && channel.configured).length} 路已配置 · 配置并发 {totalCapacity || 0}</span><button type="button" className="icon-button" title="刷新通道状态" aria-label="刷新通道状态" onClick={() => void refresh(true)}><RefreshCw size={15} className={loading ? 'is-spinning' : ''} /></button></div>
     </div>
     <div className="provider-usage-dashboard" aria-label="API 与通道使用率">
@@ -522,7 +524,7 @@ export function AiProviderPool({ globalConcurrency, onGlobalConcurrencyChange }:
           {channels.map((channel) => <article className={`provider-channel-row ${channel.id === selectedId && !creating ? 'is-selected' : ''}`} key={channel.id}>
             <button type="button" className="provider-channel-select" onClick={() => selectChannel(channel.id)} aria-pressed={channel.id === selectedId && !creating}>
               <span className={`provider-channel-dot ${channelStatusClass(channel)}`} />
-              <span className="provider-channel-copy"><strong>{channel.name}</strong><small>{channelHost(channel.baseUrl)} · {channel.model || '未选择模型'}</small></span>
+              <span className="provider-channel-copy"><strong>{channel.name}</strong><small>{channelHost(channel.baseUrl)} · {channel.model || '未选择模型'}{(channel.sharedCredentialCount ?? 0) > 1 ? ` · 共用凭据 ×${channel.sharedCredentialCount}` : ''}</small></span>
               <span className={`provider-channel-status ${channelStatusClass(channel)}`}>{channelStatusLabel(channel)}</span>
               <span className="provider-channel-capacity">{channel.runtime?.activeRequests ?? 0}/{channel.maxConcurrency}</span>
             </button>
@@ -542,13 +544,14 @@ export function AiProviderPool({ globalConcurrency, onGlobalConcurrencyChange }:
         <div className="provider-fields provider-fields--pool">
           <label><span>通道名称</span><input value={draft.name} onChange={(event) => updateDraft({ name: event.target.value })} placeholder="例如：主中转" /></label>
           <label className="provider-field-wide"><span>服务地址</span><input type="url" value={draft.url} onChange={(event) => updateDraft({ url: event.target.value })} placeholder="https://relay.example.com/v1" /></label>
-          <label className="provider-field-wide"><span>API Key</span><div className="provider-key-input"><KeyRound size={14} /><input type="text" autoComplete="off" spellCheck={false} value={draft.key} onChange={(event) => updateDraft({ key: event.target.value })} placeholder="明文保存在本机 INI" /></div></label>
+          <label className="provider-field-wide"><span>API Key</span><div className="provider-key-input"><KeyRound size={14} /><input type="text" autoComplete="off" spellCheck={false} value={draft.key} onChange={(event) => updateDraft({ key: event.target.value })} placeholder="由当前系统账户加密保存" /></div></label>
           <label className="provider-model-field"><span>模型 ID</span>{models.length > 0 && <select value={manualModelEntry || !models.includes(draft.model) ? '__manual__' : draft.model} onChange={(event) => { if (event.target.value === '__manual__') setManualModelEntry(true); else { setManualModelEntry(false); updateDraft({ model: event.target.value }) } }}><option value="__manual__">手动输入模型 ID</option>{models.map((item) => <option value={item} key={item}>{item}</option>)}</select>}{(manualModelEntry || models.length === 0) && <input value={draft.model} onChange={(event) => updateDraft({ model: event.target.value })} placeholder="输入模型 ID" />}</label>
           <label><span>接口模式</span><select value={draft.apiMode} onChange={(event) => updateDraft({ apiMode: event.target.value as AiStatus['apiMode'] })}><option value="auto">自动兼容</option><option value="responses">Responses API</option><option value="chat-completions">Chat Completions</option></select></label>
           <label><span>通道并发容量</span><select value={normalizeAiConcurrency(draft.maxConcurrency)} onChange={(event) => updateDraft({ maxConcurrency: Number(event.target.value) })}>{Array.from({ length: 8 }, (_, index) => index + 1).map((value) => <option key={value} value={value}>{value} 个请求</option>)}</select></label>
           <label className="provider-enabled-toggle"><input type="checkbox" checked={draft.enabled} onChange={(event) => updateDraft({ enabled: event.target.checked })} /><span>参与自动分流</span></label>
         </div>
         <div className="provider-actions"><button type="button" className="secondary-button" onClick={() => void probe()} disabled={busy || !urlReady(draft.url) || !draft.key.trim()}><RefreshCw size={15} />{busy ? '处理中' : '检测模型'}</button><button type="button" className="primary-button" onClick={() => void save()} disabled={busy || (!creating && !selectedId && !draft.model.trim())}><Save size={15} />保存通道</button><input ref={configInputRef} type="file" accept=".json,application/json" onChange={(event) => void importConnection(event)} hidden /><button type="button" className="secondary-button" onClick={() => configInputRef.current?.click()} disabled={busy}><FileJson size={15} />导入为新通道</button></div>
+        {activeChannel?.runtime?.status === 'authentication-failed' && <p className="provider-message is-error" role="alert">上游已明确拒绝当前 API Key。请替换为属于该服务地址的有效 Key，再点击“检测模型”和“保存通道”。</p>}
         {message && <p className="provider-message" role="status">{message}</p>}
       </div>
     </div>

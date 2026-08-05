@@ -22,7 +22,7 @@ const imageTypes = new Map([
 const defaultPromptInstructions = {
   task: '优先保留仍需你处理、具体可执行的安排。约见、返校、报名、缴费、回复、预约、截止事项优先；闲聊、历史通知、已过期事项不输出。',
   people: '只提取对方自己明确说过的信息。偏好要保留证据强度：单次表达只是“曾有正向评价”，不是稳定习惯或性格。',
-  peopleMerge: '将已核验聊天事实按时间线收敛成简洁的人物志：只写原文能支持的经历、明确偏好、重复互动模式和有证据的变化；单次表达保留单次强度。允许使用人物底稿，但必须与聊天事实分开，不能补写未知背景。证据不足时明确说明边界。',
+  peopleMerge: '将已核验聊天事实与关键互动事件按时间线收敛成简洁的人物志：只写原文能支持的经历、明确偏好、重复互动模式、重要的一次性事件和有证据的变化或延续；单次表达保留单次强度。人物底稿也可包含你确认过的日期与时间线注记，用于解释聊天无法证明的删好友、重新添加或其他偶然节点，但必须与聊天事实分开，不能补写未知背景。证据不足时明确说明边界。',
   taskGuidance: '建议要具体、尊重边界，优先给出可执行的准备、确认和备选方案。不足时建议优先补充时间、地点或对方偏好。',
 }
 
@@ -71,16 +71,20 @@ export function normalizeMapSettings(input, fallback = { tileProvider: 'osm-de',
 }
 
 function environmentProvider() {
+  // Desktop and IDE processes often inherit unrelated host credentials.
+  // Treat environment-provider configuration as an explicit compatibility
+  // mode so an ambient OPENAI_API_KEY can never enter the user's settings.
+  const environmentEnabled = process.env.THEIA_USE_ENV_PROVIDER === '1'
   return {
     id: 'primary',
     name: '主通道',
     enabled: true,
-    apiKey: text(process.env.OPENAI_API_KEY, 1000),
-    baseURL: text(process.env.OPENAI_BASE_URL, 1000) || 'https://api.openai.com/v1',
-    model: text(process.env.OPENAI_MODEL, 200) || 'gpt-5-mini',
-    apiMode: supportedModes.has(process.env.OPENAI_API_MODE) ? process.env.OPENAI_API_MODE : 'auto',
+    apiKey: environmentEnabled ? text(process.env.OPENAI_API_KEY, 1000) : '',
+    baseURL: environmentEnabled ? text(process.env.OPENAI_BASE_URL, 1000) || 'https://api.openai.com/v1' : 'https://api.openai.com/v1',
+    model: environmentEnabled ? text(process.env.OPENAI_MODEL, 200) || 'gpt-5-mini' : 'gpt-5-mini',
+    apiMode: environmentEnabled && supportedModes.has(process.env.OPENAI_API_MODE) ? process.env.OPENAI_API_MODE : 'auto',
     models: [],
-    maxConcurrency: clamp(process.env.OPENAI_MAX_CONCURRENCY, 1, 8, 4),
+    maxConcurrency: environmentEnabled ? clamp(process.env.OPENAI_MAX_CONCURRENCY, 1, 8, 4) : 4,
   }
 }
 
@@ -260,11 +264,15 @@ function normalizeProvider(input, fallback, index = 0) {
   }
 }
 
-function normalizeProviders(input, fallbackProvider) {
+export function normalizeProviderRecords(input, fallbackProvider) {
   const records = Array.isArray(input) && input.length ? input.slice(0, 32) : [fallbackProvider]
   const usedIds = new Set()
   return records.map((record, index) => {
-    const channelFallback = index === 0 ? fallbackProvider : { ...environmentProvider(), id: `channel-${index + 1}`, name: `通道 ${index + 1}` }
+    // Protected channels omit apiKey and retain only credentialRef. Never
+    // inherit the process-wide OPENAI_API_KEY for channel 2+.
+    const channelFallback = index === 0
+      ? fallbackProvider
+      : { ...environmentProvider(), apiKey: '', id: `channel-${index + 1}`, name: `通道 ${index + 1}` }
     const normalized = normalizeProvider(record, channelFallback, index)
     const baseId = normalized.id
     let id = baseId
@@ -277,7 +285,7 @@ function normalizeProviders(input, fallbackProvider) {
 
 function normalizeSettings(input, fallback = defaultSettings()) {
   const requestedPrimary = normalizeProvider(input?.provider, fallback.provider)
-  const providers = normalizeProviders(input?.providers, requestedPrimary)
+  const providers = normalizeProviderRecords(input?.providers, requestedPrimary)
   const requestedPrimaryId = normalizeProviderId(input?.primaryProviderId, requestedPrimary.id)
   const provider = providers.find((channel) => channel.id === requestedPrimaryId) ?? providers[0]
   return {
@@ -315,12 +323,14 @@ async function hydrateProviderCredentials(settings) {
   const providers = []
   for (const channel of settings.providers) {
     const credentialRef = credentialReference(channel)
-    let apiKey = channel.apiKey
-    if (apiKey) {
-      await saveCredential(credentialRef, apiKey)
+    // An existing encrypted credential belongs to this channel and wins over
+    // any fallback value produced while parsing the INI. Otherwise an ambient
+    // OPENAI_API_KEY can silently replace every per-channel secret.
+    const storedCredential = await loadCredential(credentialRef)
+    const apiKey = storedCredential || channel.apiKey
+    if (!storedCredential && channel.apiKey) {
+      await saveCredential(credentialRef, channel.apiKey)
       migratedPlaintext = true
-    } else {
-      apiKey = await loadCredential(credentialRef) ?? ''
     }
     providers.push({ ...channel, apiKey, credentialRef })
   }

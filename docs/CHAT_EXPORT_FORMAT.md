@@ -238,6 +238,33 @@ THEIA 不要求固定顶层键。它递归进入对象和数组，并把上层�
 
 如果完全识别不到消息对象，THEIA 会把 JSON 的叶子值扁平化成普通文本作为最后降级。这会丢失可靠结构，不应作为正式导入成功的标准。
 
+## 6.1 本地归档与模型请求的边界
+
+本地归档故意保留完整信息，便于审计、回看、人物头像获取和错误修复，包括 `type`、`senderDisplayName`、`speaker`、`speakerRole`、`avatarUrl`、平台、来源文件和原始时间。它们不等于模型请求格式。
+
+当前模型请求使用 `compact-v2`。本地先为每条消息确定 `speakerRole`，再按会话发送：
+
+```json
+{
+  "conversation": {
+    "kind": "direct",
+    "counterpartName": "林晓",
+    "analysisAsOf": "2026-08-05T12:00:00.000Z",
+    "timeZone": "Asia/Shanghai",
+    "utcOffsetMinutes": 480,
+    "recordFormat": "compact-v2"
+  },
+  "records": [
+    { "id": "msg-001", "sentAt": "2026-07-28T18:30:00.000Z", "content": "周六下午去图书馆讨论材料，可以吗？", "speakerRole": "other" },
+    { "id": "msg-002", "sentAt": "2026-07-28T18:31:12.000Z", "content": "可以，三点东门见。", "speakerRole": "self" }
+  ]
+}
+```
+
+实际 HTTP envelope 中每条记录带本地 `id` 和 `content`，服务端将其转换为模型看到的紧凑行 `[RecordRef, sentAt, content, speakerRole]`；响应中的 `sourceIds` 使用短 `RecordRef`，返回本地后再恢复为消息 ID。`counterpartName` 是 direct 会话唯一的人物主体来源；不能要求模型从省略的 `senderDisplayName` 猜人。`analysisAsOf` 只用于计算消息距分析时刻多久，不能替代 `sentAt` 解析“明天/下周”等相对日期。`timeZone`/`utcOffsetMinutes` 只描述会话时钟，不重复到每条记录。
+
+旧适配器可以继续上传 `formattedTime`、`type` 和 `senderDisplayName`，服务端会兼容读取并在发给模型前丢弃冗余字段。新适配器应优先输出 ISO 8601 的 `sentAt`、可靠的 `speakerRole` 和 direct 会话级主体。
+
 ## 7. 去重与更新
 
 每条导入 ID 基于：
@@ -283,15 +310,25 @@ THEIA 不要求固定顶层键。它递归进入对象和数组，并把上层�
 
 ```ts
 interface NormalizedMessage {
-  formattedTime: string
-  type: string
+  /** Stable within the source archive; THEIA may generate one when omitted. */
+  id?: string
+  /** ISO 8601 timestamp. Keep null/empty when the export cannot verify it. */
+  sentAt?: string | null
+  /** Original text, or a short exporter marker for non-text messages. */
   content: string
-  senderDisplayName: string
+  /** Determined locally from exporter metadata, never guessed from wording. */
   speakerRole: 'self' | 'other' | 'unknown'
-  senderId?: string
-  selfId?: string
-  avatar?: string
+  /** Optional local-audit fields; they are not sent in the compact model row. */
+  speaker?: string
+  avatarUrl?: string
 }
 ```
+
+因此，模型真正需要的最小记录是 `content + speakerRole`，并强烈建议提供
+`sentAt`。`type` 和 `senderDisplayName` 不是分析必需字段：只有在审计导出
+结果或恢复头像时有用，才保留在本地归档。会话级应提供
+`conversationId`、`conversationKind`，私聊还应提供已核验的
+`counterpartName`；`analysisAsOf` 和会话时钟每次请求提供一次，不要重复到
+每条消息。
 
 适配器应记录自身版本、来源平台、导出账户 ID、时区和附件根目录。严禁在适配器里把无法确认的方向默认成 other；unknown 比错误方向更安全。

@@ -61,6 +61,16 @@ test('custom segment options remain deterministic for tiny conversations', () =>
   assert.deepEqual(new Set(plan.jobs.flatMap((job) => job.coreRecordIds)), new Set(records.map((item) => item.id)))
 })
 
+test('planner keeps summary-only and non-text rows in the full conversation coverage', () => {
+  const records = [
+    { ...record(0), content: '', summary: 'summary-only row' },
+    { ...record(1), content: 42, summary: 7, title: '' },
+  ]
+  const plan = buildConversationAnalysisPlan(records, Date.parse('2026-08-20T00:00:00.000Z'))
+  assert.equal(plan.recordCount, records.length)
+  assert.deepEqual(new Set(plan.jobs.flatMap((job) => job.coreRecordIds)), new Set(records.map((item) => item.id)))
+})
+
 test('people segmentation widens the window without changing coverage semantics', () => {
   const records = Array.from({ length: 901 }, (_, index) => record(index, 'direct:people'))
   const plan = buildPeopleConversationAnalysisPlan(records, Date.parse('2026-08-20T00:00:00.000Z'))

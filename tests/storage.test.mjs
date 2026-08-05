@@ -6,6 +6,7 @@ import { APP_STORAGE_SCHEMA, APP_STORAGE_SCHEMA_VERSION, unwrapAppStorage, wrapA
 import { loadData, resetData, restoreRollbackData, saveData } from '../src/lib/storage.ts'
 import { compactIntelItem, compactIntelItems } from '../src/lib/intelPersistence.ts'
 import { planIntelDelta } from '../src/lib/intelDelta.ts'
+import { PERSON_PORTRAIT_PIPELINE_VERSION } from '../src/lib/personTemporal.ts'
 
 const values = new Map()
 globalThis.localStorage = {
@@ -45,6 +46,39 @@ test('loading a legacy payload keeps a rollback copy before migration', () => {
   assert.equal(JSON.parse(values.get('theia:v1:rollback')).profile.name, 'Legacy user')
   assert.equal(restoreRollbackData(), true)
   assert.equal(JSON.parse(values.get('theia:v1')).profile.name, 'Legacy user')
+})
+
+test('current structured person portraits survive a storage round trip', () => {
+  const data = createSeedData()
+  const person = data.people[0]
+  person.evidence = [{
+    id: 'claim-current',
+    kind: 'preference',
+    text: '对方曾表示喜欢散步',
+    quote: '我喜欢散步',
+    sourceIds: ['message-current', 'message-supporting'],
+    category: 'preference',
+    portraitEligible: true,
+  }]
+  person.portrait = '对方平时愿意通过散步放松，也会在聊天里直接表达自己的偏好。'
+  person.portraitBlocks = [{
+    text: person.portrait,
+    claimIds: ['claim-current'],
+    sourceIds: ['message-current', 'message-supporting'],
+    reason: 'preference',
+  }]
+  person.portraitSchemaVersion = PERSON_PORTRAIT_PIPELINE_VERSION
+  person.portraitSourceIds = ['message-current', 'message-supporting']
+  person.portraitEvidenceSignature = 'portrait-v4-signature'
+
+  saveData(data)
+  const loaded = loadData()
+  const restored = loaded.people.find((item) => item.id === person.id)
+
+  assert.equal(restored?.portrait, person.portrait)
+  assert.equal(restored?.portraitSchemaVersion, PERSON_PORTRAIT_PIPELINE_VERSION)
+  assert.equal(restored?.portraitEvidenceSignature, 'portrait-v4-signature')
+  assert.equal(restored?.portraitBlocks?.length, 1)
 })
 
 test('resetData clears the current snapshot and rollback copy', () => {

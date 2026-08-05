@@ -353,6 +353,8 @@ h1 { font-size: 26.5px; letter-spacing: .03em; }
 .person-portrait-note { margin: 18px 22px 0; padding: 13px 14px; border-left: 2px solid var(--gold); background: rgba(198, 152, 95, .08); }
 .person-portrait-note.is-insufficient { border-left-color: var(--line-strong); background: rgba(255, 255, 255, .025); }
 .person-portrait-note p { margin-top: 7px; color: var(--ink); font-size: 12.5px; line-height: 1.65; }
+.person-portrait-prose { display: grid; gap: 10px; margin-top: 9px; }
+.person-portrait-prose p { margin: 0; color: var(--ink); font-size: 12.5px; line-height: 1.8; }
 .person-portrait-note small { display: block; margin-top: 7px; color: var(--faint); font-size: 9.5px; line-height: 1.55; }
 .person-portrait-note > .secondary-button { margin-top: 10px; min-height: 30px; padding: 0 10px; font-size: 10.5px; }
 .person-profile-editor { display: grid; gap: 10px; margin: 14px 22px 0; padding: 14px; border: 1px solid var(--line); background: color-mix(in srgb, var(--surface-strong) 78%, transparent); }
@@ -366,10 +368,15 @@ h1 { font-size: 26.5px; letter-spacing: .03em; }
 .person-profile-editor-actions .secondary-button { min-height: 31px; padding: 0 10px; font-size: 10.5px; }
 .person-evidence-section { display: grid; gap: 7px; margin: 14px 22px 0; padding: 13px 14px; border-left: 2px solid color-mix(in srgb, var(--gold) 70%, var(--line)); background: rgba(198, 152, 95, .045); }
 .person-evidence-section--preference { border-left-color: color-mix(in srgb, var(--sage) 70%, var(--line)); background: rgba(121, 163, 138, .045); }
+.person-evidence-section--event { border-left-color: color-mix(in srgb, var(--accent) 78%, var(--line)); background: color-mix(in srgb, var(--accent) 6%, transparent); }
 .person-evidence-section .subsection-label { margin: 0 0 2px; }
 .person-evidence-section > div { display: grid; gap: 3px; }
 .person-evidence-section p { margin: 0; color: var(--muted); font-size: 10.5px; line-height: 1.55; }
 .person-evidence-section small { color: var(--faint); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+.person-evidence-age { display: inline-flex; align-items: center; min-height: 17px; margin-right: 4px; padding: 1px 5px; border: 1px solid color-mix(in srgb, var(--sage) 45%, var(--line)); border-radius: 2px; color: var(--sage); background: color-mix(in srgb, var(--sage) 8%, transparent); font-style: normal; white-space: nowrap; }
+.person-evidence-age.is-historical { border-color: var(--line); color: var(--faint); background: rgba(255, 255, 255, .02); }
+.person-evidence-age.is-undated { border-color: color-mix(in srgb, var(--gold) 35%, var(--line)); color: var(--gold); }
+.person-evidence-age.is-event { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .person-evidence-toggle { display: inline-flex; width: max-content; align-items: center; gap: 5px; margin-top: 3px; padding: 5px 0 1px; border: 0; color: var(--accent); background: transparent; font-size: 10px; cursor: pointer; }
 .person-evidence-toggle:hover { color: var(--ink); }
 .person-evidence-toggle:focus-visible { border-radius: 3px; outline: 1px solid var(--accent); outline-offset: 3px; }

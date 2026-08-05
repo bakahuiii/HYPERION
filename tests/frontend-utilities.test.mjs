@@ -6,6 +6,14 @@ import { parseIntelFile } from '../src/lib/importer.ts'
 import { incrementalConversationRecords } from '../src/lib/intelConversationView.ts'
 import { relativeInteractionLabel, summarizePersonInteraction } from '../src/lib/personInteraction.ts'
 import { isHumanCenteredAdvice, interpersonalAdviceRisk } from '../src/lib/interpersonalSafety.ts'
+import { counterpartIdentityEvidence } from '../src/lib/personCounterpart.ts'
+import {
+  historicalPortraitTextIsQualified,
+  personEvidenceTemporalScope,
+  portraitBlockTemporalMetadata,
+  selectProfileEvidence,
+  summarizePersonEvidenceTime,
+} from '../src/lib/personTemporal.ts'
 import { normalizeMapSettings } from '../server/settings.mjs'
 
 test('attachment queue separates text estimates from provider-priced media', () => {
@@ -135,8 +143,110 @@ test('person interaction summary is factual, deduplicated, and direction-aware',
   assert.equal(relativeInteractionLabel('2026-08-06T12:00:00Z', Date.parse('2026-08-05T12:00:00Z')), '明天')
 })
 
+test('person portrait time boundaries keep old evidence out of the current profile', () => {
+  const analysisAsOf = '2026-08-05T12:00:00.000Z'
+  const recent = {
+    id: 'recent',
+    kind: 'preference',
+    text: '曾表示最近在看电影',
+    quote: '最近在看电影',
+    sourceIds: ['recent-source'],
+    evidenceStrength: 'single',
+    category: 'preference',
+    portraitEligible: true,
+    firstObservedAt: '2026-07-30T12:00:00.000Z',
+    lastObservedAt: '2026-07-30T12:00:00.000Z',
+  }
+  const historical = {
+    ...recent,
+    id: 'historical',
+    text: '曾表示过去喜欢跑步',
+    quote: '那时候喜欢跑步',
+    sourceIds: ['historical-source'],
+    firstObservedAt: '2025-05-01T12:00:00.000Z',
+    lastObservedAt: '2025-05-01T12:00:00.000Z',
+  }
+
+  assert.equal(personEvidenceTemporalScope(recent, analysisAsOf), 'recent')
+  assert.equal(personEvidenceTemporalScope(historical, analysisAsOf), 'historical')
+  assert.deepEqual(portraitBlockTemporalMetadata([recent], analysisAsOf), {
+    temporalScope: 'recent',
+    observedFrom: '2026-07-30T12:00:00.000Z',
+    observedTo: '2026-07-30T12:00:00.000Z',
+  })
+  assert.equal(portraitBlockTemporalMetadata([recent, historical], analysisAsOf).temporalScope, 'change')
+  assert.equal(historicalPortraitTextIsQualified('她喜欢跑步。'), false)
+  assert.equal(historicalPortraitTextIsQualified('她曾表示当时喜欢跑步。'), true)
+
+  const summary = summarizePersonEvidenceTime([recent, historical], analysisAsOf, '2026-08-02T12:00:00.000Z')
+  assert.equal(summary.recentClaimCount, 1)
+  assert.equal(summary.historicalClaimCount, 1)
+  assert.equal(summary.recentEvidenceStatus, 'limited')
+  assert.equal(summary.latestInteractionAgeDays, 3)
+})
+
+test('person portrait workset retains meaningful middle-period events without truncating the archive', () => {
+  const analysisAsOf = '2026-08-05T12:00:00.000Z'
+  const routineClaims = Array.from({ length: 140 }, (_, index) => ({
+    id: `routine-${index}`,
+    kind: index % 2 ? 'fact' : 'preference',
+    text: `已核验线索 ${index}`,
+    quote: `线索 ${index}`,
+    sourceIds: [`source-${index}`],
+    evidenceStrength: 'single',
+    category: index % 2 ? 'background' : 'preference',
+    portraitEligible: true,
+    firstObservedAt: `2026-07-${String(1 + (index % 28)).padStart(2, '0')}T12:00:00.000Z`,
+    lastObservedAt: `2026-07-${String(1 + (index % 28)).padStart(2, '0')}T12:00:00.000Z`,
+  }))
+  const mayEvent = {
+    id: 'may-27-care-event',
+    kind: 'event',
+    text: '2026年5月27日，对方曾提醒你不要继续吃坏掉的荔枝，并要求拍照确认',
+    quote: '你拍一张我看看',
+    sourceIds: ['source-may-27'],
+    evidenceStrength: 'single',
+    category: 'interaction',
+    stability: 'single',
+    portraitEligible: true,
+    firstObservedAt: '2026-05-27T12:00:00.000Z',
+    lastObservedAt: '2026-05-27T12:00:00.000Z',
+  }
+  const completeArchive = [...routineClaims, mayEvent]
+  const workset = selectProfileEvidence(completeArchive, 96, analysisAsOf)
+
+  assert.equal(completeArchive.length, 141)
+  assert.equal(workset.length, 96)
+  assert.equal(workset.some((claim) => claim.id === mayEvent.id), true)
+})
+
 test('interpersonal advice rejects manipulation and unsupported certainty', () => {
   assert.equal(isHumanCenteredAdvice('先确认对方现在是否方便，并给对方一个拒绝或改期的选择。'), true)
   assert.equal(interpersonalAdviceRisk('故意冷处理几天，让对方吃醋后再联系。'), 'manipulative_or_overconfident')
   assert.equal(interpersonalAdviceRisk('对方肯定喜欢你，可以直接逼对方答应。'), 'manipulative_or_overconfident')
+})
+
+test('conversation-level counterpart identity supports nameless direct-chat rows without merging named senders', () => {
+  const nameless = [
+    { speakerRole: 'self' },
+    { speakerRole: 'other' },
+    { speakerRole: 'other' },
+  ]
+  const resolved = counterpartIdentityEvidence(nameless, '林晓', '林晓')
+  assert.equal(resolved.valid, true)
+  assert.equal(resolved.basis, 'conversation')
+  assert.equal(resolved.records.length, 2)
+
+  const ambiguous = counterpartIdentityEvidence([
+    { speakerRole: 'other', speaker: 'Alice' },
+    { speakerRole: 'other', speaker: 'Bob' },
+  ], 'Direct folder', 'Direct folder')
+  assert.equal(ambiguous.valid, false)
+
+  const named = counterpartIdentityEvidence([
+    { speakerRole: 'other', speaker: ' 林晓 ' },
+    { speakerRole: 'self', speaker: '你' },
+  ], '林晓', 'Direct folder')
+  assert.equal(named.valid, true)
+  assert.equal(named.basis, 'speaker')
 })

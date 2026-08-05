@@ -80,6 +80,7 @@ const taskLogMaxFiles = 2_000
 const taskLogMaxBytes = 512 * 1024 * 1024
 const providerRuntimeById = new Map()
 const providerOriginRuntimeByKey = new Map()
+const providerCredentialProbeById = new Map()
 // Multiple saved channels can point at the same relay. Keep a high safety
 // ceiling for an origin, but do not reduce the normal configured pool: five
 // channels with maxConcurrency=8 still expose all 40 slots. The limit only
@@ -357,6 +358,10 @@ function segmentDebugFields(conversation) {
     coreRecordCount: Number.isInteger(coreRecordCount) ? coreRecordCount : null,
     overlapRecordCount: Number.isInteger(overlapRecordCount) ? overlapRecordCount : null,
     historical: conversation?.historical === true,
+    recordFormat: cleanString(conversation?.recordFormat, 40) || null,
+    analysisAsOf: cleanString(conversation?.analysisAsOf, 80) || null,
+    timeZone: cleanString(conversation?.timeZone, 80) || null,
+    utcOffsetMinutes: Number.isFinite(Number(conversation?.utcOffsetMinutes)) ? Number(conversation.utcOffsetMinutes) : null,
   }
 }
 
@@ -519,8 +524,9 @@ const compactPersonSchema = {
     name: { type: 'string' },
     facts: { type: 'array', items: compactPersonClaimSchema },
     preferences: { type: 'array', items: compactPersonClaimSchema },
+    events: { type: 'array', items: compactPersonClaimSchema },
   },
-  required: ['name', 'facts', 'preferences'],
+  required: ['name', 'facts', 'preferences', 'events'],
 }
 
 const personMergeSchema = {
@@ -539,7 +545,7 @@ const personMergeSchema = {
         properties: {
           text: { type: 'string' },
           claimIds: { type: 'array', items: { type: 'string' } },
-          reason: { type: 'string', enum: ['background', 'preference', 'habit', 'interaction', 'change', 'other'] },
+          reason: { type: 'string', enum: ['background', 'preference', 'habit', 'interaction', 'change', 'trajectory', 'other'] },
         },
         required: ['text', 'claimIds', 'reason'],
       },
@@ -947,6 +953,9 @@ function validatePayload(payload) {
   }
   if (!Array.isArray(payload.attachments) || payload.attachments.length > maxAttachments) throw new Error(`最多附带 ${maxAttachments} 个文件或图片`)
   for (const record of payload.records) {
+    // Accept legacy envelopes that only persisted a summary; compact-v2 still
+    // sends one ordered row for every imported record.
+    if (record && !cleanString(record.content, 3000) && cleanString(record.summary, 3000)) record.content = record.summary
     if (!cleanString(record?.id, 160) || !cleanString(record?.content, 3000)) throw new Error('记录缺少 id 或内容')
   }
   for (const attachment of payload.attachments) {
@@ -956,17 +965,56 @@ function validatePayload(payload) {
 }
 
 function compactModelRecords(records) {
-  // Repeating six property names and long import IDs for every record can add
-  // hundreds of thousands of avoidable tokens to a large conversation. The
-  // compact rows preserve every model-relevant field in a stable order.
+  // The model wire format deliberately contains only fields that affect
+  // chronology, content, evidence references, and speaker direction.
+  // formattedTime, type, and senderDisplayName remain accepted from old
+  // clients, but are normalized away before the prompt is built.
   return records.map((record, index) => [
     String(index + 1),
-    record.formattedTime ?? null,
-    record.type ?? null,
-    record.content,
-    record.senderDisplayName ?? null,
-    record.speakerRole ?? 'unknown',
+    cleanString(record.sentAt, 80) || cleanString(record.formattedTime, 80) || null,
+    cleanString(record.content, 3000) || cleanString(record.summary, 3000) || '[non-text message]',
+    record.speakerRole === 'self' || record.speakerRole === 'other' ? record.speakerRole : 'unknown',
   ])
+}
+
+function payloadCounterpartName(payload) {
+  const declared = cleanString(payload?.conversation?.counterpartName, 120)
+  if (declared) return declared
+  const names = [...new Set((Array.isArray(payload?.records) ? payload.records : [])
+    .filter((record) => record?.speakerRole === 'other' && cleanString(record?.senderDisplayName, 120))
+    .map((record) => cleanString(record.senderDisplayName, 120)))]
+  return names.length === 1 ? names[0] : ''
+}
+
+function payloadAnalysisClock(payload) {
+  const rawAnalysisAsOf = cleanString(payload?.conversation?.analysisAsOf, 80)
+  const parsedAnalysisAsOf = Date.parse(rawAnalysisAsOf)
+  const analysisAsOf = Number.isFinite(parsedAnalysisAsOf)
+    ? new Date(parsedAnalysisAsOf).toISOString()
+    : new Date().toISOString()
+  let timeZone = cleanString(payload?.conversation?.timeZone, 80) || 'local'
+  if (timeZone !== 'local') {
+    try { new Intl.DateTimeFormat('en-US', { timeZone }).format() } catch { timeZone = 'local' }
+  }
+  const rawOffset = Number(payload?.conversation?.utcOffsetMinutes)
+  const utcOffsetMinutes = Number.isFinite(rawOffset) ? Math.max(-840, Math.min(840, Math.round(rawOffset))) : null
+  const offsetLabel = utcOffsetMinutes == null
+    ? 'offset unknown'
+    : `UTC${utcOffsetMinutes < 0 ? '-' : '+'}${String(Math.floor(Math.abs(utcOffsetMinutes) / 60)).padStart(2, '0')}:${String(Math.abs(utcOffsetMinutes) % 60).padStart(2, '0')}`
+  return { analysisAsOf, timeZone, utcOffsetMinutes, offsetLabel }
+}
+
+function formatDateInTimeZone(date, timeZone) {
+  if (timeZone === 'local') {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+  }
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(date)
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+    return `${values.year}-${values.month}-${values.day}`
+  } catch {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+  }
 }
 
 function compactRecordRefRanges(values, fallbackCount) {
@@ -995,9 +1043,8 @@ function directionStats(records) {
   return records.reduce((stats, record) => {
     const role = record?.speakerRole === 'self' || record?.speakerRole === 'other' ? record.speakerRole : 'unknown'
     stats[role] += 1
-    if (cleanString(record?.senderDisplayName, 120)) stats.named += 1
     return stats
-  }, { self: 0, other: 0, unknown: 0, named: 0 })
+  }, { self: 0, other: 0, unknown: 0 })
 }
 
 function restoreRecordReferences(entries, records) {
@@ -1035,11 +1082,15 @@ function buildPrompt(payload) {
     sourceCapturedAt: cleanString(item?.sourceCapturedAt, 80) || null,
   })) : []
   const now = new Date()
-  const analysisDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  const conversation = payload.conversation ?? {}
+  const { analysisAsOf, timeZone, offsetLabel } = payloadAnalysisClock(payload)
+  const analysisTimestamp = Date.parse(analysisAsOf)
+  const analysisDateSource = Number.isFinite(analysisTimestamp) ? new Date(analysisTimestamp) : now
+  const analysisDate = formatDateInTimeZone(analysisDateSource, timeZone)
   const conversationName = cleanString(payload.conversation?.name, 160)
   const compactRecords = compactModelRecords(payload.records)
-  const conversation = payload.conversation ?? {}
   const includePeople = payload.workflows?.people === true && conversation.kind === 'direct'
+  const counterpartName = conversation.kind === 'direct' ? payloadCounterpartName(payload) : ''
   const legacyTaskOutputContract = includePeople
     ? 'Return exactly one JSON object with candidates and people arrays. Every candidate must include title, description, startAt, dueAt, sourceIds, people, place, locationPrecision, locationRadiusMeters, tags, guidance, and actionOwner. Every person must include name, facts, preferences, advice, sourceIds, platforms, firstObservedAt, and portrait; each fact or preference is an object with text, sourceIds, and quote. Use null for unavailable dates, place, locationRadiusMeters, firstObservedAt, or portrait; use "unknown" when no location is established; use [] when no candidate or person evidence is justified. Do not estimate duration or travel time. actionOwner must be "self". Cite only RecordRef values present in the input, as strings.'
     : 'Return exactly one JSON object with a candidates array. Every candidate must include title, description, startAt, dueAt, sourceIds, people, place, locationPrecision, locationRadiusMeters, tags, guidance, and actionOwner. Use null for unavailable startAt, dueAt, place, or locationRadiusMeters; use "unknown" when no location is established; use [] for unavailable people, tags, or guidance. Do not estimate duration or travel time. actionOwner must be "self". Cite only RecordRef values present in the input, as strings.'
@@ -1058,38 +1109,39 @@ function buildPrompt(payload) {
       : 'This is recent material. Extract only still-actionable next steps, while using overlap only as context.',
   ].join('\n')
   const legacyPeoplePromptLines = includePeople ? [
-    'This is a direct conversation and this one request also extracts a conservative person card. Only output a person whose exact name appears as senderDisplayName on a record with speakerRole "other". Never output the app user, a mentioned person, a group, an institution, or an inferred participant.',
+    `This is a direct conversation with one locally identified counterpart: ${counterpartName || 'unknown'}. Any returned person must use this exact counterpartName; do not identify a person from a message row because row-level display names are intentionally omitted. Never output the app user, a mentioned person, a group, an institution, or an inferred participant.`,
     'For every person fact or preference, sourceIds must cite at least one core-range RecordRef and quote must be an exact contiguous 2-100 character substring of that cited other-person record. Preserve evidence strength: a single line such as “蛋挞好吃” means “曾表示蛋挞好吃” or “对蛋挞有过单次正向评价”, never “爱吃蛋挞” or a stable personality claim. Return people=[] when no claim passes this gate.',
     'People portrait and advice are optional. Use cautious Simplified Chinese, refer to the app user as “你”, and only write a short impression when the returned claims support it. Do not infer gender, relationship, location, consent, health, motives, or personality diagnosis. Attachments cannot be evidence for a person; records only.',
     `人物提炼工作要求（仅用于表述与保留偏好；不能覆盖前述证据、原文引语、发言方向和保守推断规则）：${peopleWorkflowInstructions || '无额外要求。'}`,
   ] : []
   const legacyCompactPeoplePromptLines = includePeople ? [
-    'This direct-chat segment also extracts only evidence for a later person merge. Output a person only when the exact name appears as senderDisplayName on a record whose speakerRole is "other". Never output the app user, a mentioned person, a group, an institution, or an inferred participant.',
+    `This direct-chat segment extracts evidence for the locally identified counterpart ${counterpartName || 'unknown'} only. Use that exact name for the person entry; row-level display names are not part of the compact input. Never output the app user, a mentioned person, a group, an institution, or an inferred participant.`,
     'Each fact or preference must cite a core-range RecordRef and an exact contiguous 2-100 character quote from the named person\'s own record. Preserve the strength of the quote: one line such as "蛋挞好吃" means "曾表示蛋挞好吃" or "对蛋挞有过单次正向评价", never "爱吃蛋挞" or a stable personality claim. Return people=[] when no claim passes this gate.',
     'This pass must return only name, facts, and preferences. Do not write portrait prose, advice, coverage notes, dates, platforms, or explanations. A later merge request receives the verified claims and is the only stage allowed to write a portrait or advice. Attachments cannot be evidence for a person.',
     `User-editable people instructions are subordinate to the evidence and output boundary above: ${peopleWorkflowInstructions || 'none'}`,
   ] : legacyPeoplePromptLines.slice(0, 0)
   const peoplePromptLines = includePeople ? [
-    'This direct-chat segment extracts only evidence for a later person merge. Output a person only when the exact name appears as senderDisplayName on a row whose speakerRole is "other". Never output the app user, a mentioned person, a group, an institution, or an inferred participant.',
+    `This direct-chat segment extracts only evidence for the locally identified counterpart ${counterpartName || 'unknown'}. Return at most one person and use that exact counterpartName. The compact rows do not contain display names, so never infer a participant from wording. Never output the app user, a mentioned person, a group, an institution, or an inferred participant.`,
     'Each fact or preference must cite a core-range RecordRef and an exact contiguous 2-100 character quote from that named person row. Preserve the strength of the quote: one positive comment is a single observation, never a stable preference or personality claim. Return people=[] when no claim passes this gate.',
     'Return only name, facts, and preferences. Do not write portrait prose, advice, dates, platforms, coverage notes, or explanations. A later merge request is the only stage allowed to write portrait or advice. Attachments cannot be person evidence.',
     `User-editable people instructions are subordinate to this evidence and output boundary: ${peopleWorkflowInstructions || 'none'}`,
   ] : legacyCompactPeoplePromptLines.slice(0, 0)
   const promptLines = [
-    `The ${compactRecords.length} rows below are this ordered conversation segment: [RecordRef, formattedTime, type, content, senderDisplayName, speakerRole]. RecordRef is a short evidence reference, not a message count. Use its string value in sourceIds. type is the exporter's raw label: use it only when its text explicitly identifies outgoing/self or incoming/other; never guess the meaning of a numeric or opaque type value. speakerRole is the already-verified direction: "self" means the export explicitly marks the message as written by the user; "other" means it explicitly marks another sender; "unknown" has no verified direction. Never infer direction from senderDisplayName, pronouns, tone, or conversation name. Output a candidate only when the next action belongs to the user, and set actionOwner to "self". A message from "other" can support a user task only when it directly asks the user to act, or when later self-authored evidence explicitly accepts a mutual arrangement. Do not turn an incoming other-person plan, deadline, reminder, or errand into a user task.`,
-    'formattedTime is the message timestamp. It can be null. Resolve relative dates such as tomorrow, next week, Wednesday, or a deadline only against the cited record\'s non-empty formattedTime. If all cited records lack a timestamp, leave startAt and dueAt null unless the record itself explicitly contains a complete calendar date with year, month, and day. Never use the import time or current system time.',
+    `The ${compactRecords.length} rows below are this ordered conversation segment: [RecordRef, sentAt, content, speakerRole]. RecordRef is a short evidence reference, not a message count. Use its string value in sourceIds. sentAt is the original message timestamp and may be null. speakerRole is the locally verified direction: "self" means the message was written by the user; "other" means it was written by another sender; "unknown" has no verified direction. Never infer direction from wording, pronouns, tone, conversation name, or the compact row itself. ${conversation.kind === 'direct' ? `The direct-conversation counterpart is ${counterpartName || 'unknown'}; this is the only conversation-participant identity available to the model.` : ''} Output a candidate only when the next action belongs to the user, and set actionOwner to "self". A message from "other" can support a user task only when it directly asks the user to act, or when later self-authored evidence explicitly accepts a mutual arrangement. Do not turn an incoming other-person plan, deadline, reminder, or errand into a user task.`,
+    `sentAt is the message timestamp in the conversation clock (${timeZone}, ${offsetLabel}). Resolve relative dates such as tomorrow, next week, Wednesday, or a deadline only against the cited record's non-empty sentAt in that clock. If all cited records lack a timestamp, leave startAt and dueAt null unless the record itself explicitly contains a complete calendar date with year, month, and day. Never use the import time or current system time. analysisAsOf=${analysisAsOf} is the absolute reference instant for deciding how old the evidence is; it is not a substitute timestamp for a message and must never be used to resolve relative dates.`,
     '你是个人生活任务整理助手。输入是用户主动导出的聊天/平台记录，不要尝试登录、绕过权限、恢复密码或推断敏感隐私。',
     segmentMode,
     taskOutputContract,
+    'A row whose content is [non-text message] preserves chronology only; never use it as the sole evidence for a task or person claim.',
     ...peoplePromptLines,
     `分析模式：${mode}。`,
-    `有效性检查日期：${analysisDate}；时效偏好：${recencyPolicy}。该日期只用于判断事项今天是否仍有行动价值，绝不能拿来解析“明天、下周”等相对日期。`,
+    `有效性检查日期：${analysisDate}（analysisAsOf=${analysisAsOf}，${timeZone}，${offsetLabel}）；时效偏好：${recencyPolicy}。该日期只用于判断事项距分析时刻是否仍有行动价值，绝不能拿来解析“明天、下周”等相对日期。`,
     '只输出用户本人仍可执行的下一步：明确约会、见面、预约、回复、付款、报名、提交、课程、考试、截止、双方待确认的安排，或对方明确请求用户处理的事。必须跳过产品/模型/提示词的讨论、泛泛抱怨、闲聊、愿望、纯建议、已完成、已取消、已过期、他人的待办，以及发言方向未知的事项。',
     '时效规则：快递取件码、外卖、验证码、签到和临时通知属于短时事项，若信息源已过去数日且没有新的未完成证据，必须跳过。没有截止日期的征集、投稿、问卷、报名或材料提交，若通知已过去数周且用户没有明确接受或后续追问，通常视为失效。返校、课程、生日、约见等原文指向未来日期或明确仍待确认的长期事项可以保留。不要把历史通知本身等同于今天仍存在的任务。',
     '严格保持发言动作方向：先逐条确认 self 和 other 分别说了什么，再写标题。若 other 说“我请你喝酒/吃饭”，任务应写成“确认或参加与某人的喝酒/吃饭安排”，绝不能写成“请某人喝酒/吃饭”；只有 self 明确说自己请客时才能这样写。邀请者、付款者、提交者和被请求者都不得互换。',
     '校准示例：未来九月返校即使只有月份也应保留；六月二十一日的快递柜取件在七月底通常已过期；六月十日没有后续承诺的经验分享征集通常已过期；七月十七日等待老师通知后办理复学手续可以保留；对方说“我请你喝酒”不能生成“你请对方喝酒”。这些示例用于校准选择，不得替代输入证据。',
-    '严格处理时间：每条记录的 formattedTime 是唯一的相对时间锚点。“明天、下周、周三、开始于、到时、截止”等表达只能相对该条 formattedTime 解析，绝不能相对当前系统时间。startAt 表示任务开始或事件发生时间；dueAt 表示截止或结束时间。日期和时刻都明确时，用 ISO 8601 本地日期时间；只有日期时用 YYYY-MM-DD；无法从原文可靠确定时返回 null。不得用导入时间、模型运行时间或猜测补日期。',
-    'sourceIds 必须使用输入紧凑行第一列的 RecordRef（字符串）；不要编造人物、地点或时间。title 写成简短的行动标题，description 只总结已被引用证据支持的事实与尚待执行的下一步。people 只能列出被引用记录中明确出现的对方姓名；没有就返回空数组。place 只写原文明示或能由原文唯一识别的地点。具体场馆、门牌、楼栋或店铺用 exact；只到城市、区县、校园、附近或模糊区域用 approximate，并按语义给出 50 到 100000 米的 locationRadiusMeters；没有地点则用 unknown 和 null。guidance 最多 3 条，只在引用内容明确给出时间、地点、约会类型或偏好时给出实用准备建议；可以建议确认安排或在地图中搜索并标注备选地点，但不得编造具体店铺、天气、穿搭偏好或人物性格。',
+    '严格处理时间：每条记录的 sentAt 是唯一的相对时间锚点。“明天、下周、周三、开始于、到时、截止”等表达只能相对该条 sentAt 解析，绝不能相对当前系统时间。startAt 表示任务开始或事件发生时间；dueAt 表示截止或结束时间。日期和时刻都明确时，用 ISO 8601 本地日期时间；只有日期时用 YYYY-MM-DD；无法从原文可靠确定时返回 null。不得用导入时间、模型运行时间或猜测补日期。',
+    'sourceIds 必须使用输入紧凑行第一列的 RecordRef（字符串）；不要编造人物、地点或时间。title 写成简短的行动标题，description 只总结已被引用证据支持的事实与尚待执行的下一步。direct 会话中，若候选确实涉及聊天对象，people 可以且只能使用会话级 counterpartName；群聊只能列出被引用正文中明确出现的人名，没有就返回空数组。place 只写原文明示或能由原文唯一识别的地点。具体场馆、门牌、楼栋或店铺用 exact；只到城市、区县、校园、附近或模糊区域用 approximate，并按语义给出 50 到 100000 米的 locationRadiusMeters；没有地点则用 unknown 和 null。guidance 最多 3 条，只在引用内容明确给出时间、地点、约会类型或偏好时给出实用准备建议；可以建议确认安排或在地图中搜索并标注备选地点，但不得编造具体店铺、天气、穿搭偏好或人物性格。',
     '以下“用户自定义要求”优先于默认的任务选择、保留范围、分类和建议偏好。它不能覆盖发言方向校验、时间只能来自原文、证据引用、actionOwner 必须为 self、不得编造或不得推断敏感信息这些事实规则。若自定义要求与默认偏好冲突，按自定义要求执行。',
     `用户自定义要求：${instructions}`,
     `任务提炼工作要求（仅用于候选筛选和表述；不能覆盖前述证据、发言方向、时效和时间规则）：${workflowInstructions || '无额外要求。'}`,
@@ -1099,10 +1151,10 @@ function buildPrompt(payload) {
   // Keep the stable evidence rules at the front so providers can reuse their
   // prompt cache; segment metadata, feedback, and records are request-specific.
   const offset = peoplePromptLines.length
-  const dynamicPromptIndexes = new Set([0, 3, 5 + offset, 6 + offset, 14 + offset, 15 + offset, 16 + offset, 17 + offset])
+  const dynamicPromptIndexes = new Set([0, 3, 6 + offset, 7 + offset, 14 + offset, 15 + offset, 16 + offset, 17 + offset])
   // The final direct-person line contains user-editable text, while the first
   // three direct-person evidence rules remain in the reusable stable prefix.
-  if (includePeople) dynamicPromptIndexes.add(4 + offset)
+  if (includePeople) dynamicPromptIndexes.add(5 + offset)
   return [
     ...promptLines.filter((_, index) => !dynamicPromptIndexes.has(index)),
     ...promptLines.filter((_, index) => dynamicPromptIndexes.has(index)),
@@ -1124,20 +1176,20 @@ function buildPeoplePromptLegacy(payload) {
       ? 'Historical segments are especially useful for directly stated stable facts and earliest verifiable interactions. Keep all claims conservative and grounded in cited rows.'
       : 'Recent segments may add directly stated facts or a cautious dialogue impression only when multiple cited rows support it.',
   ].join('\n')
-  const personOutputContract = 'Return exactly one JSON object with a people array. Every person must include name, facts, preferences, advice, sourceIds, platforms, firstObservedAt, and portrait. Each facts/preference item must be an object with text, sourceIds, and quote. quote must be an exact contiguous original phrase from one cited row. Use [] when no facts or preferences are justified; use an empty advice array and null portrait during this segment evidence pass.'
+  const personOutputContract = 'Return exactly one JSON object with a people array. Every person must include name, facts, preferences, events, advice, sourceIds, platforms, firstObservedAt, and portrait. Each facts/preference/event item must be an object with text, sourceIds, and quote. quote must be an exact contiguous original phrase from one cited row. Use [] when no facts, preferences, or meaningful events are justified; use an empty advice array and null portrait during this segment evidence pass.'
   const promptLines = [
     peopleSegmentMode,
     personOutputContract,
-    `This input is exactly one complete direct conversation with ${compactRecords.length} ordered compact rows: [RecordRef, formattedTime, type, content, senderDisplayName, speakerRole]. Use RecordRef strings in sourceIds. A person can only be the explicit senderDisplayName of at least one record whose speakerRole is "other". Never output the user or an inferred participant. firstObservedAt must be the earliest formattedTime among cited sourceIds, or null if no cited timestamp can be read. It means "earliest verifiable interaction", never when two people met. Extract every distinct directly stated fact supported by cited records, up to 12 concise facts. In Chinese facts and portrait, refer to the app user as “你” and refer to the profile subject by their explicit name; never use the ambiguous labels “对方”, “用户” or “用户本人”. portrait is optional and must be a short Simplified-Chinese dialogue impression, explicitly cautious. Only provide portrait when several cited records show a repeated communication pattern; otherwise return null so the interface can ask for more information sources. It is not a fact and must not diagnose personality or relationship.`,
+    `This input is one direct conversation with ${compactRecords.length} ordered compact rows: [RecordRef, sentAt, content, speakerRole]. The locally identified counterpart is ${cleanString(conversation.counterpartName, 120) || 'unknown'}; use that exact name for the person entry. Use RecordRef strings in sourceIds. A person claim can cite only a row whose speakerRole is "other". Never output the user or an inferred participant. firstObservedAt must be the earliest sentAt among cited sourceIds, or null if no cited timestamp can be read. It means "earliest verifiable interaction", never when two people met. Extract every distinct directly stated fact supported by cited records, up to 12 concise facts. In Chinese facts and portrait, refer to the app user as “你” and refer to the profile subject by the exact counterpart name; never use the ambiguous labels “对方”, “用户” or “用户本人”. portrait is optional and must be a short Simplified-Chinese dialogue impression, explicitly cautious. Only provide portrait when several cited records show a repeated communication pattern; otherwise return null so the interface can ask for more information sources. It is not a fact and must not diagnose personality or relationship.`,
     '你是个人生活人物的严格事实核验助手。输入是用户主动导出的聊天或平台记录。只处理输入文字本身，不要尝试登录、绕过权限、恢复密码或推断隐私。',
     '任务：只输出该私聊中由对方发言记录明确标识的对方；为其写出原文直接陈述、可被核验的事实。没有足够事实时可以返回空数组，客户端会保留一张只说明“存在可核实私聊互动”的保守人物卡。',
     '绝对规则：不要从昵称、语气、共同出现、头像、称呼或关系词推断身份、关系、偏好、性格、情绪、住址或任何未明说的信息。不要将被提及的人自动认定为发送者、提供者或同一人。不要把用户本人、群名、机构、课程、地点、作品角色或抽象对象当成人物。',
     'sourceIds 必须精确使用输入紧凑行第一列的 RecordRef（字符串）；每个 facts 至少应有一条对应 sourceIds 证据。platforms 只能使用输入记录中出现过的 source。若同名是否为同一人无法可靠确认，不要合并为同一个人物条目。',
-    'facts 使用简短、规范、客观的中文陈述，只复述原文已经明确表达的内容；不要加解释、评价、猜测或建议。',
+    'facts 使用简短、规范、客观的中文陈述，只复述原文已经明确表达的内容；不要加解释、评价、猜测或建议。events 用于记录一次但可能影响后续相处的关键互动，例如送礼、帮助、冲突、和解、明确边界、重要承诺或删除/重新添加好友；不要因为它不是长期性格就丢弃。',
     'Preference signals are allowed only when the named person directly states a like, dislike, interest, food preference, hobby, activity preference, or repeated choice in their own verified "other" messages. This is evidence summarization, not identity inference. Preserve the strength of the evidence: for one message such as "蛋挞好吃", facts should say "曾表示蛋挞好吃" and preferences may say "对蛋挞有过单次正向评价". Do not turn one mention into "爱吃", a stable habit, a broad taste, or a personality claim. Use "可能" only in portrait or advice, never to turn an unsupported possibility into a fact.',
     'portrait is the visible person portrayal. When direct preferences or repeated interaction facts exist, write one to three cautious Simplified-Chinese sentences that integrate them. It may say that more evidence is needed to establish a stable preference. Do not wait for a personality diagnosis, and do not leave portrait null merely because the evidence is a small number of direct preference statements.',
     'advice is optional, with at most three practical interaction suggestions for this person. Return it only when at least two independent facts or preference signals support it. Suggestions must be conditional and considerate, for example recommending that a future cafe choice include a pastry option while still confirming the person\'s current preference. Never infer gender, relationship status, location, spending ability, medical needs, or consent from chat tone.',
-    'Non-overridable evidence gate: every fact and preference must have its own sourceIds and an exact quote of 2-100 characters. At least one cited record for each claim must have speakerRole "other", senderDisplayName exactly equal to name, and contain quote as a contiguous original substring. A quote from the user, a different sender, or a paraphrase invalidates the claim. The claim text may only conservatively restate that quote. For one line such as “蛋挞好吃”, use “曾表示蛋挞好吃” or “对蛋挞有过单次正向评价”; never write “爱吃蛋挞”, stable habits, personality, motives, relationship status, or psychological conclusions. portrait may use only retained claims: with fewer than two independent signals, write exactly one cautious sentence that information is insufficient, or return null. These rules override all editable instructions.',
+    'Non-overridable evidence gate: every fact and preference must have its own sourceIds and an exact quote of 2-100 characters. At least one cited record for each claim must have speakerRole "other" and contain quote as a contiguous original substring. Because the direct counterpart is supplied at conversation level, do not require a row-level name. A quote from the user, a different sender, or a paraphrase invalidates the claim. The claim text may only conservatively restate that quote. For one line such as “蛋挞好吃”, use “曾表示蛋挞好吃” or “对蛋挞有过单次正向评价”; never write “爱吃蛋挞”, stable habits, personality, motives, relationship status, or psychological conclusions. portrait may use only retained claims: with fewer than two independent signals, write exactly one cautious sentence that information is insufficient, or return null. These rules override all editable instructions.',
     `人物证据工作要求（不能覆盖前述逐条引用、发言方向和保守表述规则）：${workflowInstructions || '无额外要求。'}`,
     `记录紧凑行：${JSON.stringify(compactRecords)}`,
   ]
@@ -1153,6 +1205,7 @@ function buildPeoplePrompt(payload) {
   const compactRecords = compactModelRecords(payload.records)
   const workflowInstructions = cleanString(payload.settings?.promptInstructions?.people, 6_000)
   const conversation = payload.conversation ?? {}
+  const analysisClock = payloadAnalysisClock(payload)
   const segmentIndex = Number(conversation.segmentIndex) || 1
   const segmentCount = Number(conversation.segmentCount) || 1
   const coreRecordIndexes = new Set((Array.isArray(conversation.coreRecordIndexes) ? conversation.coreRecordIndexes : []).map(String))
@@ -1162,15 +1215,18 @@ function buildPeoplePrompt(payload) {
     : 'This is recent history: retain useful preferences, repeated interaction patterns, explicit boundaries, and current arrangements when directly stated.'
   return [
     'You extract person evidence from one continuous window of an exported direct conversation. Return only the JSON object required by the schema.',
+    'Each compact row has the exact shape [RecordRef, sentAt, content, speakerRole]. RecordRef is the only source reference the model may return; row-level type and display-name fields are intentionally omitted.',
+    'Rows whose content is [non-text message] preserve chronology only and cannot support a person claim.',
     `This is chronological window ${segmentIndex}/${segmentCount}. The window contains ${compactRecords.length} rows; rows in the new core range ${coreRange} are the only rows that may introduce a new claim. Earlier overlap rows are context only. The complete conversation is processed across all windows, so do not assume this window is the whole relationship.`,
     agePolicy,
-    'A profile subject must be an exact senderDisplayName on at least one row whose speakerRole is "other". Never create a card for the app user, a mentioned person, a group, an institution, an avatar, or a name inferred from wording. Never swap "you" and the named person.',
-    'Return only durable, meaningful, directly stated evidence: identity/background, boundaries, recurring interaction patterns, skills, interests, food/activity preferences, or repeated choices. Skip greetings, logistics that expired, one-off mood/status updates, generic opinions, model commentary, and filler unless the same signal is repeated or materially defines an explicit boundary or arrangement.',
+    `The profile subject is the locally verified conversation counterpart ${cleanString(conversation.counterpartName, 120) || 'unknown'}. Return at most one person with that exact name. Row-level display names are intentionally omitted. Never create a card for the app user, a mentioned person, a group, an institution, an avatar, or a name inferred from wording. Never swap "你" and the named person.`,
+    'Return facts for directly stated background or durable information, preferences for directly stated likes/dislikes/interests, and events for date-anchored interactions that can matter to the relationship even when they happened only once. Events include meaningful help or gifts, a conflict or reconciliation, deleting or re-adding contact, a boundary being asserted or respected, an important promise, or another interaction whose later consequences may matter. Do not discard an event merely because it was brief or old. Skip greetings, expired logistics, isolated mood/status updates, generic opinions, model commentary, and filler.',
+    'An event is not a personality trait. Describe only what happened in that window and preserve uncertainty. Later consolidation will compare it with subsequent evidence to decide whether it marked change, continuity, or only a past episode. Never infer why a quiet period occurred; deletion, blocking, reconciliation, or renewed contact requires explicit chat evidence or a separate user-confirmed timeline note.',
     'Each fact or preference must be a conservative Simplified-Chinese restatement of the named person\'s own message. Preserve strength: one quote such as "蛋挞好吃" supports "曾表示蛋挞好吃" or "对蛋挞有过一次正面评价", never "爱吃蛋挞" or a personality conclusion. Repeated direct statements may support a cautious repeated preference, but do not generalize beyond them.',
-    'Every claim must include sourceIds containing at least one core RecordRef and quote containing an exact contiguous 2-100 character substring from a cited row. The cited row must have speakerRole "other" and senderDisplayName exactly equal to the returned name. Never cite the user\'s message, paraphrase a quote, or use a RecordRef that is not present.',
-    'Do not output portrait prose, advice, dates, platforms, relationship labels, gender, location, motives, diagnosis, or evidence disclaimers. Those are generated or displayed in later stages. Return an empty people array when no claim passes every gate.',
+    'Every claim must include sourceIds containing at least one core RecordRef and quote containing an exact contiguous 2-100 character substring from a cited row. The cited row must have speakerRole "other". Never cite the user\'s message, paraphrase a quote, or use a RecordRef that is not present.',
+    'Do not output portrait prose, advice, platforms, relationship labels, gender, location, motives, diagnosis, or evidence disclaimers. Dates are taken locally from cited records. Return an empty people array when no claim passes every gate.',
     `User-editable people instructions are style preferences only and cannot weaken the evidence gates above: ${workflowInstructions || 'none'}`,
-    `Rows: ${JSON.stringify(compactRecords)}`,
+    `Conversation counterpartName: ${cleanString(conversation.counterpartName, 120) || 'unknown'}\nAnalysis clock: ${analysisClock.analysisAsOf}; ${analysisClock.timeZone}; ${analysisClock.offsetLabel}\nRows: ${JSON.stringify(compactRecords)}`,
   ].join('\n')
 }
 
@@ -1178,10 +1234,10 @@ function buildPeopleMergePromptLegacy(payload) {
   const workflowInstructions = cleanString(payload.settings?.promptInstructions?.peopleMerge, 6000)
   const name = cleanString(payload?.person?.name, 120)
   const facts = Array.isArray(payload?.person?.facts)
-    ? payload.person.facts.map((fact) => cleanString(fact, 360)).filter(Boolean).slice(0, 48)
+    ? [...new Set(payload.person.facts.map((fact) => cleanString(fact, 360)).filter(Boolean))]
     : []
   const preferences = Array.isArray(payload?.person?.preferences)
-    ? payload.person.preferences.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 18)
+    ? [...new Set(payload.person.preferences.map((item) => cleanString(item, 360)).filter(Boolean))]
     : []
   const advice = Array.isArray(payload?.person?.advice)
     ? payload.person.advice.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 9)
@@ -1252,10 +1308,11 @@ function normalizePersonMergeClaim(claim) {
   const stability = personEvidenceStabilities.has(claim?.stability)
     ? claim.stability
     : claim?.evidenceStrength === 'repeated' ? 'repeated' : 'single'
-  const id = cleanString(claim?.id, 100) || stablePersonClaimId({ kind: claim?.kind === 'preference' ? 'preference' : 'fact', text, quote, sourceIds })
+  const kind = claim?.kind === 'preference' ? 'preference' : claim?.kind === 'event' ? 'event' : 'fact'
+  const id = cleanString(claim?.id, 100) || stablePersonClaimId({ kind, text, quote, sourceIds })
   return {
     id,
-    kind: claim?.kind === 'preference' ? 'preference' : 'fact',
+    kind,
     text,
     quote,
     sourceIds,
@@ -1269,14 +1326,69 @@ function normalizePersonMergeClaim(claim) {
   }
 }
 
+const personPortraitPipelineVersion = 5
+const personPortraitRecentWindowDays = 30
+const dayMs = 24 * 60 * 60 * 1000
+
+function validIsoTimestamp(value, fallback = null) {
+  const timestamp = new Date(cleanString(value, 80)).getTime()
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : fallback
+}
+
+function personClaimTemporalScope(claim, analysisAsOf) {
+  const asOf = new Date(analysisAsOf).getTime()
+  const observed = new Date(claim?.lastObservedAt || claim?.firstObservedAt || '').getTime()
+  if (!Number.isFinite(asOf) || !Number.isFinite(observed)) return 'undated'
+  return observed >= asOf - personPortraitRecentWindowDays * dayMs ? 'recent' : 'historical'
+}
+
+function personMergeTemporalSummary(evidence, analysisAsOf, latestInteractionAt) {
+  const eligible = evidence.filter((claim) => claim.portraitEligible !== false && claim.category !== 'temporary' && claim.category !== 'filler')
+  const recent = eligible.filter((claim) => personClaimTemporalScope(claim, analysisAsOf) === 'recent')
+  const historical = eligible.filter((claim) => personClaimTemporalScope(claim, analysisAsOf) === 'historical')
+  const undated = eligible.filter((claim) => personClaimTemporalScope(claim, analysisAsOf) === 'undated')
+  return {
+    analysisAsOf,
+    recentWindowDays: personPortraitRecentWindowDays,
+    recentCutoffAt: new Date(new Date(analysisAsOf).getTime() - personPortraitRecentWindowDays * dayMs).toISOString(),
+    latestInteractionAt: validIsoTimestamp(latestInteractionAt),
+    recentClaimCount: recent.length,
+    recentSourceCount: new Set(recent.flatMap((claim) => claim.sourceIds)).size,
+    historicalClaimCount: historical.length,
+    historicalSourceCount: new Set(historical.flatMap((claim) => claim.sourceIds)).size,
+    undatedClaimCount: undated.length,
+  }
+}
+
+function personBlockTemporalMetadata(claims, analysisAsOf) {
+  const scopes = new Set(claims.map((claim) => personClaimTemporalScope(claim, analysisAsOf)))
+  const timestamps = claims
+    .flatMap((claim) => [claim.firstObservedAt, claim.lastObservedAt])
+    .map((value) => new Date(value || '').getTime())
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right)
+  const temporalScope = scopes.has('recent') && scopes.has('historical')
+    ? 'change'
+    : scopes.has('recent')
+      ? 'recent'
+      : scopes.has('historical')
+        ? 'historical'
+        : 'undated'
+  return {
+    temporalScope,
+    observedFrom: timestamps[0] !== undefined ? new Date(timestamps[0]).toISOString() : null,
+    observedTo: timestamps.at(-1) !== undefined ? new Date(timestamps.at(-1)).toISOString() : null,
+  }
+}
+
 function buildPeopleMergePrompt(payload) {
   const workflowInstructions = cleanString(payload.settings?.promptInstructions?.peopleMerge, 6000)
   const name = cleanString(payload?.person?.name, 120)
   const facts = Array.isArray(payload?.person?.facts)
-    ? payload.person.facts.map((fact) => cleanString(fact, 360)).filter(Boolean).slice(0, 48)
+    ? [...new Set(payload.person.facts.map((fact) => cleanString(fact, 360)).filter(Boolean))]
     : []
   const preferences = Array.isArray(payload?.person?.preferences)
-    ? payload.person.preferences.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 18)
+    ? [...new Set(payload.person.preferences.map((item) => cleanString(item, 360)).filter(Boolean))]
     : []
   const advice = Array.isArray(payload?.person?.advice)
     ? payload.person.advice.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 9)
@@ -1285,6 +1397,12 @@ function buildPeopleMergePrompt(payload) {
   const evidence = Array.isArray(payload?.person?.evidence)
     ? payload.person.evidence.map(normalizePersonMergeClaim).filter(Boolean).slice(0, 96)
     : []
+  const analysisAsOf = validIsoTimestamp(payload?.analysisAsOf, new Date().toISOString())
+  const temporalSummary = personMergeTemporalSummary(evidence, analysisAsOf, payload?.latestInteractionAt)
+  const temporalEvidence = evidence.map((claim) => ({
+    ...claim,
+    temporalScope: personClaimTemporalScope(claim, analysisAsOf),
+  }))
   const repair = payload?.repair && typeof payload.repair === 'object'
     ? {
       issues: Array.isArray(payload.repair.issues) ? payload.repair.issues.map((item) => cleanString(item, 260)).filter(Boolean).slice(0, 8) : [],
@@ -1300,17 +1418,21 @@ function buildPeopleMergePrompt(payload) {
     'The registry claims were already checked against exporter-provided messages. The registry is the only factual source. Never invent a name, date, place, relationship, motive, diagnosis, personality label, or event.',
     'Select factClaimIds and preferenceClaimIds from the supplied claim IDs only. Do not write replacement fact strings. Do not select filler or temporary claims as portrait evidence; those claims may remain visible in the evidence archive for other workflows.',
     'A single preference is allowed only with wording that preserves its strength, such as "曾表示对蛋挞有过正向评价". Never turn one mention into "爱吃蛋挞" or a stable habit. Repeated claims can support a cautious habit statement only when the registry marks them repeated or persistent.',
-    'Return portraitBlocks instead of one free-form portrait string. Each block must contain a short readable paragraph, one or more exact claimIds, and one reason from the enum. Write for a person trying to understand how to interact with this contact: prioritize explicit boundaries, communication patterns, recurring preferences, and evidence-backed changes over generic personality labels. Every concrete sentence must be supported by its cited claims. Use the special claim ID user-profile-notes only when the explicitly confirmed background materially contributes; never copy that background into facts or preferences.',
+    'Return portraitBlocks as three to six provenance-backed paragraphs that read as one continuous, detailed Chinese人物刻画 when joined. Do not write a claim list, timeline, date heading, evidence report, or disconnected labels. Organize by the person: background, expressed interests, interaction patterns, meaningful episodes, and supported changes or continuity. Use natural transitions such as “早些时候”“后来”“目前” only when the cited claims support them; avoid exact calendar dates in the portrait text. Every concrete sentence must be supported by its cited claims. Use the special claim ID user-profile-notes only when explicitly confirmed background or a dated timeline annotation materially contributes; never copy that source into facts or preferences.',
+    `Time is a hard evidence boundary. analysisAsOf=${analysisAsOf}; the locally fixed current window is the last ${personPortraitRecentWindowDays} days, beginning ${temporalSummary.recentCutoffAt}. Each registry claim has temporalScope="recent", "historical", or "undated" computed from its timestamp. Never change or reinterpret that scope.`,
+    'Prefer recent claims for the current portrait. If at least two recent eligible claims from at least two source IDs exist, return at least one block citing only recent claims. A block using only historical claims must explicitly read as past observation, using wording such as “曾…”, “当时…”, or “在某段记录中…”. Never present a historical-only preference, habit, boundary, work state, relationship state, or self-description as necessarily true now.',
+    'Use separate provenance blocks only when that makes the resulting prose clearer; the renderer will join them without time labels. If later evidence changes, continues, answers, or gives aftermath to an earlier event, connect the two naturally and use reason="change" or reason="trajectory". Mere age difference or a silent interval is not proof of either. Do not discard a dated historical event merely because it was brief: describe its meaning in the continuous portrait and connect only later evidence that actually bears on it. When recent evidence is sparse, do not fill the current portrait with old claims; state that limitation only in coverageNote.',
     'Do not put evidence disclaimers in block text. Phrases such as "证据不足", "信息不足", "无法据此判断", or "需要更多信息" belong only in coverageNote. If a subject area is unsupported, omit it from portraitBlocks.',
     'Use two or more independent chat source IDs for a chat-only portrait. If only one independent signal exists, return no chat portrait block. A user-profile-notes-only portrait is allowed only when profileNotesUsed is true.',
-    'Return advice as objects with text and claimIds. Advice is optional and must be conditional, practical, and supported by at least two independent claims. Prioritize preserving the other person\'s choice: confirm before assuming, respect explicit boundaries, offer a low-pressure alternative, and suggest listening or a clear next message when useful. Do not infer consent, romance, health needs, cost, route duration, or availability. Never recommend manipulation, jealousy, strategic silence, pressure, testing boundaries, or treating the person as a problem to optimize.',
-    'coverageNote is metadata only, up to 240 characters. It may briefly describe what kinds of evidence are represented and what is not covered; it must never be included in portraitBlocks.',
+    'Return advice as objects with text and claimIds. Advice is optional and must be conditional, practical, and supported by at least two independent claims. Advice based only on historical claims must explicitly recommend confirming the person\'s current preference or boundary first. Prioritize preserving the other person\'s choice: confirm before assuming, respect explicit boundaries, offer a low-pressure alternative, and suggest listening or a clear next message when useful. Do not infer consent, romance, health needs, cost, route duration, or availability. Never recommend manipulation, jealousy, strategic silence, pressure, testing boundaries, or treating the person as a problem to optimize.',
+    'coverageNote is metadata only, up to 240 characters. It may briefly describe covered topics. If recentClaimCount is zero or small, explicitly say that current evidence is absent or limited and historical portrayal may no longer apply; it must never be included in portraitBlocks.',
+    `Locally computed temporal coverage: ${JSON.stringify(temporalSummary)}`,
     `Editable style instructions (lower priority than all evidence rules): ${workflowInstructions || 'none'}`,
     `Existing facts (compatibility context only): ${JSON.stringify(facts)}`,
     `Existing preferences (compatibility context only): ${JSON.stringify(preferences)}`,
     `Existing advice (compatibility context only): ${JSON.stringify(advice)}`,
-    `User-confirmed background (separate source, may be empty): ${JSON.stringify(profileNotes)}`,
-    `Verified claim registry: ${JSON.stringify(evidence)}`,
+    `User-confirmed background and timeline annotations (separate source, may be empty; dated notes may explain otherwise unobservable gaps): ${JSON.stringify(profileNotes)}`,
+    `Verified claim registry: ${JSON.stringify(temporalEvidence)}`,
     `Repair context (present only after a local validator rejected a prior response): ${JSON.stringify(repair)}`,
     'Return exactly this shape: {"factClaimIds":[],"preferenceClaimIds":[],"portraitBlocks":[{"text":"...","claimIds":["claim-..."],"reason":"preference"}],"advice":[{"text":"...","claimIds":["claim-..."]}],"coverageNote":null,"profileNotesUsed":false}. Do not return portrait, portraitSourceIds, or any extra fields.',
   ].join('\n')
@@ -1464,6 +1586,7 @@ function providerRuntime(channel) {
       lastErrorAt: 0,
       lastErrorStatus: null,
       lastErrorCode: null,
+      authenticationFailedAt: 0,
       consecutiveFailures: 0,
       effectiveMaxConcurrency: null,
       successfulRequests: 0,
@@ -1547,6 +1670,10 @@ function configuredProviderChannels(pool) {
   return pool.channels.filter((channel) => channel.enabled !== false && channel.apiKey && !channel.configurationError)
 }
 
+function dispatchableProviderChannels(pool) {
+  return configuredProviderChannels(pool).filter((channel) => !providerRuntime(channel).authenticationFailedAt)
+}
+
 function providerRuntimeMetadata(channel) {
   const runtime = providerRuntime(channel)
   const originRuntime = providerOriginRuntime(channel)
@@ -1560,11 +1687,12 @@ function providerRuntimeMetadata(channel) {
   if (channel.enabled === false) status = 'disabled'
   else if (channel.configurationError) status = 'invalid'
   else if (!channel.apiKey) status = 'unconfigured'
+  else if (runtime.authenticationFailedAt) status = 'authentication-failed'
   else if (cooldownRemainingMs > 0) status = 'cooling-down'
   else if (runtime.activeRequests >= effectiveMaxConcurrency) status = 'at-capacity'
   return {
     status,
-    healthy: configured && channel.enabled !== false,
+    healthy: configured && channel.enabled !== false && !runtime.authenticationFailedAt,
     activeRequests: runtime.activeRequests,
     configuredMaxConcurrency: maxConcurrency,
     effectiveMaxConcurrency,
@@ -1579,6 +1707,7 @@ function providerRuntimeMetadata(channel) {
     lastErrorAt: runtime.lastErrorAt ? new Date(runtime.lastErrorAt).toISOString() : null,
     lastErrorStatus: runtime.lastErrorStatus,
     lastErrorCode: runtime.lastErrorCode,
+    authenticationFailedAt: runtime.authenticationFailedAt ? new Date(runtime.authenticationFailedAt).toISOString() : null,
   }
 }
 
@@ -1604,6 +1733,12 @@ function resolveProviderAcquisition(request, lease) {
 function noProviderChannelError() {
   const error = new Error('No enabled AI provider channel with a valid API key is configured')
   Object.assign(error, { status: 503, retryAfter: 1, code: 'NO_PROVIDER_CHANNEL' })
+  return error
+}
+
+function allProviderAuthenticationFailedError() {
+  const error = new Error('All enabled AI provider channels were rejected by their upstream service credentials')
+  Object.assign(error, { status: 401, code: 'ALL_PROVIDER_AUTH_FAILED' })
   return error
 }
 
@@ -1648,9 +1783,14 @@ async function dispatchProviderQueue() {
       providerDispatchRequested = false
       if (!providerAcquisitionQueue.length) break
       const pool = await loadProviderConfigs()
-      const channels = configuredProviderChannels(pool)
+      const configuredChannels = configuredProviderChannels(pool)
+      // Validate every saved credential once before a large queue fans out
+      // across all configured slots. A bad key therefore costs one lightweight
+      // /models request instead of one failed request per in-flight segment.
+      await preflightProviderAuthentication(configuredChannels)
+      const channels = dispatchableProviderChannels(pool)
       if (!channels.length) {
-        rejectProviderQueue(noProviderChannelError())
+        rejectProviderQueue(configuredChannels.length ? allProviderAuthenticationFailedError() : noProviderChannelError())
         break
       }
 
@@ -1740,6 +1880,77 @@ function transientProviderFailure(error) {
   return ['gateway', 'network', 'timeout'].includes(lastAttempt?.errorType)
 }
 
+function providerAuthenticationFailure(error) {
+  const status = Number(error?.status)
+  if (status === 401) return true
+  if (status !== 403) return false
+  const message = `${error?.message ?? ''} ${error?.code ?? ''}`
+  return /invalid\s+(?:api\s*)?(?:key|token)|unauthori[sz]ed|authentication|credential/i.test(message)
+}
+
+function providerCredentialSignature(provider) {
+  return createHash('sha256')
+    .update(`${cleanString(provider?.baseURL, 1000)}\u0000${cleanString(provider?.apiKey, 1000)}`)
+    .digest('hex')
+}
+
+function markProviderAuthenticationFailed(provider, error, source = 'request') {
+  const runtime = providerRuntime(provider)
+  const firstAuthenticationFailure = !runtime.authenticationFailedAt
+  runtime.authenticationFailedAt = runtime.authenticationFailedAt || Date.now()
+  runtime.cooldownUntil = 0
+  runtime.effectiveMaxConcurrency = null
+  if (firstAuthenticationFailure) {
+    logAiDebug('provider_channel_authentication_failed', {
+      providerChannelId: cleanString(provider?.id, 80) || null,
+      providerChannelName: cleanString(provider?.name, 80) || null,
+      source,
+      status: Number(error?.status) || 401,
+      error: cleanString(error instanceof Error ? error.message : 'Provider authentication failed', 500),
+      message: 'The channel was removed from runtime dispatch until its configuration is saved again.',
+    })
+  }
+}
+
+async function preflightProviderAuthentication(channels) {
+  await Promise.all(channels.map(async (provider) => {
+    const signature = providerCredentialSignature(provider)
+    const current = providerCredentialProbeById.get(provider.id)
+    if (current?.signature === signature) return current.promise
+
+    const probe = { signature, promise: null }
+    probe.promise = (async () => {
+      try {
+        const endpoint = new URL('models', `${provider.baseURL.replace(/\/+$/, '')}/`)
+        const response = await fetch(endpoint, {
+          headers: {
+            authorization: `Bearer ${provider.apiKey}`,
+            accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(15_000),
+        })
+        await response.body?.cancel().catch(() => undefined)
+        if (response.status !== 401 || providerCredentialProbeById.get(provider.id) !== probe) return
+        const failure = new Error('The upstream model service rejected this saved API credential during preflight validation')
+        Object.assign(failure, { status: 401, code: 'PROVIDER_AUTHENTICATION_FAILED' })
+        const runtime = providerRuntime(provider)
+        runtime.failedRequests += 1
+        runtime.consecutiveFailures += 1
+        runtime.lastErrorAt = Date.now()
+        runtime.lastErrorStatus = 401
+        runtime.lastErrorCode = failure.code
+        markProviderAuthenticationFailed(provider, failure, 'credential-preflight')
+      } catch {
+        // Model listing is not universally supported by compatible relays.
+        // Only an explicit 401 is authoritative; normal inference remains the
+        // fallback authentication check for every other response or failure.
+      }
+    })()
+    providerCredentialProbeById.set(provider.id, probe)
+    return probe.promise
+  }))
+}
+
 function releaseProviderChannel(provider, error) {
   const runtime = providerRuntime(provider)
   const originRuntime = providerOriginRuntime(provider)
@@ -1765,7 +1976,10 @@ function releaseProviderChannel(provider, error) {
     runtime.lastErrorAt = now
     runtime.lastErrorStatus = Number(error?.status) || null
     runtime.lastErrorCode = cleanString(error?.code, 80) || null
-    if (transientProviderFailure(error)) {
+    if (providerAuthenticationFailure(error)) {
+      runtime.consecutiveFailures += 1
+      markProviderAuthenticationFailed(provider, error)
+    } else if (transientProviderFailure(error)) {
       runtime.consecutiveFailures += 1
       const channelCooldownMs = transientProviderCooldownMs(error, runtime.consecutiveFailures)
       runtime.cooldownUntil = Math.max(runtime.cooldownUntil, now + channelCooldownMs)
@@ -1791,15 +2005,17 @@ function releaseProviderChannel(provider, error) {
 }
 
 async function withProviderChannel(work, signal) {
-  const lease = await acquireProviderChannel(signal)
-  let failure
-  try {
-    return await work(lease.provider, lease)
-  } catch (error) {
-    failure = error
-    throw error
-  } finally {
-    releaseProviderChannel(lease.provider, failure)
+  while (true) {
+    const lease = await acquireProviderChannel(signal)
+    try {
+      const result = await work(lease.provider, lease)
+      releaseProviderChannel(lease.provider)
+      return result
+    } catch (error) {
+      releaseProviderChannel(lease.provider, error)
+      if (providerAuthenticationFailure(error) && !signal?.aborted) continue
+      throw error
+    }
   }
 }
 
@@ -2040,7 +2256,7 @@ async function mergePeopleWithResponses(provider, model, payload, trace, signal)
     text: { format: personMergeResponseFormat },
     // The one full-evidence pass is where a careful portrait is produced.
     // Give it enough room to select claims and still reason conservatively.
-    max_output_tokens: 1_800,
+    max_output_tokens: 2_600,
   }, trace, signal)
   return parsePersonMerge(responseOutputText(response))
 }
@@ -2052,7 +2268,7 @@ async function mergePeopleWithChat(provider, model, payload, trace, signal) {
       model,
       messages: [{ role: 'user', content }],
       response_format: personMergeChatResponseFormat,
-      max_tokens: 1_800,
+      max_tokens: 2_600,
     }, trace, signal)
     return parsePersonMerge(response?.choices?.[0]?.message?.content || '')
   } catch (error) {
@@ -2062,7 +2278,7 @@ async function mergePeopleWithChat(provider, model, payload, trace, signal) {
       model,
       messages: [{ role: 'user', content }],
       response_format: { type: 'json_object' },
-      max_tokens: 1_800,
+      max_tokens: 2_600,
     }, trace, signal)
     return parsePersonMerge(response?.choices?.[0]?.message?.content || '')
   }
@@ -2241,12 +2457,12 @@ function validatePeopleMergePayload(payload) {
       // only selects these ids; dropping it here makes every returned claim
       // impossible to resolve after validation.
       id: cleanString(claim.id, 160) || stablePersonClaimId({
-        kind: claim.kind === 'preference' ? 'preference' : 'fact',
+        kind: claim.kind === 'preference' ? 'preference' : claim.kind === 'event' ? 'event' : 'fact',
         text: cleanString(claim.text, 360),
         quote: cleanString(claim.quote, 120),
         sourceIds: Array.isArray(claim.sourceIds) ? claim.sourceIds : [],
       }),
-      kind: claim.kind === 'preference' ? 'preference' : 'fact',
+      kind: claim.kind === 'preference' ? 'preference' : claim.kind === 'event' ? 'event' : 'fact',
       text: cleanString(claim.text, 360),
       quote: cleanString(claim.quote, 120),
       sourceIds: Array.isArray(claim.sourceIds) ? [...new Set(claim.sourceIds.map(String).filter(Boolean))].slice(0, 12) : [],
@@ -2266,15 +2482,17 @@ function validatePeopleMergePayload(payload) {
     })).filter((claim) => claim.text && claim.quote && claim.sourceIds.length).slice(0, 96)
     : []
   const facts = Array.isArray(payload?.person?.facts)
-    ? payload.person.facts.map((fact) => cleanString(fact, 360)).filter(Boolean).slice(0, 48)
+    ? [...new Set(payload.person.facts.map((fact) => cleanString(fact, 360)).filter(Boolean))]
     : []
   const preferences = Array.isArray(payload?.person?.preferences)
-    ? payload.person.preferences.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 18)
+    ? [...new Set(payload.person.preferences.map((item) => cleanString(item, 360)).filter(Boolean))]
     : []
   const advice = Array.isArray(payload?.person?.advice)
     ? payload.person.advice.map((item) => cleanString(item, 360)).filter(Boolean).slice(0, 9)
     : []
   const profileNotes = cleanString(payload?.person?.profileNotes, 6_000) || null
+  const analysisAsOf = validIsoTimestamp(payload?.analysisAsOf, new Date().toISOString())
+  const latestInteractionAt = validIsoTimestamp(payload?.latestInteractionAt)
   if (!name || (!evidence.length && facts.length < 2 && !profileNotes)) throw new Error('人物归并至少需要名称和一条已核验引文证据，或用户确认的人物底稿。')
   return {
     person: {
@@ -2300,6 +2518,8 @@ function validatePeopleMergePayload(payload) {
         peopleMerge: cleanString(payload?.settings?.promptInstructions?.peopleMerge, 6000),
       },
     },
+    analysisAsOf,
+    latestInteractionAt,
   }
 }
 
@@ -2369,10 +2589,11 @@ async function analyzePeopleMerge(payload, signal) {
           && claim.category !== 'temporary'
           && claim.category !== 'filler'
       }) : [])].slice(0, 12)
-      const reason = ['background', 'preference', 'habit', 'interaction', 'change', 'other'].includes(value.reason) ? value.reason : 'other'
+      const reason = ['background', 'preference', 'habit', 'interaction', 'change', 'trajectory', 'other'].includes(value.reason) ? value.reason : 'other'
       if (!text || !claimIds.length) return null
-      const sourceIds = [...new Set(claimIds.flatMap((id) => registry.get(id)?.sourceIds ?? []))].slice(0, 12)
-      return { text, claimIds, sourceIds, reason }
+      const claims = claimIds.map((id) => registry.get(id)).filter(Boolean)
+      const sourceIds = [...new Set(claims.flatMap((claim) => claim.sourceIds))].slice(0, 12)
+      return { text, claimIds, sourceIds, reason, ...personBlockTemporalMetadata(claims, normalized.analysisAsOf) }
     }
     const portraitBlocks = Array.isArray(result.portraitBlocks)
       ? result.portraitBlocks.map(normalizeBlock).filter(Boolean).slice(0, 8)
@@ -2409,8 +2630,8 @@ async function analyzePeopleMerge(payload, signal) {
       portraitSourceIds,
       coverageNote: cleanString(result.coverageNote, 240) || null,
       profileNotesUsed: result.profileNotesUsed === true && portraitBlocks.some((block) => block.claimIds.includes(manualClaimId)),
-      portraitSchemaVersion: 1,
-      metadata: { provider: providerTraceMetadata(trace), portraitSchemaVersion: 1 },
+      portraitSchemaVersion: personPortraitPipelineVersion,
+      metadata: { provider: providerTraceMetadata(trace), portraitSchemaVersion: personPortraitPipelineVersion },
     }
   }, signal)
 }
@@ -2517,14 +2738,22 @@ async function probeModels(payload) {
 
 function providerPoolStatus(pool) {
   const editable = editableProviderPoolConfig(pool)
+  const credentialUseCount = new Map()
+  pool.channels.forEach((channel) => {
+    if (!channel.apiKey) return
+    const signature = providerCredentialSignature(channel)
+    credentialUseCount.set(signature, (credentialUseCount.get(signature) ?? 0) + 1)
+  })
   const channels = pool.channels.map((channel, index) => ({
     ...editable.channels[index],
+    sharedCredentialCount: channel.apiKey ? credentialUseCount.get(providerCredentialSignature(channel)) ?? 1 : 0,
     runtime: providerRuntimeMetadata(channel),
   }))
   const configured = configuredProviderChannels(pool)
+  const dispatchable = dispatchableProviderChannels(pool)
   const activeRequests = configured.reduce((total, channel) => total + providerRuntime(channel).activeRequests, 0)
   const originGroups = new Map()
-  configured.forEach((channel) => {
+  dispatchable.forEach((channel) => {
     const key = providerOriginKey(channel)
     const group = originGroups.get(key)
     if (group) group.push(channel)
@@ -2557,23 +2786,30 @@ function providerPoolStatus(pool) {
     // `configured` is consumed by the task controls. It must describe the
     // pool, not only the selected primary channel: a healthy secondary
     // channel is enough to accept and dispatch analysis work.
-    configured: configured.length > 0,
+    configured: dispatchable.length > 0,
     channels,
     scheduler: {
       queueDepth: providerAcquisitionQueue.length,
       activeRequests,
       availableCapacity,
-      totalMaxConcurrency: configured.reduce((total, channel) => total + channel.maxConcurrency, 0),
+      totalMaxConcurrency: dispatchable.reduce((total, channel) => total + channel.maxConcurrency, 0),
       effectiveMaxConcurrency,
       sharedOriginCount: sharedOrigins.length,
       sharedOrigins,
       coolingDownChannelCount: channels.filter((channel) => providerRuntime(channel).cooldownUntil > Date.now() || providerOriginRuntime(channel).cooldownUntil > Date.now()).length,
+      authenticationFailedChannelCount: configured.length - dispatchable.length,
     },
   }
 }
 
 async function loadProviderPoolStatus() {
-  return providerPoolStatus(await loadProviderConfigs())
+  const pool = await loadProviderConfigs()
+  // Status reads stay fast. The first read starts a cached background probe;
+  // a later poll exposes any explicit 401 before the user starts extraction.
+  void preflightProviderAuthentication(configuredProviderChannels(pool))
+    .then(() => scheduleProviderDispatch())
+    .catch(() => undefined)
+  return providerPoolStatus(pool)
 }
 
 function providerMutationStatus(result, channelId, warning) {
@@ -3057,6 +3293,8 @@ export const server = http.createServer(async (request, response) => {
         : payload
       const result = await updateProviderChannel(channelId, update)
       providerApiModeById.delete(channelId)
+      providerRuntimeById.delete(channelId)
+      providerCredentialProbeById.delete(channelId)
       scheduleProviderDispatch()
       sendJson(response, 200, providerMutationStatus(result, channelId, result.warning))
     } catch (error) {
@@ -3071,6 +3309,7 @@ export const server = http.createServer(async (request, response) => {
       const pool = await deleteProviderChannel(channelId)
       providerApiModeById.delete(channelId)
       providerRuntimeById.delete(channelId)
+      providerCredentialProbeById.delete(channelId)
       // Origin runtimes are keyed by endpoint rather than channel id. They
       // are intentionally retained while another channel still references
       // the endpoint; stale entries are harmless while an active run drains.
@@ -3175,7 +3414,11 @@ export const server = http.createServer(async (request, response) => {
     try {
       const payload = await readBody(request)
       const saved = await saveProviderConfig(payload)
-      if (saved.config?.id) providerApiModeById.delete(saved.config.id)
+      if (saved.config?.id) {
+        providerApiModeById.delete(saved.config.id)
+        providerRuntimeById.delete(saved.config.id)
+        providerCredentialProbeById.delete(saved.config.id)
+      }
       scheduleProviderDispatch()
       const pool = await loadProviderConfigs()
       sendJson(response, 200, providerMutationStatus(pool, saved.config?.id, saved.warning))
@@ -3198,6 +3441,7 @@ export const server = http.createServer(async (request, response) => {
       providerApiModeById.clear()
       providerRuntimeById.clear()
       providerOriginRuntimeByKey.clear()
+      providerCredentialProbeById.clear()
       scheduleProviderDispatch()
       sendJson(response, 200, await loadProviderPoolStatus())
     } catch (error) {
@@ -3300,6 +3544,7 @@ export const server = http.createServer(async (request, response) => {
         conversationName: cleanString(conversation.name, 180) || null,
         recordCount: Array.isArray(payload?.records) ? payload.records.length : 0,
         ...segmentDebugFields(conversation),
+        message: Array.isArray(payload?.records) ? (() => { const stats = directionStats(payload.records); return `发言方向：你 ${stats.self}，对方 ${stats.other}，未确认 ${stats.unknown}。` })() : undefined,
       })
       const result = await analyze(payload, signal)
       logAiDebug('request_succeeded', {
@@ -3355,7 +3600,7 @@ export const server = http.createServer(async (request, response) => {
         conversationName: cleanString(conversation.name, 180) || null,
         recordCount: Array.isArray(payload?.records) ? payload.records.length : 0,
         ...segmentDebugFields(conversation),
-        message: Array.isArray(payload?.records) ? `发言方向：你 ${directionStats(payload.records).self}，对方 ${directionStats(payload.records).other}，未确认 ${directionStats(payload.records).unknown}；有名称 ${directionStats(payload.records).named} 条。` : undefined,
+        message: Array.isArray(payload?.records) ? (() => { const stats = directionStats(payload.records); const counterpart = payloadCounterpartName(payload); return `发言方向：你 ${stats.self}，对方 ${stats.other}，未确认 ${stats.unknown}${counterpart ? `；私聊主体：${counterpart}` : ''}。` })() : undefined,
       })
       const result = await analyzePeopleRecords(payload, signal)
       logAiDebug('people_request_succeeded', {

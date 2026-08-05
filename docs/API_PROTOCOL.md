@@ -1,6 +1,6 @@
 # THEIA 本地 API 与模型协议参考
 
-本文是 THEIA `0.4.1` 的协议级参考，面向前端、桌面壳、第三方导出适配器、测试服务和二次开发者。它描述的是当前 `server/index.mjs` 和 `src/lib/aiClient.ts` 的实际行为，不是未来规划。
+本文是 THEIA `0.4.2` 的协议级参考，面向前端、桌面壳、第三方导出适配器、测试服务和二次开发者。它描述的是当前 `server/index.mjs` 和 `src/lib/aiClient.ts` 的实际行为，不是未来规划。
 
 协议有两个边界：
 
@@ -187,6 +187,11 @@ Cache-Control: no-store
     "id": "direct-linxiao",
     "name": "林晓",
     "kind": "direct",
+    "recordFormat": "compact-v2",
+    "counterpartName": "林晓",
+    "analysisAsOf": "2026-08-05T12:00:00.000Z",
+    "timeZone": "Asia/Shanghai",
+    "utcOffsetMinutes": 480,
     "totalRecords": 2,
     "recordCount": 2,
     "segmentIndex": 1,
@@ -199,18 +204,14 @@ Cache-Control: no-store
   "records": [
     {
       "id": "msg-001",
-      "formattedTime": "2026-07-28 18:30:00",
-      "type": "text",
+      "sentAt": "2026-07-28T18:30:00.000Z",
       "content": "周六下午去图书馆讨论开学材料，可以吗？",
-      "senderDisplayName": "林晓",
       "speakerRole": "other"
     },
     {
       "id": "msg-002",
-      "formattedTime": "2026-07-28 18:31:12",
-      "type": "text",
+      "sentAt": "2026-07-28T18:31:12.000Z",
       "content": "可以，三点在东门见。",
-      "senderDisplayName": "你",
       "speakerRole": "self"
     }
   ],
@@ -240,7 +241,11 @@ Cache-Control: no-store
 - `conversation.recordCount` 必须等于本段 `records.length`；`totalRecords` 可以大于本段长度。
 - `segmentIndex` 从 1 开始且不大于 `segmentCount`。
 - `coreRecordIndexes` 是本段数组的 1-based 索引。只有核心记录可以直接支撑新任务，overlap 只用于消解指代。
-- 每条记录必须有稳定 `id` 和非空 `content`。模型实际看到的顺序化压缩行是 `[序号, formattedTime, type, content, senderDisplayName, speakerRole]`，不是带长键名的对象。
+- 每条记录必须有稳定 `id` 和可显示正文；旧兼容请求可以只提供 `summary`，新客户端应提供 `content`。完全没有文本的消息保留为 `[non-text message]` 占位行，不会因为缺少语音/图片正文而丢掉时间线位置。当前 `compact-v2` 模型请求实际看到的顺序化压缩行是 `[RecordRef, sentAt, content, speakerRole]`，不是带长键名的对象。`RecordRef` 是本段内的 1-based 短引用号，响应返回后由服务端恢复为本地消息 ID。
+- `conversation.counterpartName` 是本地导入阶段确认的私聊主体；人物请求只使用它识别人物，不再依赖每条记录的昵称。群聊可以省略该字段。
+- `conversation.analysisAsOf` 是本次分析的参考时间，用于判断证据距现在的年龄；相对日期必须仍以每条记录自己的 `sentAt` 为锚点，不能用 `analysisAsOf` 代替缺失的消息时间。
+- `conversation.timeZone` 与 `utcOffsetMinutes` 描述无偏移 `sentAt` 所在的本地时钟。它们是会话级字段，不在每条消息上重复，可避免午夜附近把“明天”解析到错误日期。偏移量范围限制为 `-840..840` 分钟。
+- 本地归档仍可保留 `formattedTime`、`type`、`senderDisplayName`、`speaker`、头像和平台字段，用于审计、回看、方向校验和人物头像获取。旧客户端发送这些字段时服务端继续兼容，但构造模型 prompt 前会丢弃 `type` 和 `senderDisplayName`。
 - `speakerRole` 只能是 `self`、`other`、`unknown`。未知方向不会被昵称猜测覆盖。
 - 第一段可以带最多 4 个附件；客户端后续段发送空数组，避免重复 token 和重复上传。
 

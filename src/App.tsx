@@ -33,6 +33,8 @@ import { taskGuidanceRequestIsCurrent, taskGuidanceSignature } from './lib/quest
 import { completedConversationWatermarks } from './lib/analysisWatermark'
 import { aiTaskCandidatesDuplicate, mergeAiTaskCandidates } from './lib/aiCandidateDedup'
 import { personEvidenceIdentityKey } from './lib/personEvidenceIdentity'
+import { canStartPersonConsolidation } from './lib/peopleConsolidation'
+import { PERSON_PORTRAIT_PIPELINE_VERSION } from './lib/personTemporal'
 
 const TimelineView = lazy(() => import('./views/TimelineView').then((module) => ({ default: module.TimelineView })))
 const MapView = lazy(() => import('./views/MapView').then((module) => ({ default: module.MapView })))
@@ -221,16 +223,6 @@ function personEvidenceKey(claim: PersonEvidence) {
   return personEvidenceIdentityKey(claim)
 }
 
-function personProfileSignalScore(claim: PersonEvidence) {
-  const compact = `${claim.text} ${claim.quote}`.replace(/\s+/g, '').toLocaleLowerCase('zh-CN')
-  let score = claim.kind === 'preference' ? 7 : 2
-  if (claim.evidenceStrength === 'repeated') score += 5
-  if (/(?:喜欢|不喜欢|想要|想去|爱吃|感兴趣|习惯|常去|希望|讨厌|擅长|在意|计划|准备)/.test(compact)) score += 3
-  if (claim.quote.trim().length >= 8) score += 1
-  if (/^(?:好|嗯|哦|哈哈|行|可以|知道了|收到)[!！。.]?$/.test(claim.quote.trim())) score -= 6
-  return score
-}
-
 function mergePersonEvidence(current: PersonEvidence[] = [], incoming: PersonEvidence[] = []) {
   const claims = new Map<string, PersonEvidence>()
   for (const claim of [...current, ...incoming]) {
@@ -256,27 +248,11 @@ function mergePersonEvidence(current: PersonEvidence[] = [], incoming: PersonEvi
     if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) return leftTime - rightTime
     return personEvidenceKey(left).localeCompare(personEvidenceKey(right))
   })
-  if (ordered.length <= 240) return ordered
-  const selected = new Set<number>()
-  for (let index = 0; index < 36; index += 1) selected.add(index)
-  for (let index = Math.max(36, ordered.length - 36); index < ordered.length; index += 1) selected.add(index)
-  const highSignal = ordered
-    .map((claim, index) => ({ index, score: personProfileSignalScore(claim) }))
-    .filter((entry) => entry.score >= 5)
-    .sort((left, right) => right.score - left.score || left.index - right.index)
-  for (const { index } of highSignal) {
-    if (selected.size >= 168) break
-    selected.add(index)
-  }
-  const middle = ordered.map((_, index) => index).filter((index) => !selected.has(index))
-  for (let slot = 0; selected.size < 240 && middle.length; slot += 1) {
-    selected.add(middle[Math.min(middle.length - 1, Math.floor((slot + 0.5) * middle.length / Math.max(1, 240 - 72)))])
-  }
-  return [...selected].sort((left, right) => left - right).map((index) => ordered[index])
+  return ordered
 }
 
-function notesFromPersonEvidence(evidence: PersonEvidence[], kind: PersonEvidence['kind'], limit: number) {
-  return [...new Set(evidence.filter((claim) => claim.kind === kind).map((claim) => claim.text.trim()).filter(Boolean))].slice(0, limit)
+function notesFromPersonEvidence(evidence: PersonEvidence[], kind: PersonEvidence['kind']) {
+  return [...new Set(evidence.filter((claim) => claim.kind === kind).map((claim) => claim.text.trim()).filter(Boolean))]
 }
 
 function portraitEvidenceSignature(person: Person) {
@@ -284,6 +260,7 @@ function portraitEvidenceSignature(person: Person) {
   const profileNotes = person.profileNotes?.trim() ?? ''
   if (!evidence.length && !profileNotes) return ''
   return stableId(JSON.stringify({
+    pipelineVersion: PERSON_PORTRAIT_PIPELINE_VERSION,
     evidence: evidence.map((claim) => [
       claim.kind,
       claim.text,
@@ -306,7 +283,6 @@ function isLocalExportVerifiedPerson(person: Person) {
   return person.model.includes('local-export-verified') || person.model.includes('\u5bfc\u51fa\u8bb0\u5f55\u6838\u9a8c')
 }
 
-const PERSON_FACT_BUFFER_LIMIT = 48
 // Portrait merge requests use the same configured capacity as evidence
 // extraction. The server-side provider/origin pool remains the final limiter.
 const PERSON_CONSOLIDATION_MAX_CONCURRENT = 64
@@ -383,14 +359,14 @@ function mergePeople(current: AppData, additions: Person[], options: { restoreDi
       // Once the evidence pass has contributed claims, old summary strings no
       // longer drive the card. The final profile is rebuilt only from quotes.
       facts: hasModelEvidence
-        ? notesFromPersonEvidence(evidence, 'fact', PERSON_FACT_BUFFER_LIMIT)
-        : [...new Set([...existing.facts, ...incoming.facts])].slice(0, PERSON_FACT_BUFFER_LIMIT),
+        ? notesFromPersonEvidence(evidence, 'fact')
+        : [...new Set([...existing.facts, ...incoming.facts])],
       preferences: hasModelEvidence
-        ? notesFromPersonEvidence(evidence, 'preference', 24)
-        : [...new Set([...(existing.preferences ?? []), ...(incoming.preferences ?? [])])].slice(0, 18),
+        ? notesFromPersonEvidence(evidence, 'preference')
+        : [...new Set([...(existing.preferences ?? []), ...(incoming.preferences ?? [])])],
       evidence: hasModelEvidence ? evidence : existing.evidence ?? incoming.evidence,
       advice: evidenceChanged ? [] : [...new Set([...(existing.advice ?? []), ...(incoming.advice ?? [])])].slice(0, 9),
-      sourceIds: [...new Set([...existing.sourceIds, ...incoming.sourceIds, ...evidence.flatMap((claim) => claim.sourceIds)])].slice(0, 120),
+      sourceIds: [...new Set([...existing.sourceIds, ...incoming.sourceIds, ...evidence.flatMap((claim) => claim.sourceIds)])],
       conversationIds: [...new Set([...(existing.conversationIds ?? []), ...(incoming.conversationIds ?? [])])].slice(0, 30),
       firstObservedAt: earliestObserved([existing.firstObservedAt, incoming.firstObservedAt]),
       lastObservedAt: latestObserved([existing.lastObservedAt, incoming.lastObservedAt]),
@@ -1269,6 +1245,11 @@ function App() {
   }
 
   const consolidatePeopleIfNeeded = (source: Person[] = dataRef.current.people) => {
+    // Evidence extraction owns the person cards until every conversation
+    // segment has arrived. Starting a portrait merge in the middle of that
+    // stream only guarantees that the next segment makes it stale and aborts
+    // it again.
+    if (!canStartPersonConsolidation(peopleConsolidationPausedRef.current, Boolean(peopleAnalysisAbortRef.current))) return
     if (peopleConsolidationPausedRef.current) {
       if (!pendingPersonConsolidationsRef.current.size && !peopleAnalysisAbortRef.current) {
         setAnalysisWork((current) => current?.stage === 'people' ? null : current)
@@ -1455,13 +1436,29 @@ function App() {
   }
 
   const schedulePeopleConsolidation = () => {
-    if (peopleConsolidationPausedRef.current || peopleConsolidationScheduledRef.current) return
+    if (!canStartPersonConsolidation(peopleConsolidationPausedRef.current, Boolean(peopleAnalysisAbortRef.current), peopleConsolidationScheduledRef.current)) return
     peopleConsolidationScheduledRef.current = true
     window.setTimeout(() => {
       peopleConsolidationScheduledRef.current = false
       consolidatePeopleIfNeeded()
     }, 0)
   }
+
+  // Hydrated cards can require a new portrait pass after a deterministic
+  // pipeline-version change even when no new chat import is running. Wake the
+  // bounded queue after render; its signature and pending guards keep this
+  // idempotent and the pause flag still wins.
+  useEffect(() => {
+    if (peopleConsolidationPausedRef.current || peopleAnalysisAbortRef.current) return
+    const needsConsolidation = dataRef.current.people.some((person) => {
+      const signature = portraitEvidenceSignature(person)
+      return Boolean(signature)
+        && person.portraitEvidenceSignature !== signature
+        && !pendingPersonConsolidationsRef.current.has(person.id)
+        && Math.max(personConsolidationRetriesRef.current.get(person.id) ?? 0, Number(person.portraitRetryCount) || 0) < 3
+    })
+    if (needsConsolidation) schedulePeopleConsolidation()
+  })
 
   const retryPersonPortrait = (id: string) => {
     personConsolidationRetriesRef.current.delete(id)
@@ -1489,18 +1486,21 @@ function App() {
 
   const mergeIncomingPeople = (additions: Person[], explicitExtraction = false) => {
     if (!additions.length) return
-    const incomingNames = new Set(additions.map((person) => canonicalPersonName(person.name)))
-    const incomingConversationIds = new Set(additions.flatMap((person) => person.conversationIds ?? []))
-    additions.forEach((person) => {
-      personConsolidationControllersRef.current.get(person.id)?.abort()
+    const extractionActive = Boolean(peopleAnalysisAbortRef.current)
+    dataRef.current.people.forEach((person) => {
+      const matchingAdditions = additions.filter((incoming) => canonicalPersonName(incoming.name) === canonicalPersonName(person.name)
+        || (incoming.conversationIds ?? []).some((id) => (person.conversationIds ?? []).includes(id)))
+      if (!matchingAdditions.length) return
+      const nextEvidence = matchingAdditions.reduce((evidence, incoming) => mergePersonEvidence(evidence, incoming.evidence), person.evidence ?? [])
+      const evidenceChanged = JSON.stringify(person.evidence ?? []) !== JSON.stringify(nextEvidence)
+      if (!evidenceChanged) return
+      // A new evidence batch invalidates a portrait, but during a full
+      // extraction it must not abort a request for every arriving segment.
+      // The whole extraction is fenced by peopleAnalysisAbortRef and one
+      // portrait pass is scheduled after that fence is released.
+      if (!extractionActive) personConsolidationControllersRef.current.get(person.id)?.abort()
       personConsolidationRetriesRef.current.delete(person.id)
       completedPersonConsolidationSignaturesRef.current.delete(person.id)
-    })
-    dataRef.current.people.forEach((person) => {
-      if (incomingNames.has(canonicalPersonName(person.name))
-        || (person.conversationIds ?? []).some((id) => incomingConversationIds.has(id))) {
-        personConsolidationRetriesRef.current.delete(person.id)
-      }
     })
     setData((current) => mergePeople(current, additions, { restoreDismissedConversations: explicitExtraction }))
   }
@@ -1511,11 +1511,16 @@ function App() {
     const conversationCount = new Set(directRecords.map((item) => item.conversationId)).size
     if (!directRecords.length) return { started: false, people: [], reason: '当前范围内没有带可靠会话身份的私聊记录。' }
 
+    peopleConsolidationPausedRef.current = false
+    const controller = new AbortController()
+    peopleAnalysisAbortRef.current = controller
+    // Cancel at most once, at the boundary between two complete analysis
+    // runs. Segment results below are allowed to accumulate without causing
+    // a cancel/restart loop in the portrait queue.
+    personConsolidationControllersRef.current.forEach((pending) => pending.abort())
     // Let the verified local import immediately supply names, avatars, and
     // interaction ranges while the more expensive evidence pass is running.
     mergeIncomingPeople(buildDirectConversationFallbackPeople(directRecords))
-    peopleConsolidationPausedRef.current = false
-    const controller = new AbortController()
     let bufferedPeople: Person[] = []
     let peopleFlushTimer: number | undefined
     const flushPeople = () => {
@@ -1535,7 +1540,6 @@ function App() {
       // worth avoids hundreds of full App renders without risking progress.
       peopleFlushTimer = window.setTimeout(flushPeople, 80)
     }
-    peopleAnalysisAbortRef.current = controller
     setAnalysisWork({
       stage: 'people',
       completed: 0,
@@ -1567,12 +1571,12 @@ function App() {
         concurrency: normalizeAiConcurrency(settings.concurrency),
       })
       flushPeople()
-      schedulePeopleConsolidation()
       return { started: true, ...result }
     } finally {
       flushPeople()
       if (peopleAnalysisAbortRef.current === controller) {
         peopleAnalysisAbortRef.current = null
+        if (!peopleConsolidationPausedRef.current) schedulePeopleConsolidation()
         const mergeStillRunning = peopleConsolidationScheduledRef.current || pendingPersonConsolidationsRef.current.size > 0
         if (peopleConsolidationPausedRef.current || !mergeStillRunning) {
           setAnalysisWork((current) => current?.stage === 'people' ? null : current)

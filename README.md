@@ -6,15 +6,15 @@ THEIA 是一个本地优先的个人现实任务图工具。它将用户主动�
 
 它不是聊天软件插件，也不会绕过登录或解密应用数据库。THEIA 只读取你明确选择的导出文件；只有在你启动模型提炼后，选中的记录才会发送到你配置的模型服务。
 
-> 当前源码版本：`0.4.1`。Windows x64 NSIS 安装器、便携版与源码发布包分别生成；安装器和便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js，任务、设置、聊天归档和日志保存在 `%APPDATA%\\THEIA`。重要数据请定期备份。
+> 当前源码版本：`0.4.2`。Windows x64 NSIS 安装器、便携版与源码发布包分别生成；安装器和便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js，任务、设置、聊天归档和日志保存在 `%APPDATA%\\THEIA`。重要数据请定期备份。
 
 ## 更新日志
 
-**0.4.1**
+**0.4.2**
 
-- 修复重叠聊天分段产生重复任务或人物证据的问题。
-- 优化人物搜索、排序、联系概览和对话回看。
-- 收紧人物刻画与行动建议的证据和安全边界。
+- 修复人物提炼反复取消、画像丢失和重叠分段重复结果问题。
+- 优化人物刻画、时间边界、事实核验和连续自然语言输出。
+- 精简模型请求结构并补强多通道、持久化和回归测试。
 
 完整历史见 [更新报告](docs/RELEASE_NOTES.md)。
 
@@ -210,8 +210,8 @@ THEIA-release/
 发布工具：
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.4.1\THEIA-release-0.4.1
-npm run dist:exe -- ..\staging\v0.4.1\THEIA-0.4.1-portable
+node release-tools/package-release.mjs ..\staging\v0.4.2\THEIA-release-0.4.2
+npm run dist:exe -- ..\staging\v0.4.2\THEIA-0.4.2-portable
 npm run release:index
 ```
 

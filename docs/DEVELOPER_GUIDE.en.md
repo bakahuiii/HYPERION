@@ -2,7 +2,7 @@
 
 [简体中文](DEVELOPER_GUIDE.md) | [English](DEVELOPER_GUIDE.en.md)
 
-This guide is for engineers who maintain, review, extend, or package THEIA. It describes source version `0.4.1` and treats `package-lock.json`, `server/index.mjs`, and the current implementation as authoritative. Planned capabilities are not described as complete. For field-level local HTTP, upstream model JSON, session batching, and log formats, use [API_PROTOCOL.md](API_PROTOCOL.md) alongside this guide.
+This guide is for engineers who maintain, review, extend, or package THEIA. It describes source version `0.4.2` and treats `package-lock.json`, `server/index.mjs`, and the current implementation as authoritative. Planned capabilities are not described as complete. For field-level local HTTP, upstream model JSON, session batching, and log formats, use [API_PROTOCOL.md](API_PROTOCOL.md) alongside this guide.
 
 ## 1. System and Engineering Boundary
 
@@ -130,7 +130,7 @@ Core interfaces live in `src/types.ts`.
 
 ### 5.1 `IntelItem`
 
-A raw imported record. Important fields include stable `id`, `platform`, `conversationId`, `conversationTitle`, `conversationType`, `senderDisplayName`, normalized `speakerRole`, `formattedTime`, parsed `timestamp`, `type`, `content`, source file metadata, and optional avatar URL.
+A raw imported record. Important fields include stable `id`, `platform`, `conversationId`, `conversationTitle`, `conversationType`, normalized `speakerRole`, parsed `sentAt`/`capturedAt`, `content`, source file metadata, and an optional avatar URL. `senderDisplayName` and the exporter `type` are local audit fields, not model input requirements.
 
 ### 5.2 `AiTaskCandidate`
 
@@ -200,7 +200,7 @@ Old information may remain useful for identity or relationship context while bec
 
 ### 9.1 Client orchestration
 
-`src/lib/aiClient.ts` builds compact records, invokes loopback endpoints, normalizes structured results, and validates references. `useAiWorkflow.ts` owns run state, total progress, task/person phase progress, pause checkpoints, stop behavior, failure retry, and resume prompts.
+`src/lib/aiClient.ts` builds compact records, invokes loopback endpoints, normalizes structured results, and validates references. The local archive keeps the full `IntelItem`, but the model wire format contains only `[RecordRef, sentAt, content, speakerRole]`, plus the direct-conversation `counterpartName` and request-level `analysisAsOf`, `timeZone`, and `utcOffsetMinutes`. The clock fields describe offset-free local message timestamps once per request rather than once per row. `type` and `senderDisplayName` remain local audit fields and are removed before prompt construction. `useAiWorkflow.ts` owns run state, total progress, task/person phase progress, pause checkpoints, stop behavior, failure retry, and resume prompts.
 
 Long-running callbacks read current state through refs or functional updates. Candidate IDs and quest IDs must be checked against current state at commit time to prevent duplicate creation.
 
@@ -226,6 +226,23 @@ Each provider channel has an independent URL, key reference, model, API mode, en
 
 Channels pointing to the same origin are not guaranteed independent upstream capacity. 429, 502, 503, 504, 524, network failure, and timeout use a short local retry delay capped at two seconds in the established stable baseline. Failed work remains recoverable in the session; results use acknowledgement semantics so a transient polling-response loss does not discard completed provider work.
 
+### 9.6 End-to-end task flow
+
+```text
+exported files
+  -> local recursive parse, role resolution, avatar discovery, and deduplication
+  -> conversation grouping and chronological sorting
+  -> contiguous core segments with bounded overlap
+  -> compact-v2 request: [RecordRef, sentAt, content, speakerRole]
+  -> structured candidate response
+  -> restore local message IDs and validate owner/time/place/source
+  -> deduplicate overlap results
+  -> review queue
+  -> user confirmation and persistent quest
+```
+
+The task workflow asks only whether the user still has an actionable next step. Core rows may introduce a candidate; overlap rows are context and cannot be the sole evidence for a new candidate. `analysisAsOf` is used only for age/recency decisions. Relative dates must be resolved from the cited row's `sentAt` under the request-level time zone, never from the import or model runtime clock. A candidate is never written directly as a quest.
+
 ## 10. Person Pipeline
 
 Private conversations can create or update person evidence. Group chats do not automatically become one card per participant without reliable identity boundaries.
@@ -237,6 +254,21 @@ Merge output should use structured portrait paragraphs with referenced claim IDs
 Person fingerprints advance only after a successful durable update. Incremental updates send new records plus at most 16 preceding records for each addition. Unchanged conversations are not resubmitted.
 
 When a card lacks an avatar, the service searches the linked source conversation's session metadata for `avatar`, downloads only allowed remote media through the controlled cache path, and persists a local reference. Avatar failure must not block person evidence.
+
+Person extraction is a separate evidence pass from task extraction:
+
+```text
+direct conversation
+  -> locally verified counterpartName
+  -> wide chronological windows
+  -> claim-level facts/preferences with exact quotes and RecordRefs
+  -> deterministic source/speaker/quote validation
+  -> cross-window deduplication and merge
+  -> portrait/advice generation from verified claims only
+  -> person card update
+```
+
+Each claim must cite a core row whose `speakerRole` is `other`; a self-authored row can provide interaction context but cannot prove a fact about the counterpart. A single message such as “蛋挞好吃” supports “once said that egg tart was good”, not “likes egg tarts”. Stable preferences require repeated or otherwise materially corroborated signals. The merge stage may write readable portrait prose, but it may not add a claim absent from the verified evidence. Evidence-coverage notes are metadata, not portrait sentences. An invalid or empty merge remains retryable and must not be marked permanently successful.
 
 ## 11. Task Guidance Refresh
 
@@ -292,6 +324,8 @@ Never print raw merge responses unconditionally to production console. All full-
 `settings.ini` is shared between browser and desktop modes. It stores profile display settings, appearance, prompt templates, provider metadata, concurrency, map sources, cache limits, and credential references.
 
 Packaged Electron attempts to migrate plaintext provider keys into `safeStorage` and writes ciphertext to `credentials.json`. The INI retains a `credentialRef`. A user can always choose and save a detected model; saving applies to the next request, not a stale in-flight request.
+
+Provider variables inherited from a parent IDE, Codex, or terminal process are ignored by default. `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_API_MODE`, and `OPENAI_MAX_CONCURRENCY` are read only when `THEIA_USE_ENV_PROVIDER=1` is explicitly set. A protected secondary channel must always hydrate from its own `credentialRef`; it must never inherit the process-wide key.
 
 Provider editing must remain available even when runtime-status refresh is slow or fails. Status visualization is diagnostic and must not block configuration forms.
 
@@ -352,8 +386,8 @@ Additional desired coverage includes person claim validation and same-name conve
 ### 18.2 Source and portable packages
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.4.1\THEIA-release-0.4.1
-npm run dist:exe -- ..\staging\v0.4.1\THEIA-0.4.1-portable
+node release-tools/package-release.mjs ..\staging\v0.4.2\THEIA-release-0.4.2
+npm run dist:exe -- ..\staging\v0.4.2\THEIA-0.4.2-portable
 ```
 
 The source packager refuses an existing destination and excludes conversations, tasks, people, places, candidates, keys, provider settings, browser/Electron profiles, logs, downloaded avatars, custom backgrounds, dependencies, builds, caches, and Git metadata. It includes source, lockfiles, canonical documentation, neutral assets, fictional examples, and a manifest.
@@ -392,7 +426,7 @@ Avoid `JSON.parse(JSON.stringify(...))` for domain cloning. It silently loses da
 
 ## 20. Known Risks and Priorities
 
-Version `0.4.1` includes the `0.4.0` storage and reliability foundation plus overlap-safe task/person deduplication, human-centered people search and sorting, contact summaries, source-aware conversation previews, and guarded interpersonal guidance.
+Version `0.4.2` adds compact model payloads, conversation-level counterpart identity, temporal evidence boundaries, meaningful person events, structured continuous portraits, and more resilient multi-channel recovery. Portrait consolidation starts only after evidence extraction completes, preventing repeated segment-driven cancellation; portrait versioning, persistence, and server logging now advance together so older prose is safely regenerated.
 
 Remaining priorities include:
 

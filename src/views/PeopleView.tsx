@@ -2,7 +2,10 @@ import { CalendarClock, ChevronDown, ChevronUp, FileText, ListTodo, MessageCircl
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { AvatarImage } from '../components/AvatarImage'
 import { relativeInteractionLabel, summarizePersonInteraction } from '../lib/personInteraction'
-import type { IntelItem, Person, Quest } from '../types'
+import {
+  personEvidenceTemporalScope,
+} from '../lib/personTemporal'
+import type { IntelItem, Person, PersonEvidence, PersonPortraitBlock, Quest } from '../types'
 
 interface PeopleViewProps {
   people: Person[]
@@ -52,6 +55,25 @@ function formatChatTime(value?: string) {
     : value
 }
 
+function evidenceObservedRange(value: Pick<PersonEvidence, 'firstObservedAt' | 'lastObservedAt'> | Pick<PersonPortraitBlock, 'observedFrom' | 'observedTo'>) {
+  const temporal = value as Partial<Pick<PersonEvidence, 'firstObservedAt' | 'lastObservedAt'> & Pick<PersonPortraitBlock, 'observedFrom' | 'observedTo'>>
+  const first = temporal.firstObservedAt ?? temporal.observedFrom
+  const last = temporal.lastObservedAt ?? temporal.observedTo
+  if (!first && !last) return '证据时间未记录'
+  const start = first ?? last
+  const end = last ?? first
+  if (start === end) return formatChatTime(start)
+  return `${formatChatTime(start)} 至 ${formatChatTime(end)}`
+}
+
+function newestEvidenceFirst(left: PersonEvidence, right: PersonEvidence) {
+  const leftTime = new Date(left.lastObservedAt ?? left.firstObservedAt ?? '').getTime()
+  const rightTime = new Date(right.lastObservedAt ?? right.firstObservedAt ?? '').getTime()
+  if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return rightTime - leftTime
+  if (Number.isFinite(leftTime) !== Number.isFinite(rightTime)) return Number.isFinite(rightTime) ? 1 : -1
+  return left.text.localeCompare(right.text, 'zh-CN')
+}
+
 function portraitFor(person: Person) {
   const portrait = person.portrait?.trim() ?? ''
   if (!portrait) return ''
@@ -66,7 +88,7 @@ type PeopleSortMode = 'recent' | 'coverage' | 'name'
 function PersonProfileEditor({ person, onSave }: { person: Person; onSave: (notes: string) => void }) {
   const [draft, setDraft] = useState(person.profileNotes ?? '')
   return <section className="person-profile-editor">
-    <label><span>人物底稿 <small>仅填写你本人确认的背景、经历或长期观察；不会写入聊天事实。</small></span><textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows={6} maxLength={6000} placeholder="例如：与此人于 2024 年秋认识；她目前在准备考研。只填写你确认过的内容。" /></label>
+    <label><span>人物底稿与时间线注记 <small>仅填写你本人确认的背景、经历或特殊节点；不会伪装成聊天事实。聊天空档不能证明删好友、拉黑或重新添加的原因，确认过的节点请在这里注明日期。</small></span><textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows={6} maxLength={6000} placeholder="例如：2026 年 5 月曾删除好友，之后重新添加；2024 年秋认识。只填写你确认过的内容。" /></label>
     <div className="person-profile-editor-actions"><small>{draft.length}/6000</small><button type="button" className="secondary-button" onClick={() => onSave(draft)} disabled={draft.trim() === (person.profileNotes ?? '').trim()}><Save size={14} />保存并重写人物志</button></div>
   </section>
 }
@@ -110,11 +132,13 @@ export function PeopleView({ people, quests, selectedId, onSelect, onGoIntel, on
   }, [orderedPeople, query])
   const selected = visiblePeople.find((person) => person.id === selectedId) ?? visiblePeople[0]
   const selectedPortrait = selected ? portraitFor(selected) : ''
+  const portraitParagraphs = selectedPortrait.split(/\n{2,}/).map((paragraph) => paragraph.trim()).filter(Boolean)
   const portraitFailed = selected?.portraitStatus === 'failed'
   const showAllFacts = expandedFactsPersonId === selected?.id
   const showAllPreferences = expandedPreferencesPersonId === selected?.id
-  const allSelectedFacts = selected?.evidence?.filter((claim) => claim.kind === 'fact') ?? []
-  const allSelectedPreferences = selected?.evidence?.filter((claim) => claim.kind === 'preference') ?? []
+  const allSelectedFacts = [...selected?.evidence?.filter((claim) => claim.kind === 'fact') ?? []].sort(newestEvidenceFirst)
+  const allSelectedPreferences = [...selected?.evidence?.filter((claim) => claim.kind === 'preference') ?? []].sort(newestEvidenceFirst)
+  const allSelectedEvents = [...selected?.evidence?.filter((claim) => claim.kind === 'event') ?? []].sort(newestEvidenceFirst)
   const selectedFacts = showAllFacts ? allSelectedFacts : allSelectedFacts.slice(0, 12)
   const selectedPreferences = showAllPreferences ? allSelectedPreferences : allSelectedPreferences.slice(0, 8)
   const selectedAdvice = selected?.advice ?? []
@@ -303,10 +327,17 @@ export function PeopleView({ people, quests, selectedId, onSelect, onGoIntel, on
           </div>
           <div className="person-observed"><span>最早可核实互动</span><strong>{formatFirstObserved(selectedInteraction.firstAt ?? selected.firstObservedAt)}</strong></div>
           <section className="person-contact-overview"><div className="person-contact-overview-heading"><span>联系概览</span><small>仅统计已导入消息，不代表关系质量</small></div><div className="person-contact-overview-grid"><div><CalendarClock size={14} /><span>最近互动</span><strong>{formatChatTime(selectedInteraction.lastAt ?? selected.lastObservedAt)}</strong><small>{relativeInteractionLabel(selectedInteraction.lastAt ?? selected.lastObservedAt)}</small></div><div><MessagesSquare size={14} /><span>对话记录</span><strong>{selectedInteraction.totalMessages.toLocaleString('zh-CN')} 条</strong><small>{selectedInteraction.conversationCount || personConversations.length} 个会话</small></div><div><Users size={14} /><span>发言分布</span><strong>你 {selectedInteraction.selfMessages} · 对方 {selectedInteraction.otherMessages}</strong><small>{selectedInteraction.unknownMessages ? `${selectedInteraction.unknownMessages} 条方向未确认` : '发言方向已确认'}</small></div><div><ListTodo size={14} /><span>关联事项</span><strong>{linked.length} 项</strong><small>{linked.filter((quest) => quest.status !== 'done').length ? `${linked.filter((quest) => quest.status !== 'done').length} 项待处理` : '暂无待处理事项'}</small></div></div></section>
-          <div className={`person-portrait-note ${selectedPortrait ? '' : 'is-insufficient'}`}><span>人物刻画 {selected?.profileNotesUsed && selected.profileNotes?.trim() ? '· 已确认底稿参与' : ''}</span><p>{selectedPortrait || (portraitFailed ? '人物刻画生成失败，系统没有保存未经证据校验的内容。' : '当前没有通过证据校验的人物志。请补充更多授权来源，或在下方填写你确认的人物底稿。')}</p><small>{selectedPortrait ? (selected.profileNotesUsed ? '人物志综合了你确认的人物底稿；聊天事实仍单独列在下方，不会被底稿伪装成聊天结论。' : '人物志只综合多条可追溯聊天证据，并保留证据边界。') : (portraitFailed ? `${selected.portraitFailure || '模型未通过校验。'} 可手动重试。` : '没有可靠画像时不会用事实列表拼接成假想性格。')}</small>{portraitFailed && <button type="button" className="secondary-button" onClick={() => onRetryPortrait(selected.id)}>重试人物刻画</button>}</div>
+          <div className={`person-portrait-note ${selectedPortrait ? '' : 'is-insufficient'}`}>
+            <span>人物刻画 {selected?.profileNotesUsed && selected.profileNotes?.trim() ? '· 已确认底稿参与' : ''}</span>
+            {!!portraitParagraphs.length && <div className="person-portrait-prose">{portraitParagraphs.map((paragraph, index) => <p key={`${selected.id}-portrait-${index}`}>{paragraph}</p>)}</div>}
+            {!selectedPortrait && <p>{portraitFailed ? '人物刻画生成失败，系统没有保存未经证据校验的内容。' : '当前没有通过证据校验的人物志。请补充更多授权来源，或在下方填写你确认的人物底稿。'}</p>}
+            <small>{selectedPortrait ? (selected.profileNotesUsed ? '人物志综合了你确认的人物底稿；聊天事实仍单独列在下方，不会被底稿伪装成聊天结论。' : '人物志只使用通过核验的聊天证据；具体原话和发生时间保留在下方证据区。') : (portraitFailed ? `${selected.portraitFailure || '模型未通过校验。'} 可手动重试。` : '没有可靠画像时不会用事实列表拼接成假想性格。')}</small>
+            {portraitFailed && <button type="button" className="secondary-button" onClick={() => onRetryPortrait(selected.id)}>重试人物刻画</button>}
+          </div>
           <PersonProfileEditor key={selected.id} person={selected} onSave={(notes) => onUpdateProfileNotes(selected.id, notes)} />
-          {!!selectedFacts.length && <section className="person-evidence-section"><span className="subsection-label">已核验事实</span>{selectedFacts.map((claim, index) => <div key={`${selected.id}-fact-${index}`}><p>{claim.text}</p><small>原话：“{claim.quote}” · {claim.sourceIds.join('、')}</small></div>)}{allSelectedFacts.length > 12 && <button type="button" className="person-evidence-toggle" onClick={() => setExpandedFactsPersonId((current) => current === selected.id ? undefined : selected.id)}>{showAllFacts ? <ChevronUp size={14} /> : <ChevronDown size={14} />}{showAllFacts ? '收起，仅显示前 12 条' : `展开查看全部 ${allSelectedFacts.length} 条`}</button>}</section>}
-          {!!selectedPreferences.length && <section className="person-evidence-section person-evidence-section--preference"><span className="subsection-label">偏好线索</span>{selectedPreferences.map((claim, index) => <div key={`${selected.id}-preference-${index}`}><p>{claim.text}</p><small>原话：“{claim.quote}” · {claim.sourceIds.join('、')}</small></div>)}{allSelectedPreferences.length > 8 && <button type="button" className="person-evidence-toggle" onClick={() => setExpandedPreferencesPersonId((current) => current === selected.id ? undefined : selected.id)}>{showAllPreferences ? <ChevronUp size={14} /> : <ChevronDown size={14} />}{showAllPreferences ? '收起，仅显示前 8 条' : `展开查看全部 ${allSelectedPreferences.length} 条`}</button>}</section>}
+          {!!allSelectedEvents.length && <section className="person-evidence-section person-evidence-section--event"><span className="subsection-label">关键互动事件 · 按时间记录</span>{allSelectedEvents.map((claim, index) => <div key={`${selected.id}-event-${index}`}><p>{claim.text}</p><small><em className="person-evidence-age is-event">{claim.stability === 'single' ? '单次事件' : '重复或延续'}</em> {evidenceObservedRange(claim)} · 原话：“{claim.quote}” · {claim.sourceIds.join('、')}</small></div>)}</section>}
+          {!!selectedFacts.length && <section className="person-evidence-section"><span className="subsection-label">已核验事实 · 新近优先</span>{selectedFacts.map((claim, index) => { const scope = personEvidenceTemporalScope(claim, new Date().toISOString()); return <div key={`${selected.id}-fact-${index}`}><p>{claim.text}</p><small><em className={`person-evidence-age is-${scope}`}>{scope === 'recent' ? '近 30 天' : scope === 'historical' ? '过去记录' : '时间未确认'}</em> {evidenceObservedRange(claim)} · 原话：“{claim.quote}” · {claim.sourceIds.join('、')}</small></div> })}{allSelectedFacts.length > 12 && <button type="button" className="person-evidence-toggle" onClick={() => setExpandedFactsPersonId((current) => current === selected.id ? undefined : selected.id)}>{showAllFacts ? <ChevronUp size={14} /> : <ChevronDown size={14} />}{showAllFacts ? '收起，仅显示最新 12 条' : `展开查看全部 ${allSelectedFacts.length} 条`}</button>}</section>}
+          {!!selectedPreferences.length && <section className="person-evidence-section person-evidence-section--preference"><span className="subsection-label">偏好线索 · 新近优先</span>{selectedPreferences.map((claim, index) => { const scope = personEvidenceTemporalScope(claim, new Date().toISOString()); return <div key={`${selected.id}-preference-${index}`}><p>{claim.text}</p><small><em className={`person-evidence-age is-${scope}`}>{scope === 'recent' ? '近 30 天' : scope === 'historical' ? '过去记录' : '时间未确认'}</em> {evidenceObservedRange(claim)} · 原话：“{claim.quote}” · {claim.sourceIds.join('、')}</small></div> })}{allSelectedPreferences.length > 8 && <button type="button" className="person-evidence-toggle" onClick={() => setExpandedPreferencesPersonId((current) => current === selected.id ? undefined : selected.id)}>{showAllPreferences ? <ChevronUp size={14} /> : <ChevronDown size={14} />}{showAllPreferences ? '收起，仅显示最新 8 条' : `展开查看全部 ${allSelectedPreferences.length} 条`}</button>}</section>}
           {!!selectedAdvice.length && <div className="person-interaction-advice"><span>沟通与相处建议</span>{selectedAdvice.map((item, index) => <p key={`${selected.id}-advice-${index}`}>{item}</p>)}</div>}
           <div className="person-detail-actions"><button type="button" className="secondary-button" onClick={() => personConversations[0] && openChat(personConversations[0].id, true)} disabled={!personConversations.length}><MessageCircle size={15} />回看最近互动{personConversations.length > 1 ? ` · ${personConversations.length} 个会话` : ''}</button><small>{personConversations.length ? '从最近一条消息开始查看；需要完整回顾时可在弹窗中切换会话。' : '当前人物卡尚无可打开的对话目录。'}</small></div>
           <div className="source-id-list">

@@ -7,6 +7,18 @@ import { candidateRejectionReason as rejectCandidate, hasAbsoluteCalendarDate, h
 import { mergeAiTaskCandidates } from './aiCandidateDedup'
 import { personEvidenceIdentityKey } from './personEvidenceIdentity'
 import { isHumanCenteredAdvice } from './interpersonalSafety'
+import { counterpartIdentityEvidence } from './personCounterpart'
+import {
+  historicalPortraitTextIsQualified,
+  PERSON_PORTRAIT_PIPELINE_VERSION,
+  personEvidenceIsPortraitEligible,
+  personProfileEvidenceScore,
+  personEvidenceTemporalScope,
+  portraitBlockTemporalMetadata,
+  selectProfileEvidence,
+  summarizePersonEvidenceTime,
+  type PersonTemporalSummary,
+} from './personTemporal'
 
 export interface AiAttachment {
   name: string
@@ -54,6 +66,7 @@ export interface AiProviderRuntime {
   lastErrorAt: string | null
   lastErrorStatus: number | null
   lastErrorCode: string | null
+  authenticationFailedAt?: string | null
 }
 
 export interface AiProviderChannel {
@@ -70,6 +83,7 @@ export interface AiProviderChannel {
   source?: AiStatus['source']
   models: string[]
   maxConcurrency: number
+  sharedCredentialCount?: number
   configurationError?: string
   runtime?: AiProviderRuntime
 }
@@ -94,6 +108,7 @@ export interface AiProviderScheduler {
     failedRequests: number
   }>
   coolingDownChannelCount: number
+  authenticationFailedChannelCount?: number
 }
 
 export interface AiProviderInput {
@@ -773,8 +788,8 @@ export async function consolidatePersonLegacy(
       evidence: verifiedEvidence,
       // Kept for older local proxies; the server treats these as compatibility
       // fields and the client never trusts them without a matching claim.
-      facts: [...new Set(person.facts.map((fact) => fact.trim()).filter(Boolean))].slice(0, 48),
-      preferences: [...new Set((person.preferences ?? []).map((item) => item.trim()).filter(Boolean))].slice(0, 18),
+       facts: [],
+       preferences: [],
       advice: [],
       portrait: null,
       profileNotes: profileNotes || null,
@@ -808,8 +823,8 @@ export async function consolidatePersonLegacy(
     }
     return result
   }
-  const factsEvidence = selected(payload.facts, 'fact').slice(0, 12)
-  const preferenceEvidence = selected(payload.preferences, 'preference').slice(0, 8)
+  const factsEvidence = selected(payload.facts, 'fact')
+  const preferenceEvidence = selected(payload.preferences, 'preference')
   const evidence = [...factsEvidence, ...preferenceEvidence]
   if (!evidence.length && !profileNotes) return null
   const independentSourceCount = new Set(evidence.flatMap((claim) => claim.sourceIds)).size
@@ -918,7 +933,12 @@ function unsupportedHardTokens(text: string, claims: PersonEvidence[], profileNo
   return hardTokens.filter((token) => token && !allowed.includes(normalizedEvidenceText(token)))
 }
 
-function normalizePortraitCoverage(claims: PersonEvidence[], blocks: PersonPortraitBlock[], note?: string): PersonPortraitCoverage {
+function normalizePortraitCoverage(
+  claims: PersonEvidence[],
+  blocks: PersonPortraitBlock[],
+  note: string | undefined,
+  temporalSummary: PersonTemporalSummary,
+): PersonPortraitCoverage {
   const selected = [...new Map(blocks.flatMap((block) => block.claimIds.map((id) => [id, claims.find((claim) => claim.id === id)] as const)).filter((entry): entry is [string, PersonEvidence] => Boolean(entry[1]))).values()]
   const sourceIds = [...new Set(selected.flatMap((claim) => claim.sourceIds))]
   const dates = selected.flatMap((claim) => [claim.firstObservedAt, claim.lastObservedAt]).filter((value): value is string => Boolean(value))
@@ -929,11 +949,26 @@ function normalizePortraitCoverage(claims: PersonEvidence[], blocks: PersonPortr
     categories: [...new Set(selected.map((claim) => claim.category).filter((category): category is PersonEvidenceCategory => Boolean(category)))],
     ...(orderedDates[0] ? { firstObservedAt: orderedDates[0] } : {}),
     ...(orderedDates.at(-1) ? { lastObservedAt: orderedDates.at(-1) } : {}),
+    analysisAsOf: temporalSummary.analysisAsOf,
+    recentWindowDays: temporalSummary.recentWindowDays,
+    recentCutoffAt: temporalSummary.recentCutoffAt,
+    recentClaimCount: temporalSummary.recentClaimCount,
+    historicalClaimCount: temporalSummary.historicalClaimCount,
+    undatedClaimCount: temporalSummary.undatedClaimCount,
+    recentSourceCount: temporalSummary.recentSourceCount,
+    historicalSourceCount: temporalSummary.historicalSourceCount,
+    ...(temporalSummary.latestEvidenceAgeDays !== undefined ? { latestEvidenceAgeDays: temporalSummary.latestEvidenceAgeDays } : {}),
+    recentEvidenceStatus: temporalSummary.recentEvidenceStatus,
     ...(note ? { note } : {}),
   }
 }
 
-function parsePersonMergeResponse(payload: PersonMergeResponse, verifiedEvidence: PersonEvidence[], profileNotes: string) {
+function parsePersonMergeResponse(
+  payload: PersonMergeResponse,
+  verifiedEvidence: PersonEvidence[],
+  profileNotes: string,
+  temporalSummary: PersonTemporalSummary,
+) {
   const registry = new Map<string, PersonEvidence>(verifiedEvidence.map((claim) => [claimIdForEvidence(claim), { ...claim, id: claimIdForEvidence(claim) }]))
   const resolveClaimId = (value: unknown, kind: PersonEvidence['kind']) => {
     if (typeof value === 'string' && registry.get(value)?.kind === kind) return value
@@ -995,22 +1030,37 @@ function parsePersonMergeResponse(payload: PersonMergeResponse, verifiedEvidence
       issues.push(`portrait_block_has_unsupported_hard_token:${hardTokens.slice(0, 3).join(',')}`)
       continue
     }
-    const reason = ['background', 'preference', 'habit', 'interaction', 'change', 'other'].includes(String(value.reason))
+    const reason = ['background', 'preference', 'habit', 'interaction', 'change', 'trajectory', 'other'].includes(String(value.reason))
       ? String(value.reason) as PersonPortraitBlock['reason']
       : 'other'
+    const temporal = portraitBlockTemporalMetadata(claims, temporalSummary.analysisAsOf, temporalSummary.recentWindowDays)
+    if (temporal.temporalScope === 'historical' && !historicalPortraitTextIsQualified(text)) {
+      issues.push('historical_portrait_block_requires_past_tense')
+      continue
+    }
+    if (temporal.temporalScope === 'change' && reason !== 'change' && reason !== 'trajectory') {
+      issues.push('cross_period_portrait_block_requires_change_or_trajectory_reason')
+      continue
+    }
     blocks.push({
       id: `portrait-${hash(`${text}|${claimIds.join(',')}`)}`,
       text,
       claimIds,
       sourceIds: [...new Set(claims.flatMap((claim) => claim.sourceIds))].slice(0, 12),
       reason,
+      ...temporal,
     })
   }
   const chatSourceIds = new Set(blocks.flatMap((block) => block.sourceIds))
   const manualUsed = blocks.some((block) => block.claimIds.includes(PORTRAIT_MANUAL_CLAIM_ID))
   const eligibleEvidence = [...registry.values()].filter((claim) => claim.portraitEligible !== false)
   const enoughChatEvidence = chatSourceIds.size >= 2
+  const recentEligible = [...registry.values()].filter((claim) => personEvidenceIsPortraitEligible(claim)
+    && personEvidenceTemporalScope(claim, temporalSummary.analysisAsOf, temporalSummary.recentWindowDays) === 'recent')
+  const recentSourceCount = new Set(recentEligible.flatMap((claim) => claim.sourceIds)).size
+  const hasCurrentBlock = blocks.some((block) => block.temporalScope === 'recent' || block.temporalScope === 'change')
   if (blocks.length && !manualUsed && !enoughChatEvidence) issues.push('portrait_requires_two_independent_chat_sources')
+  if (recentEligible.length >= 2 && recentSourceCount >= 2 && !hasCurrentBlock) issues.push('portrait_missing_recent_evidence_block')
   if (!blocks.length && (eligibleEvidence.filter((claim) => claim.category !== 'temporary' && claim.category !== 'filler').length >= 3 || profileNotes.length >= 80)) {
     issues.push('portrait_expected_for_available_signals')
   }
@@ -1040,21 +1090,22 @@ function parsePersonMergeResponse(payload: PersonMergeResponse, verifiedEvidence
     portrait,
     portraitBlocks: acceptedBlocks,
     portraitSourceIds: [...new Set(acceptedBlocks.flatMap((block) => block.sourceIds))].slice(0, 12),
-    portraitCoverage: normalizePortraitCoverage([...registry.values()], acceptedBlocks, coverageNote),
+    portraitCoverage: normalizePortraitCoverage([...registry.values()], acceptedBlocks, coverageNote, temporalSummary),
     coverageNote,
     profileNotesUsed: Boolean(portrait && profileNotesUsed),
-    portraitSchemaVersion: 1,
+    portraitSchemaVersion: PERSON_PORTRAIT_PIPELINE_VERSION,
     evidence,
   }
 }
 
 export async function consolidatePerson(
-  person: Pick<Person, 'name' | 'facts' | 'preferences' | 'advice' | 'portrait' | 'evidence' | 'profileNotes'>,
+  person: Pick<Person, 'name' | 'facts' | 'preferences' | 'advice' | 'portrait' | 'evidence' | 'profileNotes' | 'lastObservedAt'>,
   settings?: Pick<AiSettings, 'promptInstructions'>,
   signal?: AbortSignal,
 ): Promise<PersonConsolidation | null> {
   const profileNotes = person.profileNotes?.trim().slice(0, 6_000) ?? ''
-  const verifiedEvidence = selectProfileEvidence((person.evidence ?? [])
+  const analysisAsOf = new Date().toISOString()
+  const allVerifiedEvidence = (person.evidence ?? [])
     .filter((claim) => claim.text.trim() && claim.quote.trim() && claim.sourceIds.length)
     .map((claim) => enrichPersonEvidence({
       ...claim,
@@ -1062,14 +1113,19 @@ export async function consolidatePerson(
       text: claim.text.trim().slice(0, 360),
       quote: claim.quote.trim().slice(0, 100),
       sourceIds: [...new Set(claim.sourceIds.map(String).filter(Boolean))].slice(0, 12),
-    })), 96)
+    }))
+  const temporalSummary = summarizePersonEvidenceTime(allVerifiedEvidence, analysisAsOf, person.lastObservedAt)
+  const verifiedEvidence = selectProfileEvidence(allVerifiedEvidence, 96, analysisAsOf)
   if (!verifiedEvidence.length && !profileNotes) return null
   const basePayload = {
     person: {
       name: person.name,
       evidence: verifiedEvidence,
-      facts: [...new Set(person.facts.map((fact) => fact.trim()).filter(Boolean))].slice(0, 48),
-      preferences: [...new Set((person.preferences ?? []).map((item) => item.trim()).filter(Boolean))].slice(0, 18),
+      // The verified registry is authoritative. Sending the already-rendered
+      // arrays again only wastes request tokens and used to make the merge
+      // pass appear to impose a hidden 48/18 item limit.
+      facts: [],
+      preferences: [],
       advice: [],
       portrait: null,
       profileNotes: profileNotes || null,
@@ -1079,25 +1135,29 @@ export async function consolidatePerson(
         peopleMerge: settings?.promptInstructions?.peopleMerge ?? '',
       },
     },
+    analysisAsOf,
+    latestInteractionAt: person.lastObservedAt ?? null,
   }
   const requestMerge = (repair?: { issues: string[]; previousBlocks: PersonPortraitBlock[] }) => requestWithRetry<PersonMergeResponse>('/api/ai/people/merge', {
     ...basePayload,
     ...(repair ? { repair } : {}),
   }, undefined, signal)
   const first = await requestMerge()
-  let parsed = parsePersonMergeResponse(first, verifiedEvidence, profileNotes)
+  let parsed = parsePersonMergeResponse(first, verifiedEvidence, profileNotes, temporalSummary)
   if (parsed.issues.length) {
     const repaired = await requestMerge({
       issues: parsed.issues,
       previousBlocks: parsed.portraitBlocks,
     })
-    parsed = parsePersonMergeResponse(repaired, verifiedEvidence, profileNotes)
+    parsed = parsePersonMergeResponse(repaired, verifiedEvidence, profileNotes, temporalSummary)
   }
   if (parsed.issues.length) return null
   if (!parsed.facts.length && !parsed.preferences.length && !parsed.portrait) return null
   return {
-    facts: parsed.facts,
-    preferences: parsed.preferences,
+    // Facts and preferences are the complete locally verified registry, not
+    // the small subset the portrait model chose to cite in its prose.
+    facts: notesFromEvidence(allVerifiedEvidence, 'fact'),
+    preferences: notesFromEvidence(allVerifiedEvidence, 'preference'),
     advice: parsed.advice,
     portrait: parsed.portrait,
     portraitBlocks: parsed.portraitBlocks,
@@ -1105,7 +1165,7 @@ export async function consolidatePerson(
     portraitSchemaVersion: parsed.portraitSchemaVersion,
     portraitSourceIds: parsed.portrait ? parsed.portraitSourceIds : [],
     profileNotesUsed: parsed.profileNotesUsed,
-    evidence: parsed.evidence,
+    evidence: allVerifiedEvidence,
     model: String(first.model ?? 'unknown'),
   }
 }
@@ -1188,7 +1248,7 @@ function inferPersonEvidenceCategory(claim: Pick<PersonEvidence, 'kind' | 'text'
   if (/(?:喜欢|不喜欢|爱吃|讨厌|感兴趣|喜欢玩|爱玩|想吃|想去|喜欢听|喜欢看)/.test(compact)) return 'preference'
   if (/(?:经常|通常|习惯|每天|每周|一般会|平时)/.test(compact)) return 'habit'
   if (/(?:学校|学生|工作|家人|家乡|居住|来自|专业|年级|身份)/.test(compact)) return 'identity'
-  if (/(?:会|一起|见面|吃饭|打台球|请你|邀请|帮忙|联系)/.test(compact)) return 'interaction'
+  if (/(?:会|一起|见面|吃饭|打台球|请你|邀请|帮忙|联系|送你|给你买|买给你|关心|照顾|和好|加回|删好友|删除好友|拉黑|解除拉黑|重新联系|道歉|承诺)/.test(compact)) return 'interaction'
   if (/(?:会做|擅长|学过|会用|考试|课程|技能)/.test(compact)) return 'skill'
   return claim.kind === 'preference' ? 'preference' : 'background'
 }
@@ -1206,7 +1266,7 @@ function personEvidenceStability(claim: Pick<PersonEvidence, 'sourceIds' | 'firs
 function enrichPersonEvidence(claim: PersonEvidence): PersonEvidence {
   const category = claim.category && personEvidenceCategoryValues.includes(claim.category) ? claim.category : inferPersonEvidenceCategory(claim)
   const stability = personEvidenceStability(claim)
-  const score = profileSignalScore({ ...claim, category, stability })
+  const score = personProfileEvidenceScore({ ...claim, category, stability })
   const portraitEligible = claim.portraitEligible !== false && category !== 'temporary' && category !== 'filler'
   return {
     ...claim,
@@ -1238,6 +1298,7 @@ function verifyPersonClaim(
   allowedIds: Set<string>,
   recordsById: Map<string, IntelItem>,
   kind: PersonEvidence['kind'],
+  expectedCounterpartName?: string,
 ): PersonEvidence | null {
   const claim = value as PersonEvidenceClaim
   const text = typeof claim?.text === 'string' ? claim.text.trim().slice(0, 360) : ''
@@ -1247,9 +1308,14 @@ function verifyPersonClaim(
     ? [...new Set(claim.sourceIds.map(String).filter((id) => allowedIds.has(id)))].slice(0, 12)
     : []
   if (!text || normalizedQuote.length < 2 || !sourceIds.length) return null
+  const counterpartIds = new Set(counterpartIdentityEvidence(
+    [...recordsById.values()],
+    name,
+    expectedCounterpartName,
+  ).records.map((record) => record.id))
   const verifiedSourceIds = sourceIds.filter((id) => {
     const record = recordsById.get(id)
-    if (!record || record.speakerRole !== 'other' || record.speaker?.trim() !== name) return false
+    if (!record || !counterpartIds.has(id)) return false
     return normalizedEvidenceText(record.content || record.summary).includes(normalizedQuote)
   })
   if (!verifiedSourceIds.length) return null
@@ -1305,11 +1371,11 @@ function mergePersonEvidence(current: PersonEvidence[] = [], incoming: PersonEvi
       lastObservedAt: times.at(-1),
     }))
   }
-  return selectProfileEvidence([...merged.values()], 600)
+  return [...merged.values()]
 }
 
-function notesFromEvidence(evidence: PersonEvidence[], kind: PersonEvidence['kind'], limit: number) {
-  return [...new Set(evidence.filter((claim) => claim.kind === kind).map((claim) => claim.text.trim()).filter(Boolean))].slice(0, limit)
+function notesFromEvidence(evidence: PersonEvidence[], kind: PersonEvidence['kind']) {
+  return [...new Set(evidence.filter((claim) => claim.kind === kind).map((claim) => claim.text.trim()).filter(Boolean))]
 }
 
 /*
@@ -1325,62 +1391,6 @@ function profileSignalScoreLegacy(claim: PersonEvidence) {
 
 */
 
-function profileSignalScore(claim: PersonEvidence) {
-  const compact = normalizedEvidenceText(`${claim.text} ${claim.quote}`)
-  let score = claim.kind === 'preference' ? 5 : 2
-  if (claim.stability === 'persistent') score += 6
-  else if (claim.stability === 'repeated' || claim.evidenceStrength === 'repeated') score += 4
-  if (/(?:\u559c\u6b22|\u4e0d\u559c\u6b22|\u60f3\u8981|\u60f3\u53bb|\u7231\u5403|\u611f\u5174\u8da3|\u4e60\u60ef|\u5e38\u53bb|\u5e0c\u671b|\u8ba8\u538c|\u64c5\u957f|\u5728\u610f|\u8ba1\u5212|\u51c6\u5907)/.test(compact)) score += 3
-  if (claim.quote.trim().length >= 8) score += 1
-  if (/^(?:\u597d|\u54c8\u54c8|\u53ef\u4ee5|\u77e5\u9053\u4e86|\u6536\u5230|\u55ef|\u884c)[!！?？。,.，]*$/.test(claim.quote.trim())) score -= 6
-  if (claim.category === 'temporary' || claim.category === 'filler') score -= 6
-  return score
-}
-
-/**
- * Keep long conversations representative without resending raw chat. The
- * profile merge sees verified claims from the beginning, end, and evenly
- * distributed middle of the timeline, instead of only whichever segments
- * happened to finish first.
- */
-function selectProfileEvidence(evidence: PersonEvidence[], limit: number) {
-  const ordered = [...evidence].sort((left, right) => {
-    const leftTime = new Date(left.lastObservedAt ?? left.firstObservedAt ?? '').getTime()
-    const rightTime = new Date(right.lastObservedAt ?? right.firstObservedAt ?? '').getTime()
-    if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) return leftTime - rightTime
-    if (Number.isFinite(leftTime)) return -1
-    if (Number.isFinite(rightTime)) return 1
-    return claimKey(left).localeCompare(claimKey(right))
-  })
-  if (ordered.length <= limit) return ordered
-  const selected = new Set<number>()
-  const edgeCount = Math.min(18, Math.floor(limit / 4))
-  for (let index = 0; index < edgeCount; index += 1) selected.add(index)
-  for (let index = Math.max(edgeCount, ordered.length - edgeCount); index < ordered.length; index += 1) selected.add(index)
-  const repeated = ordered.map((claim, index) => ({ claim, index })).filter(({ claim }) => claim.evidenceStrength === 'repeated')
-  for (const { index } of repeated) {
-    if (selected.size >= Math.floor(limit * 0.45)) break
-    selected.add(index)
-  }
-  // Long conversations can contain hundreds of timestamp-accurate but
-  // profile-poor confirmations. Reserve space for direct preferences and
-  // repeated, substantive statements before filling the timeline evenly.
-  const highSignal = ordered
-    .map((claim, index) => ({ index, score: profileSignalScore(claim) }))
-    .filter((entry) => entry.score >= 5)
-    .sort((left, right) => right.score - left.score || left.index - right.index)
-  for (const { index } of highSignal) {
-    if (selected.size >= Math.floor(limit * 0.7)) break
-    selected.add(index)
-  }
-  const remainingSlots = Math.max(0, limit - selected.size)
-  const middle = ordered.map((_, index) => index).filter((index) => !selected.has(index))
-  for (let slot = 0; slot < remainingSlots && middle.length; slot += 1) {
-    selected.add(middle[Math.min(middle.length - 1, Math.floor((slot + 0.5) * middle.length / remainingSlots))])
-  }
-  return [...selected].sort((left, right) => left - right).map((index) => ordered[index])
-}
-
 function normalizePerson(
   value: Partial<Person> & { name?: string; facts?: unknown; preferences?: unknown; advice?: unknown; sourceIds?: unknown; platforms?: unknown; portrait?: unknown },
   model: string,
@@ -1389,28 +1399,31 @@ function normalizePerson(
   allowedPlatforms: Set<IntelItem['source']>,
   recordsById: Map<string, IntelItem>,
   requiredCoreIds?: Set<string>,
+  expectedCounterpartName?: string,
 ): Person | null {
   const name = String(value.name ?? '').trim().slice(0, 120)
   if (!name) return null
   const keepCoreClaim = (claim: PersonEvidence | null) => claim && (!requiredCoreIds || claim.sourceIds.some((id) => requiredCoreIds.has(id))) ? claim : null
   const factClaims = Array.isArray(value.facts)
-    ? value.facts.map((claim) => keepCoreClaim(verifyPersonClaim(claim, name, allowedIds, recordsById, 'fact'))).filter((claim): claim is PersonEvidence => Boolean(claim))
+    ? value.facts.map((claim) => keepCoreClaim(verifyPersonClaim(claim, name, allowedIds, recordsById, 'fact', expectedCounterpartName))).filter((claim): claim is PersonEvidence => Boolean(claim))
     : []
   const preferenceClaims = Array.isArray(value.preferences)
-    ? value.preferences.map((claim) => keepCoreClaim(verifyPersonClaim(claim, name, allowedIds, recordsById, 'preference'))).filter((claim): claim is PersonEvidence => Boolean(claim))
+    ? value.preferences.map((claim) => keepCoreClaim(verifyPersonClaim(claim, name, allowedIds, recordsById, 'preference', expectedCounterpartName))).filter((claim): claim is PersonEvidence => Boolean(claim))
     : []
-  const evidenceClaims = mergePersonEvidence(factClaims, preferenceClaims)
-  const facts = notesFromEvidence(evidenceClaims, 'fact', 12)
-  const preferences = notesFromEvidence(evidenceClaims, 'preference', 8)
-  const sourceIds = [...new Set(evidenceClaims.flatMap((claim) => claim.sourceIds))].slice(0, 60)
-  if (!facts.length && !preferences.length) return null
+  const eventClaims = Array.isArray((value as { events?: unknown }).events)
+    ? (value as { events: unknown[] }).events.map((claim) => keepCoreClaim(verifyPersonClaim(claim, name, allowedIds, recordsById, 'event', expectedCounterpartName))).filter((claim): claim is PersonEvidence => Boolean(claim))
+    : []
+  const evidenceClaims = mergePersonEvidence([...factClaims, ...eventClaims], preferenceClaims)
+  const facts = notesFromEvidence(evidenceClaims, 'fact')
+  const preferences = notesFromEvidence(evidenceClaims, 'preference')
+  const sourceIds = [...new Set(evidenceClaims.flatMap((claim) => claim.sourceIds))]
+  if (!facts.length && !preferences.length && !eventClaims.length) return null
   const evidence = sourceIds.map((id) => recordsById.get(id)).filter((item): item is IntelItem => Boolean(item))
-  const verifiedCounterparts = new Set([...recordsById.values()]
-    .filter((item) => item.speakerRole === 'other' && item.speaker?.trim())
-    .map((item) => item.speaker!.trim()))
   // A model may summarize a private conversation, but it must never invent a
   // participant or turn the user's own name into the counterpart.
-  if (!verifiedCounterparts.has(name) || !evidence.some((item) => item.speakerRole === 'other' && item.speaker?.trim() === name)) return null
+  const identity = counterpartIdentityEvidence([...recordsById.values()], name, expectedCounterpartName)
+  const evidenceIdentity = counterpartIdentityEvidence(evidence, name, expectedCounterpartName)
+  if (!identity.valid || !evidenceIdentity.valid) return null
   const datedEvidence = evidence
     .map((item) => ({ capturedAt: item.capturedAt, time: new Date(item.capturedAt).getTime() }))
     .filter((item) => Number.isFinite(item.time))
@@ -1418,7 +1431,7 @@ function normalizePerson(
   const firstObservedAt = datedEvidence[0]?.capturedAt ?? evidence.map((item) => item.capturedAt).sort()[0]
   const lastObservedAt = datedEvidence[datedEvidence.length - 1]?.capturedAt ?? evidence.map((item) => item.capturedAt).sort().slice(-1)[0]
   const conversationIds = [...new Set(evidence.map((item) => item.conversationId).filter((id): id is string => Boolean(id)))].slice(0, 30)
-  const avatarUrl = evidence.find((item) => item.speakerRole === 'other' && item.speaker?.trim() === name && item.avatarUrl)?.avatarUrl
+  const avatarUrl = evidenceIdentity.records.find((item) => item.avatarUrl)?.avatarUrl
   const id = `person-${hash(`${name}|${[...sourceIds].sort().join(',')}`)}-${index}`
   const platforms = [...new Set(evidence.map((item) => item.source).filter((platform): platform is IntelItem['source'] => allowedPlatforms.has(platform)))].slice(0, 8)
   // Portrait and advice are deliberately not accepted in this segment pass.
@@ -1436,6 +1449,7 @@ export async function analyzeIntelLegacy(
   const candidates: AiTaskCandidate[] = []
   const analyzedIds: string[] = []
   const plan = buildConversationAnalysisPlan(items)
+  const analysisClock = modelAnalysisClock()
   const log = (event: string, level: AiDebugEntry['level'], details: Omit<AiDebugEntry, 'at' | 'event' | 'level'> = {}) => {
     onLog?.({ at: new Date().toISOString(), event, level, ...details })
   }
@@ -1479,6 +1493,9 @@ export async function analyzeIntelLegacy(
           id: conversation.id,
           name: conversation.name,
           kind: conversation.kind,
+          recordFormat: 'compact-v2',
+          ...analysisClock,
+          counterpartName: conversation.kind === 'direct' ? modelCounterpartName(conversation.records, conversation.name) ?? null : null,
           totalRecords: conversation.totalRecords,
           recordCount: conversation.records.length,
           segmentIndex: conversation.segmentIndex,
@@ -1488,14 +1505,7 @@ export async function analyzeIntelLegacy(
           coreRecordIndexes,
           historical: conversation.historical,
         },
-        records: conversation.records.map((item) => ({
-          id: item.id,
-          formattedTime: item.capturedAt || null,
-          type: item.messageType ?? null,
-          content: item.content || item.summary,
-          senderDisplayName: item.speaker ?? null,
-          speakerRole: item.speakerRole ?? 'unknown',
-        })),
+        records: conversation.records.map(modelRecord),
         attachments: attachmentsSent ? [] : attachments,
         settings: {
           mode: settings.mode,
@@ -1618,6 +1628,7 @@ export async function analyzeIntel(
   const candidates: AiTaskCandidate[] = []
   const people: Person[] = []
   const plan = buildConversationAnalysisPlan(items)
+  const analysisClock = modelAnalysisClock()
   const candidateBatches = new Map<number, AiTaskCandidate[]>()
   const peopleBatches = new Map<number, Person[]>()
   const modelsBySegment = new Map<number, string>()
@@ -1712,6 +1723,10 @@ export async function analyzeIntel(
     activeWorkers += 1
     const acceptedCandidates: AiTaskCandidate[] = []
     const sourceById = new Map(segment.records.map((item) => [item.id, item]))
+    const allConversationRecords = conversationRecords.get(segment.id) ?? segment.records
+    const expectedCounterpartName = segment.kind === 'direct'
+      ? modelCounterpartName(allConversationRecords, segment.name)
+      : undefined
     const coreIds = new Set(segment.coreRecordIds)
     const coreRecordIndexes = segment.records
       .map((item, recordIndex) => coreIds.has(item.id) ? String(recordIndex + 1) : null)
@@ -1755,6 +1770,9 @@ export async function analyzeIntel(
           id: segment.id,
           name: segment.name,
           kind: segment.kind,
+          recordFormat: 'compact-v2',
+          ...analysisClock,
+          counterpartName: expectedCounterpartName ?? null,
           totalRecords: segment.totalRecords,
           recordCount: segment.recordCount,
           segmentIndex: segment.segmentIndex,
@@ -1771,14 +1789,7 @@ export async function analyzeIntel(
           // incorrectly marking a private conversation as fully processed.
           people: false,
         },
-        records: segment.records.map((item) => ({
-          id: item.id,
-          formattedTime: item.capturedAt || null,
-          type: item.messageType ?? null,
-          content: item.content || item.summary,
-          senderDisplayName: item.speaker ?? null,
-          speakerRole: item.speakerRole ?? 'unknown',
-        })),
+        records: segment.records.map(modelRecord),
         // A fixed owner avoids every concurrent worker uploading the same files.
         attachments: index === attachmentOwnerIndex ? attachments : [],
         settings: {
@@ -1870,16 +1881,15 @@ export async function analyzeIntel(
         const included = peopleIncludedSegments.get(segment.id) ?? new Set<number>()
         included.add(segment.segmentIndex)
         peopleIncludedSegments.set(segment.id, included)
-        const allConversationRecords = conversationRecords.get(segment.id) ?? segment.records
         const allowedIds = new Set(segment.records.map((item) => item.id))
         const allowedPlatforms = new Set(segment.records.map((item) => item.source))
         const modelPeople = Array.isArray(payload.people) ? payload.people : []
         modelPeople.forEach((value, personIndex) => {
-          const person = normalizePerson(value as Partial<Person>, payload.model, index * 1_000 + personIndex, allowedIds, allowedPlatforms, sourceById, coreIds)
+          const person = normalizePerson(value as Partial<Person>, payload.model, index * 1_000 + personIndex, allowedIds, allowedPlatforms, sourceById, coreIds, expectedCounterpartName)
           // A preceding overlap is context only. A new card claim must anchor
           // itself in this segment's new timeline range.
           if (!person || !person.sourceIds.some((id) => coreIds.has(id))) return
-          const fullCounterpartRecords = counterpartRecords(allConversationRecords, person.name)
+          const fullCounterpartRecords = counterpartRecords(allConversationRecords, person.name, expectedCounterpartName)
           const chronologicalCounterpartRecords = [...fullCounterpartRecords].sort((left, right) => {
             const leftTime = new Date(left.capturedAt).getTime()
             const rightTime = new Date(right.capturedAt).getTime()
@@ -1895,7 +1905,7 @@ export async function analyzeIntel(
               ...person.sourceIds,
               chronologicalCounterpartRecords[0]?.id,
               chronologicalCounterpartRecords.at(-1)?.id,
-            ].filter((id): id is string => Boolean(id)))].slice(0, 60),
+             ].filter((id): id is string => Boolean(id)))],
             conversationIds: [...new Set([
               ...(person.conversationIds ?? []),
               ...fullCounterpartRecords.map((item) => item.conversationId).filter((id): id is string => Boolean(id)),
@@ -2142,6 +2152,7 @@ export async function analyzePeopleLegacy(
   const people: Person[] = []
   const seen = new Set<string>()
   const failedBatches: number[] = []
+  const analysisClock = modelAnalysisClock()
   let model = 'unknown'
   const conversations = new Map<string, IntelItem[]>()
   items.forEach((item) => {
@@ -2166,18 +2177,20 @@ export async function analyzePeopleLegacy(
     }))
   for (const [offset, job] of jobs.entries()) {
     const batch = job.records
+    const expectedCounterpartName = modelCounterpartName(batch, job.name)
     const additions: Person[] = []
     try {
       const payload = await requestWithRetry<{ model: string; people: unknown[]; receivedRecordCount?: number }>('/api/ai/people', {
-        conversation: { id: job.id, name: job.name, kind: 'direct', totalRecords: batch.length },
-        records: batch.map((item) => ({
-          id: item.id,
-          formattedTime: item.capturedAt || null,
-          type: item.messageType ?? null,
-          content: item.content || item.summary,
-          senderDisplayName: item.speaker ?? null,
-          speakerRole: item.speakerRole ?? 'unknown',
-        })),
+        conversation: {
+          id: job.id,
+          name: job.name,
+          kind: 'direct',
+          recordFormat: 'compact-v2',
+          ...analysisClock,
+          counterpartName: expectedCounterpartName ?? null,
+          totalRecords: batch.length,
+        },
+        records: batch.map(modelRecord),
         attachments: [],
         settings: {
           promptInstructions: {
@@ -2191,7 +2204,7 @@ export async function analyzePeopleLegacy(
       const allowedPlatforms = new Set(batch.map((item) => item.source))
       const recordsById = new Map(batch.map((item) => [item.id, item]))
       payload.people.forEach((value, index) => {
-        const person = normalizePerson(value as Partial<Person>, model, offset * 1000 + index, allowedIds, allowedPlatforms, recordsById)
+        const person = normalizePerson(value as Partial<Person>, model, offset * 1000 + index, allowedIds, allowedPlatforms, recordsById, undefined, expectedCounterpartName)
         if (!person) return
         const key = `${person.name}|${[...person.conversationIds ?? []].sort().join(',')}`
         if (seen.has(key)) return
@@ -2220,8 +2233,44 @@ export async function analyzePeopleLegacy(
   return { people, model, failedBatches }
 }
 
-function counterpartRecords(records: IntelItem[], name: string) {
-  return records.filter((item) => item.speakerRole === 'other' && item.speaker?.trim() === name)
+function counterpartRecords(records: IntelItem[], name: string, expectedCounterpartName?: string) {
+  return counterpartIdentityEvidence(records, name, expectedCounterpartName).records
+}
+
+function modelAnalysisClock() {
+  const now = new Date()
+  let timeZone = 'UTC'
+  try {
+    timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || timeZone
+  } catch { /* keep the stable UTC fallback */ }
+  return {
+    analysisAsOf: now.toISOString(),
+    timeZone,
+    utcOffsetMinutes: -now.getTimezoneOffset(),
+  }
+}
+
+function modelCounterpartName(records: IntelItem[], fallbackName?: string) {
+  const names = [...new Set(records
+    .filter((item) => item.speakerRole === 'other' && item.speaker?.trim())
+    .map((item) => item.speaker!.trim()))]
+  if (names.length === 1) return names[0]
+  const fallback = directConversationDisplayName(String(fallbackName ?? ''))
+  return fallback || undefined
+}
+
+function modelRecord(item: IntelItem) {
+  const content = [item.content, item.summary, item.title]
+    .find((value): value is string => typeof value === 'string' && value.trim().length > 0)
+  return {
+    id: item.id,
+    sentAt: item.capturedAt || null,
+    // Non-text exports still occupy a position in the timeline. Keep the row
+    // instead of failing the entire segment when an exporter only supplied a
+    // summary or an attachment placeholder.
+    content: content?.trim().slice(0, 3_000) || '[non-text message]',
+    speakerRole: item.speakerRole === 'self' || item.speakerRole === 'other' ? item.speakerRole : 'unknown',
+  }
 }
 
 function normalizedPersonName(value: string) {
@@ -2260,14 +2309,14 @@ function mergePersonResult(people: Person[], incoming: Person) {
     // Keep only evidence-backed notes once a model segment has contributed
     // claims. Local fallback timestamps remain available until that happens.
     facts: hasModelEvidence
-      ? notesFromEvidence(evidence, 'fact', 96)
-      : [...new Set([...current.facts, ...incoming.facts])].slice(0, 48),
+      ? notesFromEvidence(evidence, 'fact')
+      : [...new Set([...current.facts, ...incoming.facts])],
     preferences: hasModelEvidence
-      ? notesFromEvidence(evidence, 'preference', 24)
-      : [...new Set([...(current.preferences ?? []), ...(incoming.preferences ?? [])])].slice(0, 18),
+      ? notesFromEvidence(evidence, 'preference')
+      : [...new Set([...(current.preferences ?? []), ...(incoming.preferences ?? [])])],
     evidence: hasModelEvidence ? evidence : current.evidence ?? incoming.evidence,
     advice: evidenceChanged ? [] : [...new Set([...(current.advice ?? []), ...(incoming.advice ?? [])])].slice(0, 9),
-    sourceIds: [...new Set([...current.sourceIds, ...incoming.sourceIds, ...evidence.flatMap((claim) => claim.sourceIds)])].slice(0, 120),
+    sourceIds: [...new Set([...current.sourceIds, ...incoming.sourceIds, ...evidence.flatMap((claim) => claim.sourceIds)])],
     conversationIds: [...new Set([...(current.conversationIds ?? []), ...(incoming.conversationIds ?? [])])],
     firstObservedAt: mergeObservedAt(current.firstObservedAt, incoming.firstObservedAt),
     lastObservedAt: mergeObservedAt(current.lastObservedAt, incoming.lastObservedAt, true),
@@ -2292,6 +2341,7 @@ export async function analyzePeople(
   options?: { signal?: AbortSignal; concurrency?: number },
 ) {
   const plan = buildPeopleConversationAnalysisPlan(items)
+  const analysisClock = modelAnalysisClock()
   const directSegments = plan.jobs.filter((job) => job.kind === 'direct')
   const recordsByConversation = new Map<string, IntelItem[]>()
   items.filter((item) => inferConversationKind(item) === 'direct' && item.conversationId).forEach((item) => {
@@ -2378,6 +2428,8 @@ export async function analyzePeople(
     activeWorkers += 1
     const additions: Person[] = []
     const sourceById = new Map(segment.records.map((item) => [item.id, item]))
+    const allConversationRecords = recordsByConversation.get(segment.id) ?? segment.records
+    const expectedCounterpartName = modelCounterpartName(allConversationRecords, segment.name)
     const coreIds = new Set(segment.coreRecordIds)
     const coreRecordIndexes = segment.records
       .map((item, recordIndex) => coreIds.has(item.id) ? String(recordIndex + 1) : null)
@@ -2402,6 +2454,9 @@ export async function analyzePeople(
           id: segment.id,
           name: segment.name,
           kind: 'direct',
+          recordFormat: 'compact-v2',
+          ...analysisClock,
+          counterpartName: expectedCounterpartName ?? null,
           totalRecords: segment.totalRecords,
           recordCount: segment.recordCount,
           segmentIndex: segment.segmentIndex,
@@ -2411,14 +2466,7 @@ export async function analyzePeople(
           coreRecordIndexes,
           historical: segment.historical,
         },
-        records: segment.records.map((item) => ({
-          id: item.id,
-          formattedTime: item.capturedAt || null,
-          type: item.messageType ?? null,
-          content: item.content || item.summary,
-          senderDisplayName: item.speaker ?? null,
-          speakerRole: item.speakerRole ?? 'unknown',
-        })),
+        records: segment.records.map(modelRecord),
         attachments: [],
         settings: {
           promptInstructions: {
@@ -2435,18 +2483,20 @@ export async function analyzePeople(
       model = payload.model
       const allowedIds = new Set(segment.records.map((item) => item.id))
       const allowedPlatforms = new Set(segment.records.map((item) => item.source))
-      const allConversationRecords = recordsByConversation.get(segment.id) ?? segment.records
       const modelPeople = Array.isArray(payload.people) ? payload.people : []
       const rawClaimCount = modelPeople.reduce<number>((count, value) => {
-        const person = value as { facts?: unknown; preferences?: unknown }
-        return count + (Array.isArray(person.facts) ? person.facts.length : 0) + (Array.isArray(person.preferences) ? person.preferences.length : 0)
+        const person = value as { facts?: unknown; preferences?: unknown; events?: unknown }
+        return count
+          + (Array.isArray(person.facts) ? person.facts.length : 0)
+          + (Array.isArray(person.preferences) ? person.preferences.length : 0)
+          + (Array.isArray(person.events) ? person.events.length : 0)
       }, 0)
       let acceptedClaimCount = 0
       modelPeople.forEach((value, index) => {
-        const person = normalizePerson(value as Partial<Person>, model, offset * 1_000 + index, allowedIds, allowedPlatforms, sourceById, coreIds)
+        const person = normalizePerson(value as Partial<Person>, model, offset * 1_000 + index, allowedIds, allowedPlatforms, sourceById, coreIds, expectedCounterpartName)
         if (!person || !person.sourceIds.some((id) => coreIds.has(id))) return
         acceptedClaimCount += person.evidence?.length ?? 0
-        const fullCounterpartRecords = counterpartRecords(allConversationRecords, person.name)
+        const fullCounterpartRecords = counterpartRecords(allConversationRecords, person.name, expectedCounterpartName)
         const chronologicalCounterpartRecords = [...fullCounterpartRecords].sort((left, right) => {
           const leftTime = new Date(left.capturedAt).getTime()
           const rightTime = new Date(right.capturedAt).getTime()
@@ -2462,7 +2512,7 @@ export async function analyzePeople(
           ...person,
           // Keep the first and latest verified messages as evidence whenever
           // we derive the interaction range from the complete conversation.
-          sourceIds: [...new Set([...person.sourceIds, chronologicalCounterpartRecords[0]?.id, chronologicalCounterpartRecords.at(-1)?.id].filter((id): id is string => Boolean(id)))].slice(0, 60),
+           sourceIds: [...new Set([...person.sourceIds, chronologicalCounterpartRecords[0]?.id, chronologicalCounterpartRecords.at(-1)?.id].filter((id): id is string => Boolean(id)))],
           avatarUrl,
           firstObservedAt: firstObservedAt ?? person.firstObservedAt,
           lastObservedAt: lastObservedAt ?? person.lastObservedAt,
