@@ -340,6 +340,16 @@ h1 { font-size: 26.5px; letter-spacing: .03em; }
 .person-observed { display: grid; gap: 5px; padding: 18px 22px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--surface-strong) 70%, transparent); }
 .person-observed span, .person-portrait-note > span { color: var(--accent); font-size: 10.5px; letter-spacing: .08em; }
 .person-observed strong { color: var(--ink); font-size: 12.5px; font-weight: 500; }
+.person-contact-overview { padding: 16px 22px 17px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--surface-strong) 52%, transparent); }
+.person-contact-overview-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+.person-contact-overview-heading > span { color: var(--accent); font-size: 10.5px; letter-spacing: .08em; }
+.person-contact-overview-heading small { color: var(--faint); font-size: 9px; }
+.person-contact-overview-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px 10px; }
+.person-contact-overview-grid > div { display: grid; grid-template-columns: 15px minmax(0, 1fr); align-items: center; gap: 3px 5px; min-width: 0; }
+.person-contact-overview-grid svg { grid-row: span 2; color: var(--gold); }
+.person-contact-overview-grid span { color: var(--faint); font-size: 9px; }
+.person-contact-overview-grid strong { overflow: hidden; color: var(--ink); font-size: 10.5px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.person-contact-overview-grid small { grid-column: 2; overflow: hidden; color: var(--faint); font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
 .person-portrait-note { margin: 18px 22px 0; padding: 13px 14px; border-left: 2px solid var(--gold); background: rgba(198, 152, 95, .08); }
 .person-portrait-note.is-insufficient { border-left-color: var(--line-strong); background: rgba(255, 255, 255, .025); }
 .person-portrait-note p { margin-top: 7px; color: var(--ink); font-size: 12.5px; line-height: 1.65; }
@@ -360,6 +370,9 @@ h1 { font-size: 26.5px; letter-spacing: .03em; }
 .person-evidence-section > div { display: grid; gap: 3px; }
 .person-evidence-section p { margin: 0; color: var(--muted); font-size: 10.5px; line-height: 1.55; }
 .person-evidence-section small { color: var(--faint); font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+.person-evidence-toggle { display: inline-flex; width: max-content; align-items: center; gap: 5px; margin-top: 3px; padding: 5px 0 1px; border: 0; color: var(--accent); background: transparent; font-size: 10px; cursor: pointer; }
+.person-evidence-toggle:hover { color: var(--ink); }
+.person-evidence-toggle:focus-visible { border-radius: 3px; outline: 1px solid var(--accent); outline-offset: 3px; }
 .person-interaction-advice { display: grid; gap: 7px; margin: 14px 22px 0; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line)); background: color-mix(in srgb, var(--accent) 7%, transparent); }
 .person-interaction-advice > span { color: var(--accent); font-size: 10.5px; letter-spacing: .08em; }
 .person-interaction-advice p { margin: 0; color: var(--muted); font-size: 10.5px; line-height: 1.6; }
@@ -436,6 +449,13 @@ h1 { font-size: 26.5px; letter-spacing: .03em; }
 .intel-quest-button:hover { border-color: var(--accent); background: rgba(216, 120, 81, .16); color: #f3c1a9; }
 .list-overflow-note { padding: 16px 4px 3px; border-top: 1px solid var(--line); color: var(--faint); font-size: 10.5px; text-align: center; }
 .conversation-timeline { display: grid; }
+.conversation-search { position: relative; display: flex; align-items: center; width: min(300px, 34vw); min-width: 190px; }
+.conversation-search > svg { position: absolute; left: 10px; color: var(--faint); pointer-events: none; }
+.conversation-search input { width: 100%; min-width: 0; height: 33px; padding: 0 32px 0 31px; border: 1px solid var(--line-strong); border-radius: 3px; outline: 0; background: color-mix(in srgb, var(--surface-strong) 72%, transparent); color: var(--ink); font-size: 10.5px; }
+.conversation-search input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent); }
+.conversation-search input::placeholder { color: var(--faint); }
+.conversation-search button { position: absolute; right: 4px; display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--faint); cursor: pointer; }
+.conversation-search button:hover { color: var(--ink); background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .conversation-period { border-top: 1px solid var(--line); }
 .conversation-period-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 2px 9px; color: var(--gold); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; }
 .conversation-period-heading small { color: var(--faint); font-family: inherit; font-size: 9.5px; }
@@ -713,6 +733,7 @@ h1 { font-size: 26.5px; letter-spacing: .03em; }
   .list-heading { align-items: stretch; flex-direction: column; }
   .list-heading-actions { justify-content: space-between; }
   .list-heading-actions { flex-wrap: wrap; }
+  .conversation-search { width: 100%; min-width: 0; }
   .automation-console { align-items: start; flex-wrap: wrap; }
   .automation-copy { min-width: calc(100% - 58px); }
   .automation-copy p { white-space: normal; }
@@ -1079,6 +1100,8 @@ h1 { font-size: 26.5px; letter-spacing: .03em; }
 .people-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 12px; }
 .people-toolbar-actions { display: inline-flex; align-items: center; justify-content: end; flex-wrap: wrap; gap: 6px; }
 .people-toolbar-actions > span { color: var(--faint); font-size: 10.5px; white-space: nowrap; }
+.people-sort { display: inline-flex; align-items: center; gap: 5px; color: var(--faint); font-size: 9.5px; white-space: nowrap; }
+.people-sort select { min-height: 31px; padding: 0 7px; border: 1px solid var(--line-strong); border-radius: 3px; background: var(--surface-strong); color: var(--muted); font-size: 9.5px; }
 .people-select-all, .people-bulk-delete { min-height: 31px; padding: 0 9px; font-size: 10.5px; }
 .people-search { position: relative; display: flex; align-items: center; flex: 1; max-width: 360px; min-width: 0; }
 .people-search svg { position: absolute; left: 10px; color: var(--faint); pointer-events: none; }

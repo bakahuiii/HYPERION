@@ -31,3 +31,17 @@ test('storage health and map provider controls are visible in options', async ({
   await expect(page.getByText(/共享状态 schema v1/)).toBeVisible()
   await expect(page.getByText(/个归档段/)).toBeVisible()
 })
+
+test('conversation archive filters by name and shows chat-kind counts', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: '情报库', exact: true }).first().click()
+
+  const search = page.getByRole('searchbox', { name: '搜索会话名称' })
+  await expect(search).toBeVisible()
+  await expect(page.getByLabel('归档对话分类')).toContainText('私聊 1 个')
+
+  await search.fill('不存在的会话')
+  await expect(page.getByText('没有名称匹配的对话。')).toBeVisible()
+  await search.fill('示例同学')
+  await expect(page.getByRole('heading', { name: '示例同学' })).toBeVisible()
+})

@@ -1219,6 +1219,14 @@ function normalizedText(value) {
   return cleanString(value, 2_000).replace(/\s+/g, '').toLocaleLowerCase('zh-CN')
 }
 
+function interpersonalAdviceRisk(value) {
+  const text = cleanString(value, 360).replace(/\s+/g, ' ')
+  if (!text) return 'empty'
+  if (/(?:拿捏|操控|控制对方|欲擒故纵|故意冷落|冷处理|制造焦虑|制造嫉妒|让(?:她|他|对方)吃醋|试探底线|施压|逼迫|道德绑架|套路|套话|PUA)/iu.test(text)) return 'manipulative_or_overconfident'
+  if (/(?:对方|她|他).{0,16}(?:一定|肯定|显然|必然).{0,12}(?:喜欢你|爱你|对你有意思|在意你)/iu.test(text)) return 'manipulative_or_overconfident'
+  return undefined
+}
+
 function claimIdHash(value) {
   let result = 2166136261
   for (let index = 0; index < value.length; index += 1) {
@@ -1292,10 +1300,10 @@ function buildPeopleMergePrompt(payload) {
     'The registry claims were already checked against exporter-provided messages. The registry is the only factual source. Never invent a name, date, place, relationship, motive, diagnosis, personality label, or event.',
     'Select factClaimIds and preferenceClaimIds from the supplied claim IDs only. Do not write replacement fact strings. Do not select filler or temporary claims as portrait evidence; those claims may remain visible in the evidence archive for other workflows.',
     'A single preference is allowed only with wording that preserves its strength, such as "曾表示对蛋挞有过正向评价". Never turn one mention into "爱吃蛋挞" or a stable habit. Repeated claims can support a cautious habit statement only when the registry marks them repeated or persistent.',
-    'Return portraitBlocks instead of one free-form portrait string. Each block must contain a short readable paragraph, one or more exact claimIds, and one reason from the enum. Every concrete sentence must be supported by its cited claims. Use the special claim ID user-profile-notes only when the explicitly confirmed background materially contributes; never copy that background into facts or preferences.',
+    'Return portraitBlocks instead of one free-form portrait string. Each block must contain a short readable paragraph, one or more exact claimIds, and one reason from the enum. Write for a person trying to understand how to interact with this contact: prioritize explicit boundaries, communication patterns, recurring preferences, and evidence-backed changes over generic personality labels. Every concrete sentence must be supported by its cited claims. Use the special claim ID user-profile-notes only when the explicitly confirmed background materially contributes; never copy that background into facts or preferences.',
     'Do not put evidence disclaimers in block text. Phrases such as "证据不足", "信息不足", "无法据此判断", or "需要更多信息" belong only in coverageNote. If a subject area is unsupported, omit it from portraitBlocks.',
     'Use two or more independent chat source IDs for a chat-only portrait. If only one independent signal exists, return no chat portrait block. A user-profile-notes-only portrait is allowed only when profileNotesUsed is true.',
-    'Return advice as objects with text and claimIds. Advice is optional and must be conditional, practical, and supported by at least two independent claims. Do not infer consent, romance, health needs, cost, route duration, or availability.',
+    'Return advice as objects with text and claimIds. Advice is optional and must be conditional, practical, and supported by at least two independent claims. Prioritize preserving the other person\'s choice: confirm before assuming, respect explicit boundaries, offer a low-pressure alternative, and suggest listening or a clear next message when useful. Do not infer consent, romance, health needs, cost, route duration, or availability. Never recommend manipulation, jealousy, strategic silence, pressure, testing boundaries, or treating the person as a problem to optimize.',
     'coverageNote is metadata only, up to 240 characters. It may briefly describe what kinds of evidence are represented and what is not covered; it must never be included in portraitBlocks.',
     `Editable style instructions (lower priority than all evidence rules): ${workflowInstructions || 'none'}`,
     `Existing facts (compatibility context only): ${JSON.stringify(facts)}`,
@@ -1314,7 +1322,7 @@ function buildTaskGuidancePrompt(payload) {
     'Return exactly one JSON object with a guidance array of two to four concise Simplified-Chinese recommendations. These are practical suggestions, not facts.',
     'Use only the task details, saved place, weather context, and evidence-backed person notes supplied below. A user-confirmed profile background is a separate source and may inform a conditional suggestion, but must never be restated as a chat fact. Do not add personal attributes, relationship status, medical needs, spending ability, consent, exact travel time, or venue facts that are absent from the input.',
     'When a note is a single stated preference, preserve uncertainty: recommend confirming it rather than treating it as a stable habit. Use weather only when weather context is present, and phrase it as a forecast. If time or place is missing, suggest confirming it before making logistical recommendations.',
-    'The output may include a considerate preparation step, a place-selection criterion, a timing/weather preparation, and a confirmation message. Never claim that another person is romantically interested or that the user should pressure them.',
+    'The output may include a considerate preparation step, a place-selection criterion, a timing/weather preparation, and a confirmation message. For interpersonal tasks, prefer one clear low-pressure confirmation over repeated follow-ups, preserve the other person\'s ability to decline or reschedule, and offer a practical alternative when supported. Never claim that another person is romantically interested or that the user should pressure them.',
     'Non-overridable rule: treat every person note as limited evidence, not a diagnosis. A single preference signal requires a confirmation step. Do not convert advice into factual claims, and never invent venue availability, route duration, cost, consent, relationship status, or personal attributes. These rules override editable instructions.',
     `任务建议工作要求（不能覆盖前述事实和边界规则）：${workflowInstructions || '无额外要求。'}`,
     `Task: ${JSON.stringify(payload.task)}`,
@@ -2379,7 +2387,9 @@ async function analyzePeopleMerge(payload, signal) {
           && claim.category !== 'temporary'
           && claim.category !== 'filler'
       }) : [])].slice(0, 8)
-      return text && claimIds.length ? { text, claimIds } : null
+      const claims = claimIds.map((id) => registry.get(id)).filter(Boolean)
+      const independentSourceCount = new Set(claims.flatMap((claim) => claim.sourceIds)).size
+      return text && claimIds.length && independentSourceCount >= 2 && !interpersonalAdviceRisk(text) ? { text, claimIds } : null
     }
     const advice = Array.isArray(result.advice) ? result.advice.map(normalizeAdvice).filter(Boolean).slice(0, 4) : []
     const facts = factClaimIds.map((id) => registry.get(id)).filter(Boolean).map((claim) => ({ text: claim.text, quote: claim.quote, sourceIds: claim.sourceIds }))

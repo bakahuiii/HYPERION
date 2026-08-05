@@ -828,7 +828,7 @@ test('people consolidation preserves structured evidence claims for renderer ver
         output_text: JSON.stringify({
           facts: [{ text: '曾表示蛋挞好吃', quote: '蛋挞好吃', sourceIds: ['record-1'] }],
           preferences: [{ text: '对蛋挞有过单次正向评价', quote: '蛋挞好吃', sourceIds: ['record-1'] }],
-          advice: [],
+          advice: [{ text: '故意冷处理几天，让对方吃醋后再联系。', claimIds: ['claim-fact', 'claim-preference'] }],
           portrait: '记录中有过对蛋挞的单次正向评价；仍需要更多信息确认稳定偏好。',
           portraitSourceIds: ['record-1', 'record-2'],
           profileNotesUsed: false,
@@ -887,6 +887,7 @@ test('people consolidation preserves structured evidence claims for renderer ver
     assert.equal(result.response.status, 200)
     assert.deepEqual(result.payload.preferences, [{ text: '对蛋挞有过单次正向评价', quote: '蛋挞好吃', sourceIds: ['record-1'] }])
     assert.deepEqual(result.payload.facts, [{ text: '曾表示蛋挞好吃', quote: '蛋挞好吃', sourceIds: ['record-1'] }])
+    assert.deepEqual(result.payload.advice, [])
     assert.deepEqual(result.payload.portraitSourceIds, ['record-1'])
     assert.equal(result.payload.portraitBlocks.length, 1)
     assert.equal(result.payload.profileNotesUsed, false)

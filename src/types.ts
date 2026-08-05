@@ -245,6 +245,10 @@ export interface ArchiveSummary {
   messageCount: number
   conversationCount: number
   identifiedConversationCount: number
+  /** Distinct conversations explicitly classified as direct chats. */
+  directConversationCount?: number
+  /** Distinct conversations explicitly classified as group chats. */
+  groupConversationCount?: number
   messagesWithoutConversation: number
   lastImport?: ArchiveImportSummary
   lastAnalysis?: ArchiveAnalysisSummary

@@ -174,7 +174,7 @@ export const seedData: AppData = {
       status: 'reviewed',
     },
   ],
-  archive: { version: 1, messageCount: 3, conversationCount: 1, identifiedConversationCount: 1, messagesWithoutConversation: 0 },
+  archive: { version: 1, messageCount: 3, conversationCount: 1, identifiedConversationCount: 1, directConversationCount: 1, groupConversationCount: 0, messagesWithoutConversation: 0 },
   aiCandidates: [],
   aiSettings: {
     mode: 'balanced',
@@ -186,9 +186,9 @@ export const seedData: AppData = {
     feedback: [],
     promptInstructions: {
       task: '优先保留仍需你处理、具体可执行的安排。约见、返校、报名、缴费、回复、预约和截止事项优先；闲聊、历史通知和已过期事项不输出。',
-      people: '只提取对方自己明确说过的信息。单次表达只能写成“曾表示”或“有过单次评价”，不能升级为稳定习惯或性格。',
-      peopleMerge: '只根据已核验事实收敛人物刻画。信息不足时明确说明需要更多信息源，不要用套话补齐。',
-      taskGuidance: '建议应具体、尊重边界，优先给出准备、确认和备选方案。信息不足时先建议补充时间、地点或对方偏好。',
+      people: '只提取对方自己明确说过的信息。优先保留能帮助你更好相处的明确边界、沟通方式、重复偏好和长期变化。单次表达只能写成“曾表示”或“有过单次评价”，不能升级为稳定习惯或性格。',
+      peopleMerge: '把已核验事实整理成自然、有人味但克制的人物理解：优先写对方如何沟通、明确在意或拒绝什么、重复出现的偏好、互动方式和有证据的变化；不要写关系分数、心理诊断或武断性格标签。建议必须帮助你尊重对方选择、先确认再行动、留出拒绝空间，并且每条都能回到至少两条证据。信息不足的方面直接省略。',
+      taskGuidance: '建议应具体、尊重边界，优先给出准备、确认、倾听和备选方案。涉及他人时先保护对方选择权，避免催促、试探和操控。信息不足时先建议补充时间、地点或对方当前偏好。',
     },
   },
   appearance: defaultAppearance,

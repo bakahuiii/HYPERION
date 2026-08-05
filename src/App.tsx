@@ -31,6 +31,8 @@ import { filterDismissedPeople, removePeopleCards, resolvePersonDismissals } fro
 import { removeQuestAndDetachChildren } from './lib/questState'
 import { taskGuidanceRequestIsCurrent, taskGuidanceSignature } from './lib/questGuidance'
 import { completedConversationWatermarks } from './lib/analysisWatermark'
+import { aiTaskCandidatesDuplicate, mergeAiTaskCandidates } from './lib/aiCandidateDedup'
+import { personEvidenceIdentityKey } from './lib/personEvidenceIdentity'
 
 const TimelineView = lazy(() => import('./views/TimelineView').then((module) => ({ default: module.TimelineView })))
 const MapView = lazy(() => import('./views/MapView').then((module) => ({ default: module.MapView })))
@@ -81,6 +83,8 @@ function appendTaskFeedback(settings: AiSettings, additions: AiTaskFeedback[]) {
 
 function cleanDanglingPersonReferences(current: AppData): AppData {
   const peopleIds = new Set(current.people.map((person) => person.id))
+  const deduplicatedCandidates = mergeAiTaskCandidates(current.aiCandidates)
+  const aiCandidates = deduplicatedCandidates.length === current.aiCandidates.length ? current.aiCandidates : deduplicatedCandidates
   let changed = false
   const quests = current.quests.map((quest) => {
     const existingIds = Array.isArray(quest.characterIds) ? quest.characterIds : []
@@ -89,7 +93,7 @@ function cleanDanglingPersonReferences(current: AppData): AppData {
     changed = true
     return { ...quest, characterIds }
   })
-  return changed ? { ...current, quests } : current
+  return changed || aiCandidates !== current.aiCandidates ? { ...current, quests, aiCandidates } : current
 }
 
 interface IntelImportResult {
@@ -109,20 +113,24 @@ function dismissInvalidAiCandidates(current: AppData, indexedIntel?: ReadonlyMap
   const compacted = withoutGeneratedArchive.length === cleaned.aiCandidates.length
     ? cleaned
     : { ...cleaned, aiCandidates: withoutGeneratedArchive }
-  const pending = compacted.aiCandidates.filter((candidate) => candidate.status === 'pending')
-  if (!pending.length) return compacted
+  const deduplicatedCandidates = mergeAiTaskCandidates(compacted.aiCandidates)
+  const normalized = deduplicatedCandidates.length === compacted.aiCandidates.length
+    ? compacted
+    : { ...compacted, aiCandidates: deduplicatedCandidates }
+  const pending = normalized.aiCandidates.filter((candidate) => candidate.status === 'pending')
+  if (!pending.length) return normalized
   const recordsById = indexedIntel ?? new Map(cleaned.intel.map((item) => [item.id, item]))
   const dismissed = pending.flatMap((candidate) => {
     const evidence = candidate.sourceIds.map((id) => recordsById.get(id)).filter((item): item is IntelItem => Boolean(item))
     const reason = candidateRejectionReason(candidate, evidence, cleaned.aiSettings)
     return reason ? [{ candidate, reason }] : []
   })
-  if (!dismissed.length) return compacted
+  if (!dismissed.length) return normalized
   const dismissedIds = new Set(dismissed.map(({ candidate }) => candidate.id))
   return {
-    ...compacted,
-    aiCandidates: compacted.aiCandidates.map((candidate) => dismissedIds.has(candidate.id) ? { ...candidate, status: 'dismissed' as const } : candidate),
-    aiSettings: appendTaskFeedback(compacted.aiSettings, dismissed.map(({ candidate, reason }) => feedbackEntry(candidate, 'dismissed', reason))),
+    ...normalized,
+    aiCandidates: normalized.aiCandidates.map((candidate) => dismissedIds.has(candidate.id) ? { ...candidate, status: 'dismissed' as const } : candidate),
+    aiSettings: appendTaskFeedback(normalized.aiSettings, dismissed.map(({ candidate, reason }) => feedbackEntry(candidate, 'dismissed', reason))),
   }
 }
 
@@ -210,8 +218,7 @@ function canonicalPersonName(name: string) {
 }
 
 function personEvidenceKey(claim: PersonEvidence) {
-  const compact = (value: string) => value.replace(/\s+/g, '').toLocaleLowerCase('zh-CN')
-  return `${claim.kind}|${compact(claim.text)}|${compact(claim.quote)}`
+  return personEvidenceIdentityKey(claim)
 }
 
 function personProfileSignalScore(claim: PersonEvidence) {
@@ -1577,13 +1584,17 @@ function App() {
   const saveAiAnalysis = (candidates: AiTaskCandidate[], analyzedIds: string[], settings: AiSettings, analysis: Omit<ArchiveAnalysisSummary, 'analyzedAt'>, completedSuccessfully: boolean, watermarkEligible = false) => {
     const analyzedAt = new Date().toISOString()
     setData((current) => {
-      const existing = new Set(current.aiCandidates.map((candidate) => `${candidate.title}|${candidate.description}`))
-      const unique = candidates.filter((candidate) => !existing.has(`${candidate.title}|${candidate.description}`))
+      // Segment overlap can produce the same task with slightly different
+      // punctuation or optional metadata. Normalize the incoming batch first,
+      // then compare it against the persisted review queue without reviving a
+      // previously dismissed candidate.
+      const existingCandidates = mergeAiTaskCandidates(current.aiCandidates)
+      const unique = mergeAiTaskCandidates(candidates).filter((candidate) => !existingCandidates.some((existing) => aiTaskCandidatesDuplicate(existing, candidate)))
       const taskWatermarks = watermarkEligible ? completedConversationWatermarks(current.intel, analyzedIds) : {}
       const previousWatermarks = current.aiSettings.analysisWatermarks?.tasks ?? {}
       return {
         ...current,
-        aiCandidates: [...unique, ...current.aiCandidates],
+        aiCandidates: [...unique, ...existingCandidates],
         aiSettings: {
           ...current.aiSettings,
           ...(completedSuccessfully ? { lastRunAt: analyzedAt } : {}),

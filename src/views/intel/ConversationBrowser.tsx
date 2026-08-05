@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, ChevronRight, Clock3, MessagesSquare, Sparkles, X } from 'lucide-react'
+import { ChevronDown, ChevronRight, Clock3, MessagesSquare, Search, Sparkles, X } from 'lucide-react'
 
 import type { ConversationTimeline } from '../../lib/intelConversationView'
 import { timelineBucket } from '../../lib/intelConversationView'
@@ -29,6 +29,18 @@ function formatChatTime(value?: string) {
   return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString('zh-CN', { hour12: false }) : '未记录时间'
 }
 
+function formatTimelinePeriod(value: string) {
+  const match = /^(\d{4})-(\d{2})$/.exec(value)
+  return match ? `${match[1]}年${Number(match[2])}月` : value
+}
+
+function latestCounterpartRecord(conversation: ConversationTimeline) {
+  for (let index = conversation.records.length - 1; index >= 0; index -= 1) {
+    if (conversation.records[index].speakerRole === 'other') return conversation.records[index]
+  }
+  return conversation.records.at(-1)
+}
+
 export function ConversationBrowser({
   open,
   conversations,
@@ -41,24 +53,31 @@ export function ConversationBrowser({
   onResetTimeline,
 }: ConversationBrowserProps) {
   const [selectedConversationId, setSelectedConversationId] = useState<string>()
+  const [conversationSearch, setConversationSearch] = useState('')
   const [messageScrollTop, setMessageScrollTop] = useState(0)
   const [messageViewportHeight, setMessageViewportHeight] = useState(600)
   const messageListRef = useRef<HTMLDivElement>(null)
   const messageScrollFrame = useRef(0)
   const pendingMessageScrollTop = useRef(0)
+  const visibleConversations = useMemo(() => {
+    const query = conversationSearch.trim().toLocaleLowerCase()
+    return query
+      ? filteredConversations.filter((conversation) => conversation.name.toLocaleLowerCase().includes(query))
+      : filteredConversations
+  }, [conversationSearch, filteredConversations])
   const conversationsByPeriod = useMemo(() => {
     const groups = new Map<string, ConversationTimeline[]>()
-    for (const conversation of filteredConversations) {
+    for (const conversation of visibleConversations) {
       const bucket = timelineBucket(conversation)
       const current = groups.get(bucket)
       if (current) current.push(conversation)
       else groups.set(bucket, [conversation])
     }
     return [...groups.entries()]
-  }, [filteredConversations])
+  }, [visibleConversations])
   const selectedConversation = useMemo(
-    () => filteredConversations.find((conversation) => conversation.id === selectedConversationId),
-    [filteredConversations, selectedConversationId],
+    () => visibleConversations.find((conversation) => conversation.id === selectedConversationId),
+    [selectedConversationId, visibleConversations],
   )
   const selectedConversationRecords = selectedConversation?.records ?? []
   const safeMessageScrollTop = Math.min(messageScrollTop, Math.max(0, selectedConversationRecords.length * MESSAGE_ROW_HEIGHT - messageViewportHeight))
@@ -107,14 +126,14 @@ export function ConversationBrowser({
 
   return (
     <section className={`intel-list-section conversation-section intel-collapsible-section ${open ? 'is-open' : 'is-collapsed'}`}>
-      <div className="list-heading"><div><span className="section-kicker">LOCAL CONVERSATIONS · 原始对话目录</span><h2><button type="button" className="intel-section-toggle" aria-expanded={open} onClick={onToggleOpen}>对话档案<ChevronDown size={17} /></button></h2></div><div className="list-heading-actions"><span>{filteredConversations.length}/{conversations.length} 个对话</span></div></div>
+      <div className="list-heading"><div><span className="section-kicker">LOCAL CONVERSATIONS · 原始对话目录</span><h2><button type="button" className="intel-section-toggle" aria-expanded={open} onClick={onToggleOpen}>对话档案<ChevronDown size={17} /></button></h2></div><div className="list-heading-actions"><label className="conversation-search"><Search size={15} /><input type="search" value={conversationSearch} onChange={(event) => setConversationSearch(event.target.value)} placeholder="搜索会话名称" aria-label="搜索会话名称" />{conversationSearch && <button type="button" aria-label="清除会话搜索" title="清除会话搜索" onClick={() => setConversationSearch('')}><X size={14} /></button>}</label><span>{visibleConversations.length}/{filteredConversations.length} 个对话{filteredConversations.length !== conversations.length ? ` · 全部 ${conversations.length}` : ''}</span></div></div>
       {open && <>
         <div className="bulk-note">这里是去重后的原始消息档案，不是模型候选。每个文件夹或导出会话被归为一个对话；按最后聊天时间倒序和月份分组。选择时间范围后，显示范围与模型提炼范围一致。</div>
         <div className="conversation-timeline">
           {conversationsByPeriod.map(([period, entries]) => <section className="conversation-period" key={period}>
-            <div className="conversation-period-heading"><span>{period === '未记录时间' ? period : `${period} · 最后聊天`}</span><small>{entries.length} 个对话</small></div>
+            <div className="conversation-period-heading"><span>{period === '未记录时间' ? period : `${formatTimelinePeriod(period)} · 最后聊天`}</span><small>{entries.length} 个对话</small></div>
             {entries.map((conversation) => {
-              const latest = conversation.records.at(-1)
+              const latest = latestCounterpartRecord(conversation)
               const kind = conversation.kind === 'group' ? '群聊' : conversation.kind === 'direct' ? '私聊' : '对话'
               return <article className={`conversation-row ${selectedConversation?.id === conversation.id ? 'is-selected' : ''} ${analysisConversationId === conversation.id ? 'is-analysis-target' : ''}`} key={conversation.id}>
                 <div className="conversation-row-icon"><MessagesSquare size={17} /></div>
@@ -123,7 +142,7 @@ export function ConversationBrowser({
               </article>
             })}
           </section>)}
-          {!filteredConversations.length && <p className="empty-note">当前时间范围内没有最后聊天时间可匹配的对话。</p>}
+          {!visibleConversations.length && <p className="empty-note">{conversationSearch.trim() ? '没有名称匹配的对话。' : '当前时间范围内没有最后聊天时间可匹配的对话。'}</p>}
         </div>
         {selectedConversation && <section className="conversation-detail" aria-label={`${selectedConversation.name} 的对话内容`}>
           <div className="conversation-detail-heading"><div><span className="section-kicker">DIALOGUE · 按消息时间排序</span><h3>{selectedConversation.name}</h3><p>{selectedConversation.source} · {selectedConversation.kind === 'group' ? '群聊' : selectedConversation.kind === 'direct' ? '私聊' : '对话'} · {formatCount(selectedConversation.records.length)} 条消息 · 最后聊天 {formatChatTime(selectedConversation.lastAt)}</p></div><button type="button" className="icon-button" title="关闭对话内容" aria-label="关闭对话内容" onClick={() => setSelectedConversationId(undefined)}><X size={16} /></button></div>

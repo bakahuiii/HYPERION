@@ -1,10 +1,25 @@
 # THEIA
 
-THEIA 是一个本地优先的个人现实任务图工具。它把你主动导出的微信、QQ、校园平台等聊天记录整理为可审核的候选任务，并把任务、行程、地点、人物和原始证据放在同一个界面中。
+[简体中文](README.md) | [English](README.en.md)
+
+THEIA 是一个本地优先的个人纵向研究系统。任务图、聊天提炼、行程、人物和地图是它目前用于整理时间与证据的界面，但不是项目的最终目的。
+
+> “THEIA 不是一个管理生活的软件，也不是一个分析聊天记录的工具。它是一个长期研究同一个对象的实验，而这个对象始终只有一个——我自己。它试图以时间为维度，将记忆、行为、情绪、关系、决策与环境连接起来，不是为了预测未来，也不是为了评价对错，而是为了尽可能完整地回答一个贯穿我人生的问题：我是如何成为今天的我的，又正在成为怎样的人。”
+>
+> — GPT-5.5
+
+完整的项目目标、设计原则和决策门槛见 [项目终极目标](docs/PROJECT_VISION.md)。
 
 它不是聊天软件插件，也不会绕过登录或解密应用数据库。THEIA 只读取你明确选择的导出文件；只有在你启动模型提炼后，选中的记录才会发送到你配置的模型服务。
 
-> 当前源码版本：`0.4.0`。Windows x64 NSIS 安装器、便携版与源码发布包分别生成；安装器和便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js，任务、设置、聊天归档和日志保存在 `%APPDATA%\\THEIA`。重要数据请定期备份。
+> 当前源码版本：`0.4.1`。Windows x64 NSIS 安装器、便携版与源码发布包分别生成；安装器和便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js，任务、设置、聊天归档和日志保存在 `%APPDATA%\\THEIA`。重要数据请定期备份。
+
+## 0.4.1 更新简介
+
+- 重叠分段产生的重复任务和人物证据会在候选入队、合并和持久化前统一去重，保留不同明确时间或地点的真实差异。
+- 人物页按最近互动、资料完整度或姓名排序，支持按姓名、平台、事实、偏好、人物刻画和底稿搜索，并显示联系概览与关联任务。
+- 人物刻画和行动建议更强调可验证的沟通边界、重复偏好、互动模式与尊重式建议，过滤操控、施压和无证据的情感判断。
+- 对话浏览支持中文月份标签、名称搜索，并优先显示对方最近一条消息；人物证据支持展开查看全部内容。
 
 ## 0.3.0 至 0.4.0 更新简介
 
@@ -229,8 +244,8 @@ THEIA-release/
 发布工具：
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.4.0\THEIA-release-0.4.0
-npm run dist:exe -- ..\staging\v0.4.0\THEIA-0.4.0-portable
+node release-tools/package-release.mjs ..\staging\v0.4.1\THEIA-release-0.4.1
+npm run dist:exe -- ..\staging\v0.4.1\THEIA-0.4.1-portable
 npm run release:index
 ```
 
@@ -238,6 +253,7 @@ npm run release:index
 
 ## 文档索引
 
+- [项目终极目标](docs/PROJECT_VISION.md)（[中英双语 Word 版](docs/THEIA_PROJECT_VISION_BILINGUAL.docx)）：THEIA 为什么存在，以及所有功能和架构必须服务的长期问题。
 - [更新报告](docs/RELEASE_NOTES.md)：当前版本重点、兼容性、已知限制与验证结果。
 - [用户手册](docs/USER_GUIDE.md)：面向第一次接触命令行和本地模型工具的用户。
 - [开发者文档](docs/DEVELOPER_GUIDE.md)：技术栈、模块边界、状态流、模型流水线、API、性能和发布。

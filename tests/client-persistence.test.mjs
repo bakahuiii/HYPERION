@@ -17,9 +17,101 @@ import { taskGuidanceRequestIsCurrent, taskGuidanceSignature } from '../src/lib/
 import { editableSettingsSignature } from '../src/lib/settingsState.ts'
 import { analysisConversationFingerprint, completedConversationWatermarks } from '../src/lib/analysisWatermark.ts'
 import { buildConversationAnalysisPlan, buildPeopleConversationAnalysisPlan } from '../src/lib/conversationAnalysis.ts'
+import { summarizeArchive } from '../src/lib/archiveSummary.ts'
+import { aiTaskCandidatesDuplicate, mergeAiTaskCandidates } from '../src/lib/aiCandidateDedup.ts'
+import { personEvidenceIdentityKey } from '../src/lib/personEvidenceIdentity.ts'
 import { createSeedData } from '../src/seed.ts'
 
 const file = (path, signature) => ({ path, signature })
+
+test('archive summary counts distinct direct and group conversations', () => {
+  const record = (id, conversationId, conversationKind) => ({
+    id,
+    title: id,
+    summary: id,
+    source: '本地文件',
+    conversationId,
+    conversationKind,
+    capturedAt: '2026-08-05T00:00:00.000Z',
+    status: 'new',
+  })
+  const summary = summarizeArchive([
+    record('direct-a-1', 'direct:a', 'direct'),
+    record('direct-a-2', 'direct:a', 'direct'),
+    record('direct-b-1', 'direct:b', 'direct'),
+    record('group-a-1', 'group:a', 'group'),
+    record('unknown-a-1', 'unknown:a', 'unknown'),
+  ])
+
+  assert.equal(summary.conversationCount, 4)
+  assert.equal(summary.identifiedConversationCount, 4)
+  assert.equal(summary.directConversationCount, 2)
+  assert.equal(summary.groupConversationCount, 1)
+})
+
+test('overlap task results merge despite punctuation and optional-field drift', () => {
+  const candidate = (overrides = {}) => ({
+    id: 'candidate',
+    title: '确认咖啡安排',
+    description: '和 A 确认咖啡时间',
+    sourceIds: ['record-1'],
+    people: ['A'],
+    tags: [],
+    guidance: [],
+    model: 'test-model',
+    createdAt: '2026-08-05T00:00:00.000Z',
+    status: 'pending',
+    ...overrides,
+  })
+  const first = candidate()
+  const repeated = candidate({
+    id: 'candidate-repeat',
+    title: '确认咖啡安排！',
+    description: '和 A 确认咖啡时间。',
+    sourceIds: ['record-1', 'record-2'],
+    guidance: ['先确认日期'],
+    status: 'dismissed',
+  })
+  assert.equal(aiTaskCandidatesDuplicate(first, repeated), true)
+  const merged = mergeAiTaskCandidates([first, repeated])
+  assert.equal(merged.length, 1)
+  assert.deepEqual(merged[0].sourceIds, ['record-1', 'record-2'])
+  assert.deepEqual(merged[0].guidance, ['先确认日期'])
+  assert.equal(merged[0].status, 'dismissed')
+})
+
+test('same task wording remains separate when target dates or exact places conflict', () => {
+  const candidate = (overrides = {}) => ({
+    id: 'candidate',
+    title: '参加课程',
+    description: '按时参加课程',
+    sourceIds: ['record-1'],
+    people: [],
+    tags: [],
+    model: 'test-model',
+    createdAt: '2026-08-05T00:00:00.000Z',
+    status: 'pending',
+    ...overrides,
+  })
+  const monday = candidate({ startAt: '2026-08-10T09:00:00+08:00' })
+  const tuesday = candidate({ id: 'candidate-tuesday', startAt: '2026-08-11T09:00:00+08:00' })
+  const eastCampus = candidate({ id: 'candidate-east', place: '东校区', locationPrecision: 'exact' })
+  const westCampus = candidate({ id: 'candidate-west', place: '西校区', locationPrecision: 'exact' })
+
+  assert.equal(aiTaskCandidatesDuplicate(monday, tuesday), false)
+  assert.equal(aiTaskCandidatesDuplicate(eastCampus, westCampus), false)
+  assert.equal(mergeAiTaskCandidates([monday, tuesday]).length, 2)
+  assert.equal(mergeAiTaskCandidates([eastCampus, westCampus]).length, 2)
+})
+
+test('person evidence identity ignores overlap-only punctuation drift', () => {
+  const first = personEvidenceIdentityKey({ kind: 'preference', text: '喜欢蛋挞', quote: '蛋挞好吃' })
+  const repeated = personEvidenceIdentityKey({ kind: 'preference', text: '喜欢蛋挞。', quote: '蛋挞好吃！' })
+  const distinct = personEvidenceIdentityKey({ kind: 'preference', text: '喜欢咖啡', quote: '咖啡好喝' })
+
+  assert.equal(first, repeated)
+  assert.notEqual(first, distinct)
+})
 
 test('bulk person removal suppresses passive restoration and cleans task references', () => {
   const current = {

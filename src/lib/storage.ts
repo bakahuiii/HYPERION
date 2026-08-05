@@ -11,9 +11,9 @@ const STORAGE_ROLLBACK_KEY = 'theia:v1:rollback'
 
 export const defaultPromptInstructions = {
   task: '优先保留仍需你处理、具体可执行的安排。约见、返校、报名、缴费、回复、预约、截止事项优先；闲聊、历史通知、已过期事项不输出。',
-  people: '只提取对方自己明确说过的信息。偏好要保留证据强度：单次表达只是“曾有正向评价”，不是稳定习惯或性格。',
-  peopleMerge: '将已核验聊天事实按时间线收敛成简洁的人物志：只写原文能支持的经历、明确偏好、重复互动模式和有证据的变化；单次表达保留单次强度。允许使用人物底稿，但必须与聊天事实分开，不能补写未知背景。证据不足时明确说明边界。',
-  taskGuidance: '建议要具体、尊重边界，优先给出可执行的准备、确认和备选方案。不足时建议优先补充时间、地点或对方偏好。',
+  people: '只提取对方自己明确说过的信息。优先保留能帮助你更好相处的明确边界、沟通方式、重复偏好和长期变化。偏好要保留证据强度：单次表达只是“曾有正向评价”，不是稳定习惯或性格。',
+  peopleMerge: '把已核验事实整理成自然、有人味但克制的人物理解：优先写对方如何沟通、明确在意或拒绝什么、重复出现的偏好、互动方式和有证据的变化；不要写关系分数、心理诊断或武断性格标签。建议必须帮助你尊重对方选择、先确认再行动、留出拒绝空间，并且每条都能回到至少两条证据。允许使用人物底稿，但必须与聊天事实分开。证据覆盖不到的方面直接省略。',
+  taskGuidance: '建议要具体、尊重边界，优先给出可执行的准备、确认、倾听和备选方案。涉及他人时先保护对方选择权，避免催促、试探和操控。不足时建议优先补充时间、地点或对方当前偏好。',
 }
 
 export const defaultAiSettings: AiSettings = {
@@ -120,7 +120,18 @@ export function loadData(): AppData {
       ...defaultPromptInstructions,
       ...(parsed.aiSettings?.promptInstructions ?? {}),
     }
-    if (promptInstructions.peopleMerge === '仅根据已核验事实收敛人物刻画。结论不足时明确说需要更多信息，不要用套话补齐。') promptInstructions.peopleMerge = defaultPromptInstructions.peopleMerge
+    if (promptInstructions.people === '只提取对方自己明确说过的信息。偏好要保留证据强度：单次表达只是“曾有正向评价”，不是稳定习惯或性格。'
+      || promptInstructions.people === '只提取对方自己明确说过的信息。单次表达只能写成“曾表示”或“有过单次评价”，不能升级为稳定习惯或性格。') {
+      promptInstructions.people = defaultPromptInstructions.people
+    }
+    if (promptInstructions.peopleMerge === '仅根据已核验事实收敛人物刻画。结论不足时明确说需要更多信息，不要用套话补齐。'
+      || promptInstructions.peopleMerge === '只根据已核验事实收敛人物刻画。信息不足时明确说明需要更多信息源，不要用套话补齐。') {
+      promptInstructions.peopleMerge = defaultPromptInstructions.peopleMerge
+    }
+    if (promptInstructions.taskGuidance === '建议要具体、尊重边界，优先给出可执行的准备、确认和备选方案。不足时建议优先补充时间、地点或对方偏好。'
+      || promptInstructions.taskGuidance === '建议应具体、尊重边界，优先给出准备、确认和备选方案。信息不足时先建议补充时间、地点或对方偏好。') {
+      promptInstructions.taskGuidance = defaultPromptInstructions.taskGuidance
+    }
     return {
       ...parsed,
       // Old versions derived a person card from every sender/alias while importing.

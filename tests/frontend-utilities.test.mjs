@@ -4,6 +4,8 @@ import test from 'node:test'
 import { estimateAttachmentQueue } from '../src/lib/attachmentQueue.ts'
 import { parseIntelFile } from '../src/lib/importer.ts'
 import { incrementalConversationRecords } from '../src/lib/intelConversationView.ts'
+import { relativeInteractionLabel, summarizePersonInteraction } from '../src/lib/personInteraction.ts'
+import { isHumanCenteredAdvice, interpersonalAdviceRisk } from '../src/lib/interpersonalSafety.ts'
 import { normalizeMapSettings } from '../server/settings.mjs'
 
 test('attachment queue separates text estimates from provider-priced media', () => {
@@ -110,4 +112,31 @@ test('incremental people analysis sends only new records and bounded prior conte
   assert.deepEqual(selected.map((item) => item.id), conversation.slice(13).map((item) => item.id))
   assert.ok(selected.some((item) => item.id === 'a-29'))
   assert.ok(selected.every((item) => item.conversationId === 'direct:a'))
+})
+
+test('person interaction summary is factual, deduplicated, and direction-aware', () => {
+  const records = [
+    { id: 'm-1', conversationId: 'direct:a', capturedAt: '2026-08-01T10:00:00Z', speakerRole: 'other' },
+    { id: 'm-2', conversationId: 'direct:a', capturedAt: '2026-08-01T10:01:00Z', speakerRole: 'self' },
+    { id: 'm-3', conversationId: 'direct:b', capturedAt: '2026-08-02T10:00:00Z', speakerRole: 'unknown' },
+    { id: 'm-3', conversationId: 'direct:b', capturedAt: '2026-08-02T10:00:00Z', speakerRole: 'unknown' },
+  ]
+  assert.deepEqual(summarizePersonInteraction(records), {
+    firstAt: '2026-08-01T10:00:00Z',
+    lastAt: '2026-08-02T10:00:00Z',
+    totalMessages: 3,
+    selfMessages: 1,
+    otherMessages: 1,
+    unknownMessages: 1,
+    conversationCount: 2,
+  })
+  assert.equal(relativeInteractionLabel('2026-08-05T12:00:00Z', Date.parse('2026-08-05T23:00:00Z')), '今天')
+  assert.equal(relativeInteractionLabel('2026-08-01T12:00:00Z', Date.parse('2026-08-05T23:00:00Z')), '4 天前')
+  assert.equal(relativeInteractionLabel('2026-08-06T12:00:00Z', Date.parse('2026-08-05T12:00:00Z')), '明天')
+})
+
+test('interpersonal advice rejects manipulation and unsupported certainty', () => {
+  assert.equal(isHumanCenteredAdvice('先确认对方现在是否方便，并给对方一个拒绝或改期的选择。'), true)
+  assert.equal(interpersonalAdviceRisk('故意冷处理几天，让对方吃醋后再联系。'), 'manipulative_or_overconfident')
+  assert.equal(interpersonalAdviceRisk('对方肯定喜欢你，可以直接逼对方答应。'), 'manipulative_or_overconfident')
 })

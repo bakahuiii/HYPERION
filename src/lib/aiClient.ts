@@ -4,6 +4,9 @@ import { apiUrl, localProxyUrl } from './apiUrl'
 import { normalizeAiConcurrency } from './aiConcurrency'
 import { portraitUsesProfileNotes } from './peoplePortraitValidation'
 import { candidateRejectionReason as rejectCandidate, hasAbsoluteCalendarDate, hasMessageTimestamp, latestEvidenceTime, localDateTime, supportsUserOwnedTask } from './candidateValidation'
+import { mergeAiTaskCandidates } from './aiCandidateDedup'
+import { personEvidenceIdentityKey } from './personEvidenceIdentity'
+import { isHumanCenteredAdvice } from './interpersonalSafety'
 
 export interface AiAttachment {
   name: string
@@ -1018,7 +1021,7 @@ function parsePersonMergeResponse(payload: PersonMergeResponse, verifiedEvidence
       const text = typeof value.text === 'string' ? value.text.trim().slice(0, 360) : ''
       const claimIds = Array.isArray(value.claimIds) ? [...new Set(value.claimIds.map(String).filter((id) => registry.has(id)))].slice(0, 8) : []
       const claims = claimIds.map((id) => registry.get(id)).filter((claim): claim is PersonEvidence => Boolean(claim))
-      if (!text || !claimIds.length || new Set(claims.flatMap((claim) => claim.sourceIds)).size < 2) return null
+      if (!text || !claimIds.length || new Set(claims.flatMap((claim) => claim.sourceIds)).size < 2 || !isHumanCenteredAdvice(text)) return null
       return text
     }).filter((item): item is string => Boolean(item)).slice(0, 4)
     : []
@@ -1272,7 +1275,7 @@ function verifyPersonClaim(
 }
 
 function claimKey(claim: PersonEvidence) {
-  return `${claim.kind}|${normalizedEvidenceText(claim.text)}|${normalizedEvidenceText(claim.quote)}`
+  return personEvidenceIdentityKey(claim)
 }
 
 function mergePersonEvidence(current: PersonEvidence[] = [], incoming: PersonEvidence[] = []) {
@@ -1385,14 +1388,16 @@ function normalizePerson(
   allowedIds: Set<string>,
   allowedPlatforms: Set<IntelItem['source']>,
   recordsById: Map<string, IntelItem>,
+  requiredCoreIds?: Set<string>,
 ): Person | null {
   const name = String(value.name ?? '').trim().slice(0, 120)
   if (!name) return null
+  const keepCoreClaim = (claim: PersonEvidence | null) => claim && (!requiredCoreIds || claim.sourceIds.some((id) => requiredCoreIds.has(id))) ? claim : null
   const factClaims = Array.isArray(value.facts)
-    ? value.facts.map((claim) => verifyPersonClaim(claim, name, allowedIds, recordsById, 'fact')).filter((claim): claim is PersonEvidence => Boolean(claim))
+    ? value.facts.map((claim) => keepCoreClaim(verifyPersonClaim(claim, name, allowedIds, recordsById, 'fact'))).filter((claim): claim is PersonEvidence => Boolean(claim))
     : []
   const preferenceClaims = Array.isArray(value.preferences)
-    ? value.preferences.map((claim) => verifyPersonClaim(claim, name, allowedIds, recordsById, 'preference')).filter((claim): claim is PersonEvidence => Boolean(claim))
+    ? value.preferences.map((claim) => keepCoreClaim(verifyPersonClaim(claim, name, allowedIds, recordsById, 'preference'))).filter((claim): claim is PersonEvidence => Boolean(claim))
     : []
   const evidenceClaims = mergePersonEvidence(factClaims, preferenceClaims)
   const facts = notesFromEvidence(evidenceClaims, 'fact', 12)
@@ -1429,7 +1434,6 @@ export async function analyzeIntelLegacy(
   onLog?: (entry: AiDebugEntry) => void,
 ) {
   const candidates: AiTaskCandidate[] = []
-  const seen = new Set<string>()
   const analyzedIds: string[] = []
   const plan = buildConversationAnalysisPlan(items)
   const log = (event: string, level: AiDebugEntry['level'], details: Omit<AiDebugEntry, 'at' | 'event' | 'level'> = {}) => {
@@ -1466,6 +1470,10 @@ export async function analyzeIntelLegacy(
       diagnostics.attemptedConversations += 1
       log('conversation_request_started', 'info', { conversationId: conversation.id, conversationName: conversation.name, recordCount: conversation.records.length })
       const sourceById = new Map(conversation.records.map((item) => [item.id, item]))
+      const coreIds = new Set(conversation.coreRecordIds)
+      const coreRecordIndexes = conversation.records
+        .map((item, recordIndex) => coreIds.has(item.id) ? String(recordIndex + 1) : null)
+        .filter((value): value is string => Boolean(value))
       const requestPayload = {
         conversation: {
           id: conversation.id,
@@ -1473,6 +1481,12 @@ export async function analyzeIntelLegacy(
           kind: conversation.kind,
           totalRecords: conversation.totalRecords,
           recordCount: conversation.records.length,
+          segmentIndex: conversation.segmentIndex,
+          segmentCount: conversation.segmentCount,
+          coreRecordCount: conversation.coreRecordCount,
+          overlapRecordCount: conversation.overlapRecordCount,
+          coreRecordIndexes,
+          historical: conversation.historical,
         },
         records: conversation.records.map((item) => ({
           id: item.id,
@@ -1518,7 +1532,7 @@ export async function analyzeIntelLegacy(
           return
         }
         const evidence = Array.isArray(raw.sourceIds) ? raw.sourceIds.map(String).map((id) => sourceById.get(id)).filter((item): item is IntelItem => Boolean(item)) : []
-        if (!supportsUserOwnedTask(evidence)) {
+        if (!evidence.some((item) => coreIds.has(item.id)) || !supportsUserOwnedTask(evidence)) {
           diagnostics.rejectedEvidence += 1
           return
         }
@@ -1537,12 +1551,6 @@ export async function analyzeIntelLegacy(
           diagnostics.rejectedDirection += 1
           return
         }
-        const key = `${candidate.title.toLowerCase()}|${candidate.description.toLowerCase()}`
-        if (seen.has(key)) {
-          diagnostics.rejectedDuplicate += 1
-          return
-        }
-        seen.add(key)
         candidates.push(candidate)
       })
       log('conversation_request_succeeded', 'info', {
@@ -1573,6 +1581,9 @@ export async function analyzeIntelLegacy(
     }
     onProgress?.({ completed: index + 1, total: plan.jobs.length, candidates: candidates.length, recordCount: plan.recordCount, failedConversations: failedConversations.length, skippedUnverifiedConversations, currentConversation: conversation.name })
   }
+  const deduplicatedCandidates = mergeAiTaskCandidates(candidates)
+  diagnostics.rejectedDuplicate += candidates.length - deduplicatedCandidates.length
+  candidates.splice(0, candidates.length, ...deduplicatedCandidates)
   log('run_completed', failedConversations.length ? 'warn' : 'info', {
     recordCount: items.length,
     candidateCount: diagnostics.rawCandidates,
@@ -1606,7 +1617,6 @@ export async function analyzeIntel(
 ) {
   const candidates: AiTaskCandidate[] = []
   const people: Person[] = []
-  const seen = new Set<string>()
   const plan = buildConversationAnalysisPlan(items)
   const candidateBatches = new Map<number, AiTaskCandidate[]>()
   const peopleBatches = new Map<number, Person[]>()
@@ -1865,7 +1875,7 @@ export async function analyzeIntel(
         const allowedPlatforms = new Set(segment.records.map((item) => item.source))
         const modelPeople = Array.isArray(payload.people) ? payload.people : []
         modelPeople.forEach((value, personIndex) => {
-          const person = normalizePerson(value as Partial<Person>, payload.model, index * 1_000 + personIndex, allowedIds, allowedPlatforms, sourceById)
+          const person = normalizePerson(value as Partial<Person>, payload.model, index * 1_000 + personIndex, allowedIds, allowedPlatforms, sourceById, coreIds)
           // A preceding overlap is context only. A new card claim must anchor
           // itself in this segment's new timeline range.
           if (!person || !person.sourceIds.some((id) => coreIds.has(id))) return
@@ -1987,16 +1997,11 @@ export async function analyzeIntel(
 
   // Requests may finish in any order. Reduce in the original plan order so
   // deduplication and the returned candidate order remain reproducible.
+  const orderedCandidates = plan.jobs.flatMap((_, index) => candidateBatches.get(index) ?? [])
+  const deduplicatedCandidates = mergeAiTaskCandidates(orderedCandidates)
+  diagnostics.rejectedDuplicate += orderedCandidates.length - deduplicatedCandidates.length
+  candidates.push(...deduplicatedCandidates)
   for (let index = 0; index < plan.jobs.length; index += 1) {
-    for (const candidate of candidateBatches.get(index) ?? []) {
-      const key = `${candidate.title.replace(/\s+/g, '').toLowerCase()}|${candidate.description.replace(/\s+/g, '').toLowerCase()}`
-      if (seen.has(key)) {
-        diagnostics.rejectedDuplicate += 1
-        continue
-      }
-      seen.add(key)
-      candidates.push(candidate)
-    }
     for (const person of peopleBatches.get(index) ?? []) {
       mergePersonResult(people, person)
     }
@@ -2219,6 +2224,10 @@ function counterpartRecords(records: IntelItem[], name: string) {
   return records.filter((item) => item.speakerRole === 'other' && item.speaker?.trim() === name)
 }
 
+function normalizedPersonName(value: string) {
+  return value.normalize('NFKC').toLocaleLowerCase('zh-CN').replace(/[\p{P}\p{S}\s]+/gu, '')
+}
+
 function mergeObservedAt(left: string | undefined, right: string | undefined, latest = false) {
   const values = [left, right].filter((value): value is string => Boolean(value))
   return values.sort((first, second) => {
@@ -2230,8 +2239,10 @@ function mergeObservedAt(left: string | undefined, right: string | undefined, la
 }
 
 function mergePersonResult(people: Person[], incoming: Person) {
-  const index = people.findIndex((person) => person.name === incoming.name
-    && (person.conversationIds ?? []).some((id) => (incoming.conversationIds ?? []).includes(id)))
+  const incomingConversationIds = new Set(incoming.conversationIds ?? [])
+  const index = people.findIndex((person) => normalizedPersonName(person.name) === normalizedPersonName(incoming.name)
+    && (person.sourceIds.some((id) => incoming.sourceIds.includes(id))
+      || (person.conversationIds ?? []).some((id) => incomingConversationIds.has(id))))
   if (index < 0) {
     people.push(incoming)
     return incoming
@@ -2432,7 +2443,7 @@ export async function analyzePeople(
       }, 0)
       let acceptedClaimCount = 0
       modelPeople.forEach((value, index) => {
-        const person = normalizePerson(value as Partial<Person>, model, offset * 1_000 + index, allowedIds, allowedPlatforms, sourceById)
+        const person = normalizePerson(value as Partial<Person>, model, offset * 1_000 + index, allowedIds, allowedPlatforms, sourceById, coreIds)
         if (!person || !person.sourceIds.some((id) => coreIds.has(id))) return
         acceptedClaimCount += person.evidence?.length ?? 0
         const fullCounterpartRecords = counterpartRecords(allConversationRecords, person.name)

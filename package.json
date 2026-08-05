@@ -1,7 +1,7 @@
 {
   "name": "theia",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Local-first personal task atlas built from user-exported conversations.",
   "author": "bakahuiii",
   "type": "module",

@@ -10,18 +10,25 @@ export function archiveConversationKey(item: IntelItem) {
 
 export function summarizeArchive(items: IntelItem[], fileCount?: number): ArchiveSummary {
   const identified = new Set<string>()
+  const conversationKinds = new Map<string, IntelItem['conversationKind']>()
   let messagesWithoutConversation = 0
   for (const item of items) {
     if (item.conversationId) identified.add(item.conversationId)
     else messagesWithoutConversation += 1
+    const key = archiveConversationKey(item)
+    const currentKind = conversationKinds.get(key)
+    if (!currentKind || currentKind === 'unknown') conversationKinds.set(key, item.conversationKind ?? 'unknown')
   }
   const fallbackConversations = new Set(items.filter((item) => !item.conversationId).map(archiveConversationKey)).size
+  const conversationKindValues = [...conversationKinds.values()]
   return {
     version: 1,
     ...(Number.isFinite(fileCount) && Number(fileCount) >= 0 ? { fileCount: Math.floor(Number(fileCount)) } : {}),
     messageCount: items.length,
     conversationCount: identified.size + fallbackConversations,
     identifiedConversationCount: identified.size,
+    directConversationCount: conversationKindValues.filter((kind) => kind === 'direct').length,
+    groupConversationCount: conversationKindValues.filter((kind) => kind === 'group').length,
     messagesWithoutConversation,
   }
 }
