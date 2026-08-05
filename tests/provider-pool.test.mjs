@@ -138,6 +138,52 @@ function createFakeProvider(name) {
   return { name, state, server }
 }
 
+function createSelfAnalysisProvider() {
+  const state = { requestBodies: [] }
+  const server = http.createServer(async (request, response) => {
+    const path = new URL(request.url, 'http://127.0.0.1').pathname
+    if (request.method === 'GET' && path === '/v1/models') {
+      sendJson(response, 200, { data: [{ id: 'test-model' }] })
+      return
+    }
+    if (request.method !== 'POST' || path !== '/v1/responses') {
+      sendJson(response, 404, { error: { message: 'not found' } })
+      return
+    }
+    const body = await readBodyText(request)
+    state.requestBodies.push(body)
+    if (body.includes('"name":"self_observations"')) {
+      sendJson(response, 200, {
+        output_text: JSON.stringify({
+          observations: [{
+            kind: 'decision',
+            text: '在这次记录中明确决定先完成材料。',
+            evidence: [{ sourceId: '1', quote: '先完成材料' }],
+          }],
+        }),
+      })
+      return
+    }
+    if (body.includes('"name":"self_period_consolidation"')) {
+      sendJson(response, 200, {
+        output_text: JSON.stringify({
+          periods: [{
+            title: '一次明确的安排',
+            paragraphs: [{ text: '该次记录中明确提出先完成材料。', observationIds: ['self-observation-test'] }],
+            themes: ['安排'],
+            professionalContexts: [],
+          }],
+          currentSummary: null,
+          limitations: [],
+        }),
+      })
+      return
+    }
+    sendJson(response, 400, { error: { message: 'unexpected self-analysis format' } })
+  })
+  return { state, server }
+}
+
 function createProtocolFallbackProvider() {
   const state = { responsesRequests: 0, chatRequests: 0, responsesCompatible: false }
   const server = http.createServer(async (request, response) => {
@@ -264,6 +310,56 @@ const analysisPayload = {
   workflows: { people: false },
   settings: { mode: 'balanced', recencyPolicy: 'balanced' },
 }
+
+test('self-analysis endpoints preserve self-only evidence references and structured paragraphs', async () => {
+  const runtimeRoot = sharedRuntimeRoot
+  const provider = createSelfAnalysisProvider()
+  let proxy
+  try {
+    const providerUrl = await listen(provider.server)
+    process.env.THEIA_RUNTIME_ROOT = runtimeRoot
+    process.env.THEIA_RELEASE_LAYOUT = '1'
+    process.env.AI_PORT = '0'
+    process.env.AI_PROVIDER_TIMEOUT_MS = '2000'
+    const { startAiProxy } = await import(`../server/index.mjs?self-analysis-test=${Date.now()}`)
+    proxy = await startAiProxy()
+    const address = proxy.address()
+    const baseUrl = `http://127.0.0.1:${address.port}`
+    const channel = await requestJson(baseUrl, '/api/ai/channels/primary', {
+      body: { name: 'Self analysis test', url: providerUrl, key: 'self-analysis-test-secret', model: 'test-model', apiMode: 'responses', maxConcurrency: 1 },
+    })
+    assert.equal(channel.response.status, 200)
+
+    const observation = await requestJson(baseUrl, '/api/ai/self/observe', {
+      body: {
+        analysisTarget: 'self',
+        conversation: { id: 'self', name: '我', kind: 'direct', totalRecords: 1, recordCount: 1, segmentIndex: 1, segmentCount: 1, coreRecordIndexes: ['1'] },
+        records: [{ id: 'self-source-1', sentAt: '2026-08-06T08:00:00.000Z', content: '我决定先完成材料。', speakerRole: 'self' }],
+        attachments: [],
+        dailyCheckins: [],
+        settings: { promptInstructions: { selfObservation: 'Use exact citations.' } },
+      },
+    })
+    assert.equal(observation.response.status, 200)
+    assert.deepEqual(observation.payload.observations[0].evidence, [{ sourceId: 'self-source-1', quote: '先完成材料' }])
+    assert.match(provider.state.requestBodies[0], /Self-authored rows/)
+    assert.doesNotMatch(provider.state.requestBodies[0], /senderDisplayName/)
+
+    const merge = await requestJson(baseUrl, '/api/ai/self/merge', {
+      body: {
+        range: { startAt: '2026-08-06T08:00:00.000Z', endAt: '2026-08-06T08:00:00.000Z' },
+        observations: [{ id: 'self-observation-test', kind: 'decision', text: '在这次记录中明确决定先完成材料。', sourceIds: ['self-source-1'], observedFrom: '2026-08-06T08:00:00.000Z', observedTo: '2026-08-06T08:00:00.000Z' }],
+        settings: { promptInstructions: { selfMerge: 'Use evidence only.' } },
+      },
+    })
+    assert.equal(merge.response.status, 200)
+    assert.deepEqual(merge.payload.periods[0].paragraphs[0].observationIds, ['self-observation-test'])
+    assert.match(provider.state.requestBodies[1], /Verified observation registry/)
+  } finally {
+    await Promise.allSettled([close(proxy), close(provider.server)])
+    await cleanupRuntimeRoot(runtimeRoot)
+  }
+})
 
 test('provider pool balances requests and isolates a failing channel', async () => {
   const runtimeRoot = sharedRuntimeRoot

@@ -79,7 +79,7 @@ export function buildConversationTimeline(items: IntelItem[]): ConversationTimel
   }).sort((left, right) => (chatTimestamp(right.lastAt ?? '') || -Infinity) - (chatTimestamp(left.lastAt ?? '') || -Infinity))
 }
 
-export function withinLastChatRange(conversation: ConversationTimeline, start: string, end: string) {
+export function withinLastChatRange(conversation: Pick<ConversationTimeline, 'lastAt'>, start: string, end: string) {
   if (!start && !end) return true
   const lastAt = chatTimestamp(conversation.lastAt ?? '')
   if (!Number.isFinite(lastAt)) return false
@@ -97,6 +97,6 @@ export function withinStrictTimeRange(item: IntelItem, start: string, end: strin
   return capturedAt >= startAt && capturedAt <= endAt
 }
 
-export function timelineBucket(conversation: ConversationTimeline) {
+export function timelineBucket(conversation: Pick<ConversationTimeline, 'lastAt'>) {
   return conversation.lastAt?.slice(0, 7) || '未记录时间'
 }

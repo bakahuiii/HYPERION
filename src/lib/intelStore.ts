@@ -15,7 +15,7 @@ let localIntelSignatures = new Map<string, string>()
 let sharedIntelSignatures: Map<string, string> | null = null
 let sharedIntelSourceFingerprint: string | null | undefined
 
-interface SharedIntelMeta {
+export interface SharedIntelMeta {
   updatedAt: string | null
   sourceFingerprint: string | null
   recordCount: number
@@ -25,13 +25,51 @@ interface SharedIntelSnapshot extends SharedIntelMeta {
   items: IntelItem[]
 }
 
+/**
+ * Small, body-free conversation metadata used by archive lists. Message text
+ * remains in the local archive until a user opens that one conversation.
+ */
+export interface ArchiveConversationPreview {
+  id?: string
+  content?: string
+  summary?: string
+  speaker?: string
+  speakerRole?: IntelItem['speakerRole']
+  messageType?: string
+  capturedAt?: string
+}
+
+export interface ArchiveConversationSummary {
+  id: string
+  name: string
+  kind: NonNullable<IntelItem['conversationKind']>
+  source: IntelItem['source']
+  recordCount: number
+  firstAt?: string
+  lastAt?: string
+  latestPreview?: ArchiveConversationPreview
+}
+
+export interface ArchiveConversationIndexPage extends SharedIntelMeta {
+  totalConversations: number
+  items: ArchiveConversationSummary[]
+  nextCursor: string | null
+}
+
+export interface ArchiveConversationRecordsPage extends SharedIntelMeta {
+  conversation: ArchiveConversationSummary | null
+  totalRecords: number
+  items: IntelItem[]
+  nextCursor: string | null
+}
+
 export interface LocalIntelSnapshot {
   updatedAt: string | null
   sourceFingerprint: string | null
   items: IntelItem[]
 }
 
-async function sharedIntelRequest<T>(path: '/api/sync/intel' | '/api/sync/intel/meta' | '/api/sync/intel/delta', method: 'GET' | 'POST' = 'GET', body?: unknown) {
+async function sharedIntelRequest<T>(path: string, method: 'GET' | 'POST' = 'GET', body?: unknown) {
   const response = await fetch(localProxyUrl(path), body === undefined ? { method, cache: 'no-store' } : {
     method,
     headers: { 'content-type': 'application/json' },
@@ -161,6 +199,60 @@ export async function loadSharedIntelMeta(): Promise<SharedIntelMeta> {
     updatedAt: typeof payload.updatedAt === 'string' ? payload.updatedAt : null,
     sourceFingerprint: typeof payload.sourceFingerprint === 'string' ? payload.sourceFingerprint : null,
     recordCount: Math.max(0, Number(payload.recordCount) || 0),
+  }
+}
+
+function archiveQuery(path: string, parameters: Record<string, string | number | undefined>) {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(parameters)) {
+    if (value === undefined || value === '') continue
+    query.set(key, String(value))
+  }
+  const encoded = query.toString()
+  return encoded ? `${path}?${encoded}` : path
+}
+
+/**
+ * Reads a bounded page of archive conversation metadata. This deliberately
+ * avoids the legacy full `/api/sync/intel` snapshot endpoint.
+ */
+export async function loadSharedIntelConversationIndex(options: { query?: string; cursor?: string; limit?: number } = {}): Promise<ArchiveConversationIndexPage> {
+  const payload = await sharedIntelRequest<ArchiveConversationIndexPage>(archiveQuery('/api/sync/intel/conversations', options))
+  return {
+    updatedAt: typeof payload.updatedAt === 'string' ? payload.updatedAt : null,
+    sourceFingerprint: typeof payload.sourceFingerprint === 'string' ? payload.sourceFingerprint : null,
+    recordCount: Math.max(0, Number(payload.recordCount) || 0),
+    totalConversations: Math.max(0, Number(payload.totalConversations) || 0),
+    items: Array.isArray(payload.items) ? payload.items.filter((item): item is ArchiveConversationSummary => Boolean(
+      item
+      && typeof item.id === 'string'
+      && typeof item.name === 'string'
+      && typeof item.source === 'string'
+      && Number.isFinite(Number(item.recordCount)),
+    )).map((item) => ({
+      ...item,
+      recordCount: Math.max(0, Math.floor(Number(item.recordCount))),
+      kind: item.kind === 'direct' || item.kind === 'group' ? item.kind : 'unknown',
+      latestPreview: item.latestPreview && typeof item.latestPreview === 'object' ? item.latestPreview : undefined,
+    })) : [],
+    nextCursor: typeof payload.nextCursor === 'string' && payload.nextCursor ? payload.nextCursor : null,
+  }
+}
+
+/** Reads one chronological archive page for the chosen conversation only. */
+export async function loadSharedIntelConversationPage(conversationId: string, options: { cursor?: string; limit?: number } = {}): Promise<ArchiveConversationRecordsPage> {
+  const path = archiveQuery(`/api/sync/intel/conversations/${encodeURIComponent(conversationId)}`, options)
+  const payload = await sharedIntelRequest<ArchiveConversationRecordsPage>(path)
+  return {
+    updatedAt: typeof payload.updatedAt === 'string' ? payload.updatedAt : null,
+    sourceFingerprint: null,
+    recordCount: 0,
+    conversation: payload.conversation && typeof payload.conversation === 'object'
+      ? { ...payload.conversation, recordCount: Math.max(0, Number(payload.conversation.recordCount) || 0) }
+      : null,
+    totalRecords: Math.max(0, Number(payload.totalRecords) || 0),
+    items: Array.isArray(payload.items) ? hydrateIntelItems(payload.items) : [],
+    nextCursor: typeof payload.nextCursor === 'string' && payload.nextCursor ? payload.nextCursor : null,
   }
 }
 

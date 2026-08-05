@@ -1,20 +1,24 @@
 import { createSeedData, seedData } from '../seed.ts'
-import type { AiAnalysisWatermarks, AiExtractionCheckpoint, AiSettings, AppData } from '../types.ts'
+import type { AiAnalysisWatermarks, AiExtractionCheckpoint, AiPromptInstructions, AiSettings, AppData } from '../types.ts'
 import { normalizeAppearance } from './appearance.ts'
 import { summarizeArchive } from './archiveSummary.ts'
 import { DEFAULT_AI_CONCURRENCY, normalizeAiConcurrency } from './aiConcurrency.ts'
+import { defaultMultiModelSettings, normalizeMultiModelSettings } from './multiModel.ts'
 import { PERSON_PORTRAIT_PIPELINE_VERSION } from './personTemporal.ts'
 import { recoverArray } from './storageRecovery.ts'
 import { APP_STORAGE_SCHEMA, unwrapAppStorage, wrapAppStorage } from './storageSchema.ts'
+import { normalizeDailyCheckIns } from './selfJournal.ts'
 
 const STORAGE_KEY = 'theia:v1'
 const STORAGE_ROLLBACK_KEY = 'theia:v1:rollback'
 
-export const defaultPromptInstructions = {
+export const defaultPromptInstructions: AiPromptInstructions = {
   task: '优先保留仍需你处理、具体可执行的安排。约见、返校、报名、缴费、回复、预约、截止事项优先；闲聊、历史通知、已过期事项不输出。',
   people: '只提取对方自己明确说过的信息。优先保留能帮助你更好相处的明确边界、沟通方式、重复偏好和长期变化。偏好要保留证据强度：单次表达只是“曾有正向评价”，不是稳定习惯或性格。',
   peopleMerge: '把已核验事实与关键互动事件整理成自然、有人味但克制的人物理解：优先写对方如何沟通、明确在意或拒绝什么、重复出现的偏好、重要的一次性事件、互动方式和有证据的变化或延续；不要写关系分数、心理诊断或武断性格标签。建议必须帮助你尊重对方选择、先确认再行动、留出拒绝空间，并且每条都能回到证据。允许使用人物底稿与日期明确的时间线注记，但必须与聊天事实分开。证据覆盖不到的方面直接省略。',
   taskGuidance: '建议要具体、尊重边界，优先给出可执行的准备、确认、倾听和备选方案。涉及他人时先保护对方选择权，避免催促、试探和操控。不足时建议优先补充时间、地点或对方当前偏好。',
+  selfObservation: 'Only extract self-authored statements that can be traced to an exact source. Preserve events, actions, expressed feelings, decisions, routines, stressors, coping, and changes without turning one moment into a stable trait or diagnosis.',
+  selfMerge: 'Write a detailed, chronological, non-diagnostic self analysis from verified observations only. Explain what happened, what I did, what I expressed, and what changed. Professional terms are optional explanatory context, never medical conclusions, and must stay tied to evidence.',
 }
 
 export const defaultAiSettings: AiSettings = {
@@ -26,6 +30,7 @@ export const defaultAiSettings: AiSettings = {
   concurrency: DEFAULT_AI_CONCURRENCY,
   feedback: [],
   promptInstructions: defaultPromptInstructions,
+  multiModel: defaultMultiModelSettings,
 }
 
 function normalizeWatermarkGroup(value: unknown) {
@@ -47,12 +52,13 @@ function normalizeAnalysisWatermarks(value: unknown): AiAnalysisWatermarks | und
 function normalizeInterruptedRun(value: unknown): AiExtractionCheckpoint | undefined {
   if (!value || typeof value !== 'object') return undefined
   const checkpoint = value as Partial<AiExtractionCheckpoint>
-  if (checkpoint.version !== 1 || !['tasks', 'people'].includes(String(checkpoint.stage))) return undefined
+  if (checkpoint.version !== 1 || !['tasks', 'people', 'self'].includes(String(checkpoint.stage))) return undefined
   const targets = {
     tasks: checkpoint.targets?.tasks === true,
     people: checkpoint.targets?.people === true,
+    self: checkpoint.targets?.self === true,
   }
-  if (!targets.tasks && !targets.people) return undefined
+  if (!targets.tasks && !targets.people && !targets.self) return undefined
   const conversationIds = Array.isArray(checkpoint.conversationIds)
     ? [...new Set(checkpoint.conversationIds.filter((id): id is string => typeof id === 'string' && id.length > 0).slice(-10_000))]
     : []
@@ -153,6 +159,7 @@ export function loadData(): AppData {
         ? 5
         : Number(parsed.peopleDismissalVersion) >= 3 ? Number(parsed.peopleDismissalVersion) : undefined,
       peopleModelVersion: 5,
+      dailyCheckins: normalizeDailyCheckIns(parsed.dailyCheckins),
       archive: parsed.archive?.version === 1 ? parsed.archive : summarizeArchive(Array.isArray(parsed.intel) ? parsed.intel : []),
       // Created candidates are a temporary review archive. Their source IDs
       // are already stored on the quest, so do not restore this duplicate list.
@@ -165,6 +172,7 @@ export function loadData(): AppData {
         concurrency: normalizeAiConcurrency(parsed.aiSettings?.concurrency),
         feedback: Array.isArray(parsed.aiSettings?.feedback) ? parsed.aiSettings.feedback.slice(-80) : [],
         promptInstructions,
+        multiModel: normalizeMultiModelSettings(parsed.aiSettings?.multiModel),
         ...(analysisWatermarks ? { analysisWatermarks } : {}),
         ...(interruptedRun ? { interruptedRun } : {}),
       },

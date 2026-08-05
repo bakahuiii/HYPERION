@@ -27,6 +27,11 @@ export interface StorageOverview {
       recordCount: number
       segmentCount: number
       updatedAt: string | null
+      integrity?: {
+        algorithm: 'sha256' | 'unknown'
+        status: 'verified' | 'recovered-unindexed' | 'legacy-pending-migration' | 'empty' | 'unverified'
+        unindexedSegmentCount: number
+      }
       migration: { state: 'pending' | 'ready' | 'failed'; migrated?: boolean; error?: string }
     }
     recovery: {

@@ -10,6 +10,7 @@ export type TimelineFilterMode = 'last-chat' | 'strict-window'
 export interface AnalysisTargets {
   tasks: boolean
   people: boolean
+  self: boolean
 }
 
 interface UseIntelAnalysisSelectionOptions {

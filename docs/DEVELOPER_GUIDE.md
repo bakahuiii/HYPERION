@@ -1,8 +1,47 @@
 # THEIA 开发者文档
 
+> 自 `0.4.2` 后，主动记录是与导入对话同等的一级数据。它服务于可回看、可校验的长期自我研究，不是被动抓取或监控能力。
+
+## 主动记录数据契约
+
+日记消息使用稳定会话 `self-journal`：`conversationKind = "direct"`、`speakerRole = "self"`、来源 `手动记录`、状态 `reviewed`。每条日记是普通 `IntelItem`，因此拥有与导入消息相同的归档、同步、浏览、删除和未来模型溯源能力。
+
+每日状态存为 `AppData.dailyCheckins`，并同时镜像成 `self-journal` 内的一条归档消息。稳定 ID 为 `self-checkin-YYYY-MM-DD`，同一天更新时替换而非追加。这样结构化字段可以用于未来趋势查询，镜像消息则保留时间线审计与证据出处。
+
+自我分析使用 `src/lib/selfJournal.ts` 的独立契约：
+
+```ts
+buildSelfAnalysisInput(items, dailyCheckins) => {
+  analysisTarget: 'self',
+  records: /* 仅 speakerRole === self，按 capturedAt 严格排序 */,
+  dailyCheckins: /* 已归一化，每天最多一条 */
+}
+```
+
+不要把它接入当前 `analyzePeople`：人物流水线只允许核验 `other` 的引文，复用会反转证据方向。`analyzeSelf()` 仅处理 `self` 记录，保留来源 ID、时间戳与版本；阶段性理解不会覆盖原始记录或被写成不可变事实。
+
+### 自我分析流水线
+
+从情报库勾选“自我”并启动提炼后，THEIA 使用如下独立流程。打开“记录”页、保存日记或查看状态快照本身不会把数据发送给模型。
+
+```text
+已确认的本人发言 + 手动日记 + 每日快照 + AI 对话导入中 isSelf=true 的消息
+  -> 按 capturedAt 合并为单一时间线
+  -> 连续时间窗：最多 56 条核心记录 / 约 6,000 字符，前置最多 8 条 overlap
+  -> /api/ai/self/observe 只提取带精确 quote 与 RecordRef 的观察
+  -> 本地恢复真实 sourceId，并核验：本人方向、连续原文、至少一条核心段引用、时间戳、非临床文本
+  -> overlap 与重试结果按 observation ID 去重并合并来源
+  -> 按自然季度、每组最多 120 条观察提交 /api/ai/self/merge
+  -> 本地仅持久化阶段叙事、主题、解释性参考和完整来源 ID；原始正文仍留在 append-only archive
+```
+
+“观察”可描述有明确来源的事件、行动、表达过的感受或想法、决定、关系互动、习惯、压力源、应对尝试、变化和不确定性；它不是诊断、人格评分、治疗建议、风险判断，也不能把一次表达升级为稳定特质。归并阶段可以在来源允许时给出解释性专业概念，但必须引用 observation ID，且在界面中固定标记为“解释性参考，非诊断”。季度中的 120 条是**单次归并请求上限，不是丢弃上限**；稠密时期会继续按时间拆组，所有已核验观察都会进入某一组。
+
+全量目录替换必须调用 `retainManualIntelRecords(imported, current)`。外部目录只对自己的导出文件有权威性，不能删除或覆盖手动日记/快照，即使发生 ID 冲突。`dailyCheckins` 纳入 lightweight shared snapshot 并按稳定 ID 三方合并；原始 `intel` 仍由 append-only archive store 保存。
+
 [简体中文](DEVELOPER_GUIDE.md) | [English](DEVELOPER_GUIDE.en.md)
 
-本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.4.2` 源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 的逐字段定义为准。
+本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.5.0` 源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 的逐字段定义为准。
 
 ## 1. 项目定位与工程边界
 
@@ -89,6 +128,23 @@ THEIA 当前是单用户、本地优先的个人现实任务图应用。用户�
 后续行只能是 `{ "op": "upsert", "item": {...} }` 或 `{ "op": "delete", "id": "..." }`。服务端在 `expectedUpdatedAt` 不匹配时返回 409，不能盲写。`/api/sync/intel/delta` 只接受 `upserts`、`deleteIds`、`sourceFingerprint` 和可选 `expectedUpdatedAt`。前端只有在已建立签名基线且变更量较小时使用 delta；否则使用全量 snapshot 兼容路径。
 
 本地浏览器缓存不是归档的权威副本。IndexedDB v2 的 `intelRecords` 以 `id` 为 keyPath，`intelMeta` 保存 `updatedAt/sourceFingerprint/recordCount/schemaVersion`；迁移时旧 `snapshots` 只读不删除，第一次成功写入后再懒升级。
+
+### 3.2 当前规模边界与处理方式
+
+以下是当前实现边界，不是“无限规模”的承诺：
+
+| 环节 | 当前行为 | 边界与处理方式 |
+| --- | --- | --- |
+| 启动 | 当本地归档索引可用且记录数超过 **25,000 条** 时，不把原始记录复制进 React 状态。 | 阈值以下仍可能走旧兼容加载；阈值以上若发现完整归档进入界面状态，应视为性能问题排查。 |
+| 会话浏览 | 列表只读取紧凑索引；打开一个会话每页加载 **250 条**，已加载行虚拟化。 | 大量会话可保持列表可用，但连续点“继续加载”仍会把该会话正文累积到浏览器页内。 |
+| 导入解析 | 大于 **1 MiB** 的 JSON/CSV/TXT 走 Worker。 | 深层或异常导出仍可能耗尽 renderer 内存；应按目录导入并保留原始导出备份。 |
+| 归档存储 | 磁盘以 append-only gzip JSONL delta 写入，使用 SHA-256 元数据与压实。 | 服务重载目前仍会重建内存 `Map`，上限仍受 Node/Electron 可用内存约束。 |
+| 提炼 | 用户触发的提炼桥接仍会为完整时间线读取所选原始归档，再生成连续分段。 | 这不是百万消息安全路径。**10 万条以上**进入高规模模式，应先跑合成基准并观察内存；**100 万条**目前只是待验证目标，不能宣称已支持。 |
+| 模型请求 | 任务默认 48 条核心记录 / 约 4,000 个紧凑字符；人物默认 320 条 / 约 24,000 个字符，均有受限 overlap。 | ensemble 的自定义 profile 只有经过对应服务实测才能放大；过长请求仍可能造成中转超时或 502。 |
+
+修改上述边界前，必须运行合成归档基准，记录冷读、提炼内存和崩溃恢复结果。下一项规模化工作是服务端按会话读取和提炼，使一次分析不再把无关的原始归档带入 renderer。
+
+仅作回归参考：2026-08-06 在 Windows x64 / Node `v24.13.0` 上运行合成 100,000 条归档、每批 5,000 条时，写入为 646 ms，冷读加校验为 646 ms，heap 为 174.7 MiB、RSS 为 345.2 MiB，首个会话页返回 160 条。它只说明这一台机器上的归档基线，不构成支持规模承诺，也不能替代真实提炼时的内存测量。
 
 ## 4. 运行拓扑
 
@@ -222,6 +278,23 @@ AppData（React 内存）
 - 设置以 URL 编码的 INI v4 保存，允许提示词包含换行和 `=`；旧 v2/v3/legacy provider 会在读取时迁移。v4 增加地图服务配置和桌面凭据引用。
 
 这不是事务数据库。若未来支持多用户、后台写入或多进程并发，应迁移到 SQLite，并为 schema、事务和备份建立正式层。
+
+### 6.4 大归档基线（开发中）
+
+`server/archiveStore.mjs` 的追加式归档本体保持 `theia-intel-archive/v1`：首段是 snapshot，之后是按稳定 `id` 写入的 upsert/delete delta，达到 compaction 阈值时先安全写入新 snapshot、更新元数据、再删除旧段并第二次更新元数据。这样任意时刻至少存在一条可重建当前状态的路径。
+
+从本开发基线起，`chat-archive.meta.json` 的 `metadataVersion: 2` 记录每个现存 gzip 段的 SHA-256、压缩大小、操作数与完整性状态。元数据是可丢失的索引缓存，不是唯一真相：缺失时从分段恢复并标记 `recovered-unindexed`；哈希不匹配时拒绝读取；无实际变化的 delta 不写新段。运行进程以文件名清单判断是否有外部进程提交了新段，未变化时复用已加载 map，避免每一次小的同步都重新解压全部段。
+
+后端现提供两级只读接口：`/api/sync/intel/conversations` 分页返回会话摘要，`/api/sync/intel/conversations/:id` 分页返回一条会话。`ConversationBrowser` 已走该路径：启动和目录浏览只保留会话 ID、名称、时间、数量及最多 420 个字符的预览；预览优先使用最后一条 `speakerRole=other` 消息，点开会话后才按 250 条一页读取正文。超过 25,000 条记录的归档在启动时不再复制到 React 状态；用户发起提炼时才按需载入归档，并保留现有的全量会话、连续分段和证据校验语义。旧 `GET /api/sync/intel` 暂时保留给兼容读取，不得用于列表渲染、shared state 或 localStorage。
+
+规模基准命令只生成临时虚构数据：
+
+```powershell
+npm run bench:archive -- --records=100000 --batch-size=5000
+npm run bench:archive -- --records=1000000 --batch-size=10000
+```
+
+记录写入耗时、冷启动读取与 hash 校验耗时、归档段数、分页首屏大小、heap 和 RSS。基准结果必须注明 Node/Electron 版本、磁盘类型、记录数和 batch 大小；不要用用户真实聊天作为可提交的基准样本。
 
 ## 7. 导入流水线
 
@@ -397,6 +470,29 @@ Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `respon
 5. 完成后释放槽位并唤醒 FIFO 等待队列。
 
 429、502、503、504、524、网络错误和超时只增加当前通道及其共享 origin 的失败计数，并触发 250 ms 起步、最多 2 秒的指数冷却。客户端随后重试 `/api/ai/analyze` 时会重新申请 lease，因此可能切到另一通道；服务端不会把一个请求广播到所有通道，也不会把上游的长 `Retry-After` 原样变成本地长时间冻结。`/api/ai/status` 的顶层 `configured` 表示“至少一条启用且有效的通道存在”，不能只反映主通道。
+
+### 9.8 多模型裁决底座（已定协议，尚未启用发包）
+
+多通道不等于多模型：现有池只把不同会话分发到可用通道提高吞吐，不会把同一段聊天广播给全部 API。`aiSettings.multiModel` 默认 `mode: 'single'`；当前提炼链路不会读取 ensemble 参与者，也不会增加任何模型请求。因此保存这份配置不会改变已经稳定的通道调度、请求大小、重试策略或额度消耗。
+
+参与者不再使用含糊的 `extractor`/`reviewer`，而是明确区分 `task-extractor`、`task-judge`、`people-claim-extractor`、`people-judge`。旧的 `{ workflow, role: 'extractor' | 'reviewer' }` 配置会确定性迁移。每个提取器绑定一个 `segmentProfileId`；profile 固定 `maxCoreRecords`、`maxCoreChars`、overlap 和可选输出 token 上限。内建 `task-standard`（48 / 4,000 / 6 / 1,000）与 `people-context`（320 / 24,000 / 16 / 3,000）保持当前已经验证过的单模型请求包络。自定义 profile 必须使用新 ID，不能悄悄把基线请求变重。
+
+人物的目标链路是 LLM-as-judge，但证据约束始终由确定性代码控制：
+
+```text
+同一个私聊会话
+  -> 每个 people-claim extractor 按自己的 profile 完整覆盖时间线
+  -> 每条 claim 只能引用其核心段中的 archive RecordRef
+  -> 每个提取器的结果各自完成 source / 发言方向 / quote 校验
+  -> 按精确 RecordRef 聚合 observation
+  -> 只按不同模型参与者计入交叉支持；同一模型 overlap 不重复加权
+  -> people-judge 只接收 observation 与引用聚类
+  -> 带 claim/source 引用的人物段落、接受项、待核实项、拒绝项
+```
+
+证据状态只使用 `single-source`、`corroborated`、`needs-review`、`rejected` 四类来源标记，绝不换算成概率或置信度分数。只有一个模型提到的内容会以 `needs-verification` 交给裁决器，而不是因其他模型没提到就消失。裁决器只能引用已提供的 claim ID/source ID，优先采用交叉支持的事实，并把短时状态与长期偏好、习惯、兴趣、边界及关系变化分开。信息覆盖边界只能进入元数据，不能污染人物刻画正文。
+
+`src/lib/multiModel.ts` 现阶段只包含配置归一化、按 profile 的纯规划、精确引用聚类、裁决输入构造和任务候选归类。接入真实 fan-out 前，必须补齐每个 pass 的任务日志、取消/重试状态、通道 usage 记账、输出 schema 校验，以及 `needs-verification` 的审核界面；不得暗中增加广播发包路径。
 
 ## 10. 人物流水线
 
@@ -612,7 +708,7 @@ node --check electron/main.mjs
 ### 18.2 打包器
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.4.2\THEIA-release-0.4.2
+node release-tools/package-release.mjs ..\staging\v0.5.0\THEIA-release-0.5.0
 ```
 
 打包器要求目标在源码目录之外且不存在，避免误覆盖。它复制必要源码、锁文件、发布文档、默认资源和虚构示例，并生成 `RELEASE_MANIFEST.json`。明确排除：
@@ -669,6 +765,7 @@ GH_TOKEN=<仅发布 GitHub Release 时使用>
 - 为地图缓存加入命中率/清理统计和显式“清空地图缓存”；
 - 增加 macOS/Linux 安装验证，以及 CI 中的 Windows EV/OV 证书签名和发布审批；
 - 为附件识别增加每个文件的运行状态、失败重试和真实 provider usage 回填；
-- 在百万级实际数据上建立导入耗时、内存峰值、归档 compaction 和恢复时间基准。
+- 用 `bench:archive` 在百万级虚构数据上建立导入耗时、内存峰值、归档 compaction 和恢复时间基准；把提炼选择与执行进一步迁到按会话服务端读取，避免用户启动一次提炼时把整份归档放入 renderer；
+- 在明确预算、日志、证据校验和人工复核 UI 完成后，才接入多模型 ensemble 的真实 fan-out。
 
 THEIA 仍是单用户本地应用，不承诺无上限规模、任意导出格式、任何公共服务 SLA 或所有 OpenAI 兼容中转完全一致。新增协议必须继续保留 0.3.0 的并发、2 秒本地退避和 502 请求稳定基线。

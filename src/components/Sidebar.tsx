@@ -1,4 +1,4 @@
-import { BookOpenText, Clock3, ListTodo, Map, RadioTower, RefreshCw, RotateCcw, Settings2, X } from 'lucide-react'
+import { BookOpenText, Clock3, ListTodo, Map, NotebookPen, RadioTower, RefreshCw, RotateCcw, Settings2, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { getAtlasQuote, type AtlasQuote } from '../lib/quotes'
 import { AvatarImage } from './AvatarImage'
@@ -9,6 +9,7 @@ const navItems: { id: ViewId; label: string; icon: typeof ListTodo }[] = [
   { id: 'timeline', label: '行程', icon: Clock3 },
   { id: 'map', label: '地图', icon: Map },
   { id: 'people', label: '人物', icon: BookOpenText },
+  { id: 'journal', label: '记录', icon: NotebookPen },
   { id: 'intel', label: '情报库', icon: RadioTower },
   { id: 'settings', label: '选项', icon: Settings2 },
 ]

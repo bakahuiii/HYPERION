@@ -7,6 +7,7 @@ const titles: Record<ViewId, { eyebrow: string; title: string }> = {
   timeline: { eyebrow: '时间与节奏', title: '行程' },
   map: { eyebrow: '地点与记忆', title: '生活地图' },
   people: { eyebrow: '关系与同行者', title: '人物' },
+  journal: { eyebrow: '当下与自我', title: '记录' },
   intel: { eyebrow: '来源与线索', title: '情报库' },
   settings: { eyebrow: '本机与模型配置', title: '选项' },
 }

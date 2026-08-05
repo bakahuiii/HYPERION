@@ -36,6 +36,7 @@ export const seedData: AppData = {
   ],
   dismissedPersonConversationIds: [],
   peopleModelVersion: 5,
+  dailyCheckins: [],
   quests: [
     {
       id: 'q-demo-campus',
@@ -189,6 +190,18 @@ export const seedData: AppData = {
       people: '只提取对方自己明确说过的信息。优先保留能帮助你更好相处的明确边界、沟通方式、重复偏好和长期变化。单次表达只能写成“曾表示”或“有过单次评价”，不能升级为稳定习惯或性格。',
       peopleMerge: '把已核验事实与关键互动事件整理成自然、有人味但克制的人物理解：优先写对方如何沟通、明确在意或拒绝什么、重复出现的偏好、重要的一次性事件、互动方式和有证据的变化或延续；不要写关系分数、心理诊断或武断性格标签。建议必须帮助你尊重对方选择、先确认再行动、留出拒绝空间，并且每条都能回到证据。可以使用你确认过的日期与时间线注记，但必须与聊天事实分开。信息不足的方面直接省略。',
       taskGuidance: '建议应具体、尊重边界，优先给出准备、确认、倾听和备选方案。涉及他人时先保护对方选择权，避免催促、试探和操控。信息不足时先建议补充时间、地点或对方当前偏好。',
+      selfObservation: 'Only extract self-authored statements that can be traced to an exact source.',
+      selfMerge: 'Write a chronological, non-diagnostic self analysis from verified observations only.',
+    },
+    multiModel: {
+      version: 1,
+      mode: 'single',
+      maxExtractorsPerConversation: 2,
+      segmentProfiles: [
+        { id: 'task-standard', maxCoreRecords: 48, maxCoreChars: 4_000, overlapRecords: 6, overlapChars: 1_000, maxOutputTokens: 3_000 },
+        { id: 'people-context', maxCoreRecords: 320, maxCoreChars: 24_000, overlapRecords: 16, overlapChars: 3_000, maxOutputTokens: 5_500 },
+      ],
+      participants: [],
     },
   },
   appearance: defaultAppearance,

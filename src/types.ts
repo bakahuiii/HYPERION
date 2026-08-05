@@ -1,4 +1,4 @@
-export type ViewId = 'quests' | 'timeline' | 'map' | 'people' | 'intel' | 'settings'
+export type ViewId = 'quests' | 'timeline' | 'map' | 'people' | 'journal' | 'intel' | 'settings'
 export type AppearanceTheme = 'verdant' | 'nocturne' | 'paper' | 'sakura'
 export type BackgroundTarget = 'app'
 export type DynamicBackgroundPreset = 'none' | 'ribbons' | 'rain' | 'scanlines' | 'constellation'
@@ -212,7 +212,7 @@ export interface IntelItem {
   summary: string
   /** Original message body from the export, without a prepended sender label. */
   content?: string
-  source: '微信导出' | 'QQ 导出' | '朋友圈导出' | '校园平台' | '本地文件' | '手动记录'
+  source: '微信导出' | 'QQ 导出' | '朋友圈导出' | '校园平台' | '本地文件' | '手动记录' | 'AI 对话导入'
   /** Relative path inside the explicitly authorized export directory. */
   sourceFile?: string
   /** Stable folder-derived key. One exported folder represents one conversation. */
@@ -230,6 +230,104 @@ export interface IntelItem {
   capturedAt: string
   status: 'new' | 'reviewed'
   aiAnalyzedAt?: string
+}
+
+export type DailyMedicationStatus = 'yes' | 'no' | 'reduced' | 'unknown'
+export type DailyAlcoholLevel = 'none' | 'low' | 'high' | 'unknown'
+
+/** A locally verifiable, non-diagnostic observation about the app user. */
+export type SelfObservationKind =
+  | 'event'
+  | 'behavior'
+  | 'emotional-state'
+  | 'cognition'
+  | 'relationship'
+  | 'decision'
+  | 'routine'
+  | 'stressor'
+  | 'coping'
+  | 'change'
+  | 'uncertainty'
+
+export interface SelfObservationEvidence {
+  sourceId: string
+  quote: string
+}
+
+export interface SelfObservation {
+  id: string
+  kind: SelfObservationKind
+  text: string
+  evidence: SelfObservationEvidence[]
+  sourceIds: string[]
+  /** Derived locally from cited archive rows. */
+  observedFrom: string
+  /** Derived locally from cited archive rows. */
+  observedTo: string
+}
+
+/** An explanatory, explicitly non-diagnostic professional concept. */
+export interface SelfAnalysisProfessionalContext {
+  term: string
+  explanation: string
+  observationIds: string[]
+  sourceIds: string[]
+}
+
+/** One readable self-analysis paragraph with explicit observation provenance. */
+export interface SelfAnalysisNarrativeBlock {
+  text: string
+  observationIds: string[]
+  sourceIds: string[]
+}
+
+export interface SelfAnalysisPeriod {
+  id: string
+  startAt: string
+  endAt: string
+  title: string
+  narrative: string
+  paragraphs: SelfAnalysisNarrativeBlock[]
+  themes: string[]
+  observationIds: string[]
+  sourceIds: string[]
+  professionalContexts: SelfAnalysisProfessionalContext[]
+}
+
+/**
+ * The latest evidence-linked interpretation of the user's own history. The
+ * archive remains authoritative; this stores only traceable period summaries.
+ */
+export interface SelfAnalysis {
+  version: 1
+  generatedAt: string
+  analysisAsOf: string
+  sourceRecordCount: number
+  sourceCheckInCount: number
+  observationCount: number
+  periods: SelfAnalysisPeriod[]
+  currentSummary?: string
+  limitations?: string[]
+  model: string
+}
+
+/**
+ * One optional daily anchor. It remains structured for trend views and is
+ * mirrored as a self-journal archive message for future self analysis.
+ */
+export interface DailyCheckIn {
+  /** Stable one-per-day key: `self-checkin-YYYY-MM-DD`. */
+  id: string
+  /** Calendar date in the user's local time zone. */
+  date: string
+  mood?: 1 | 2 | 3 | 4 | 5
+  sleepHours?: number
+  medication: DailyMedicationStatus
+  alcohol: DailyAlcoholLevel
+  mainFocus?: string
+  note?: string
+  createdAt: string
+  updatedAt: string
 }
 
 /** A lightweight description of the local raw-message archive. Raw messages stay in IndexedDB. */
@@ -277,9 +375,9 @@ export type AiFeedbackReason = 'useful' | 'expired' | 'ownership' | 'completed' 
 /** A compact, local-only checkpoint for an extraction paused by the user or an app close. */
 export interface AiExtractionCheckpoint {
   version: 1
-  /** A combined run completes tasks before beginning people extraction. */
-  stage: 'tasks' | 'people'
-  targets: { tasks: boolean; people: boolean }
+  /** A combined run completes task, people, then self analysis in order. */
+  stage: 'tasks' | 'people' | 'self'
+  targets: { tasks: boolean; people: boolean; self: boolean }
   scope: 'unprocessed' | 'new' | 'all'
   timelineMode: 'last-chat' | 'strict-window'
   timelineStart?: string
@@ -298,6 +396,8 @@ export interface AiPromptInstructions {
   people: string
   peopleMerge: string
   taskGuidance: string
+  selfObservation: string
+  selfMerge: string
 }
 
 export interface AiTaskFeedback {
@@ -313,6 +413,61 @@ export interface AiTaskFeedback {
 export interface AiAnalysisWatermarks {
   tasks?: Record<string, string>
   people?: Record<string, string>
+}
+
+export type AiMultiModelWorkflow = 'tasks' | 'people'
+
+/**
+ * A participant's purpose is explicit so a capable judge can never
+ * accidentally be scheduled as an extractor (or vice versa). The old generic
+ * `extractor` / `reviewer` values are accepted only while normalizing stored
+ * settings and are written back in one of these canonical forms.
+ */
+export type AiModelParticipantRole =
+  | 'task-extractor'
+  | 'task-judge'
+  | 'people-claim-extractor'
+  | 'people-judge'
+
+/**
+ * A bounded chronological window which an extractor model can reliably
+ * analyse. It is a capability declaration, not an estimate of model quality.
+ * Overlap is context-only and must never count as independent evidence.
+ */
+export interface AiMultiModelSegmentProfile {
+  id: string
+  maxCoreRecords: number
+  maxCoreChars: number
+  overlapRecords: number
+  overlapChars: number
+  /** Reserved for a future per-pass request budget; no current request reads it. */
+  maxOutputTokens?: number
+}
+
+/** A saved model selection for a future ensemble pass. API credentials remain channel-owned. */
+export interface AiModelParticipant {
+  id: string
+  workflow: AiMultiModelWorkflow
+  role: AiModelParticipantRole
+  channelId: string
+  model: string
+  /** Only extractors use this. Judges receive verified claims rather than raw message windows. */
+  segmentProfileId?: string
+  enabled: boolean
+}
+
+/**
+ * Single remains the default and preserves today's routing behaviour. Ensemble
+ * is opt-in: extractors propose independently, then a judge receives only
+ * deterministic, evidence-linked observations for consolidation.
+ */
+export interface AiMultiModelSettings {
+  version: 1
+  mode: 'single' | 'ensemble'
+  maxExtractorsPerConversation: number
+  /** Profiles are selected by individual extractor participants. */
+  segmentProfiles: AiMultiModelSegmentProfile[]
+  participants: AiModelParticipant[]
 }
 
 export interface AiSettings {
@@ -333,6 +488,8 @@ export interface AiSettings {
   interruptedRun?: AiExtractionCheckpoint
   /** Compact per-conversation completion markers, separated by workflow. */
   analysisWatermarks?: AiAnalysisWatermarks
+  /** Opt-in multi-model policy. Empty/single performs no extra model calls. */
+  multiModel: AiMultiModelSettings
 }
 
 export interface AiTaskCandidate {
@@ -394,6 +551,10 @@ export interface AppData {
   peopleDismissalVersion?: number
   /** Migration marker for evidence-verified model-derived people cards. */
   peopleModelVersion: 5
+  /** Optional daily state anchors, synchronized independently from raw archive rows. */
+  dailyCheckins: DailyCheckIn[]
+  /** Latest source-linked analysis of the app user's own records. */
+  selfAnalysis?: SelfAnalysis
   intel: IntelItem[]
   archive: ArchiveSummary
   aiCandidates: AiTaskCandidate[]

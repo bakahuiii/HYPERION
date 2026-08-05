@@ -304,7 +304,38 @@ THEIA 不要求固定顶层键。它递归进入对象和数组，并把上层�
 - [ ] 文件路径和会话名称不包含临时随机目录，避免重复会话。
 - [ ] 先用严格时间和单一会话做模型测试。
 
-## 10. 导出器适配建议
+## 10. AI 对话导入
+
+THEIA 可以导入你自行导出的 ChatGPT、Gemini、DeepSeek、Claude 等 AI 对话；它不会读取浏览器历史、登录态、在线账户或应用私有数据库。每一个真实对话必须放在独立目录中：
+
+```text
+聊天导出/
+└── direct/
+    └── AI/
+        └── ChatGPT/
+            └── 2026-08-06-人生讨论/
+                └── messages.json
+```
+
+`AI` 是命名空间，`ChatGPT` 是来源提供者，下一层 `2026-08-06-人生讨论` 才是会话身份。不要把同一提供者的全部对话直接放进同一个目录，否则它们会被当作同一会话。路径包含 `chatgpt`、`openai`、`deepseek`、`gemini`、`claude` 或 `ai-chat` 时，来源会标记为 `AI 对话导入`。
+
+最小可用文件：
+
+```json
+{
+  "session": { "displayName": "ChatGPT", "kind": "direct" },
+  "messages": [
+    { "formattedTime": "2026-08-06T08:00:00+08:00", "content": "我当时的想法", "isSelf": true },
+    { "formattedTime": "2026-08-06T08:01:00+08:00", "content": "模型的回复", "isSelf": false }
+  ]
+}
+```
+
+`isSelf` 必须准确：你的发言为 `true`，模型回复为 `false`。`formattedTime` 应为带完整年份的 ISO 8601 时间；没有可靠时间时可留空，但它不能参与严格时间线判断。`type`、`senderDisplayName`、头像和平台内部 ID 是可选审计信息，不是模型分析所需字段。
+
+导入后，AI 对话与微信、QQ 会话同样保留完整原文和发言方向。未来的自我分析只会读取明确为 `speakerRole: self` 的发言与主动日记，不会把 AI 回复误当成你的观点。
+
+## 11. 导出器适配建议
 
 如果要为 THEIA 编写适配器，优先输出一个规范化中间格式，而不是让 UI 继续增加平台特例：
 

@@ -6,15 +6,15 @@ THEIA is a local-first personal task-atlas application. It turns user-exported c
 
 THEIA is not a chat-client plugin. It does not bypass login systems or decrypt application databases. It reads only files deliberately selected by the user. Selected records leave the computer only after the user starts model analysis, and they are sent to the model provider configured by that user.
 
-> Current source version: `0.4.2`. Windows x64 NSIS and portable builds bundle Electron and Node.js. Tasks, settings, conversation archives, and logs are stored under `%APPDATA%\THEIA` in an installed build. Back up important data regularly.
+> Current source version: `0.5.0`. Windows x64 NSIS and portable builds bundle Electron and Node.js. Tasks, settings, conversation archives, and logs are stored under `%APPDATA%\THEIA` in an installed build. Back up important data regularly.
 
 ## Changelog
 
-**0.4.2**
+**0.5.0**
 
-- Fixed repeated portrait cancellation, portrait loss, and overlap-generated duplicates.
-- Improved temporal evidence checks and continuous natural-language portraits.
-- Reduced model payload overhead and strengthened channel, persistence, and regression reliability.
+- Added manual journal entries, daily check-ins, and AI-conversation import. A user-selected self-analysis produces source-linked longitudinal observations.
+- Moved large conversation archives to integrity-checked append-only gzip JSONL segments, with recovery, paging, and large-file parsing improvements.
+- Expanded session/channel observability and regression coverage. The multi-model adjudication data contract is present; actual multi-model fan-out is not enabled yet.
 
 See [Release Notes](docs/RELEASE_NOTES.md) for the full history.
 

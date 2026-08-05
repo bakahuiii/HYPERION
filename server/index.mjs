@@ -214,6 +214,13 @@ async function storageOverview() {
         recordCount: Number(archiveMeta?.recordCount) || 0,
         segmentCount: Number(archiveMeta?.segmentCount) || 0,
         updatedAt: archiveMeta?.updatedAt ?? null,
+        integrity: archiveMeta?.integrity && typeof archiveMeta.integrity === 'object'
+          ? {
+              algorithm: archiveMeta.integrity.algorithm === 'sha256' ? 'sha256' : 'unknown',
+              status: typeof archiveMeta.integrity.status === 'string' ? archiveMeta.integrity.status : 'unverified',
+              unindexedSegmentCount: Math.max(0, Number(archiveMeta.integrity.unindexedSegmentCount) || 0),
+            }
+          : { algorithm: 'unknown', status: 'unverified', unindexedSegmentCount: 0 },
         migration: archiveMigrationStatus,
       },
       recovery: recoveryStatus,
@@ -404,6 +411,14 @@ async function loadSharedIntelMeta() {
   return sharedIntelStore.loadMeta()
 }
 
+async function loadSharedIntelConversationIndex(options) {
+  return sharedIntelStore.loadConversationIndex(options)
+}
+
+async function loadSharedIntelConversationPage(conversationId, options) {
+  return sharedIntelStore.loadConversationPage(conversationId, options)
+}
+
 async function writeSharedIntelUnlocked(payload) {
   return sharedIntelStore.commit(payload)
 }
@@ -577,6 +592,78 @@ const taskGuidanceSchema = {
   required: ['guidance'],
 }
 
+const selfObservationSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    kind: { type: 'string', enum: ['event', 'behavior', 'emotional-state', 'cognition', 'relationship', 'decision', 'routine', 'stressor', 'coping', 'change', 'uncertainty'] },
+    text: { type: 'string' },
+    evidence: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { sourceId: { type: 'string' }, quote: { type: 'string' } },
+        required: ['sourceId', 'quote'],
+      },
+    },
+  },
+  required: ['kind', 'text', 'evidence'],
+}
+
+const selfObservationResponseSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: { observations: { type: 'array', items: selfObservationSchema } },
+  required: ['observations'],
+}
+
+const selfMergePeriodSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    title: { type: 'string' },
+    paragraphs: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          text: { type: 'string' },
+          observationIds: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['text', 'observationIds'],
+      },
+    },
+    themes: { type: 'array', items: { type: 'string' } },
+    professionalContexts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          term: { type: 'string' },
+          explanation: { type: 'string' },
+          observationIds: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['term', 'explanation', 'observationIds'],
+      },
+    },
+  },
+  required: ['title', 'paragraphs', 'themes', 'professionalContexts'],
+}
+
+const selfMergeSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    periods: { type: 'array', items: selfMergePeriodSchema },
+    currentSummary: { type: ['string', 'null'] },
+    limitations: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['periods', 'currentSummary', 'limitations'],
+}
+
 const responseFormat = {
   type: 'json_schema',
   name: 'task_candidates',
@@ -648,6 +735,30 @@ const taskGuidanceResponseFormat = {
   name: 'task_guidance',
   strict: true,
   schema: taskGuidanceSchema,
+}
+
+const selfObservationResponseFormat = {
+  type: 'json_schema',
+  name: 'self_observations',
+  strict: true,
+  schema: selfObservationResponseSchema,
+}
+
+const selfObservationChatResponseFormat = {
+  type: 'json_schema',
+  json_schema: { name: 'self_observations', strict: true, schema: selfObservationResponseSchema },
+}
+
+const selfMergeResponseFormat = {
+  type: 'json_schema',
+  name: 'self_period_consolidation',
+  strict: true,
+  schema: selfMergeSchema,
+}
+
+const selfMergeChatResponseFormat = {
+  type: 'json_schema',
+  json_schema: { name: 'self_period_consolidation', strict: true, schema: selfMergeSchema },
 }
 
 const taskGuidanceChatResponseFormat = {
@@ -808,6 +919,8 @@ function createAiSession() {
 function sessionWorkflowPath(workflow) {
   if (workflow === 'people') return '/api/ai/people'
   if (workflow === 'tasks') return '/api/ai/analyze'
+  if (workflow === 'self-observe') return '/api/ai/self/observe'
+  if (workflow === 'self-merge') return '/api/ai/self/merge'
   return ''
 }
 
@@ -1454,6 +1567,52 @@ function buildTaskGuidancePrompt(payload) {
   ].join('\n')
 }
 
+function buildSelfObservationPrompt(payload) {
+  const conversation = payload.conversation ?? {}
+  const workflowInstructions = cleanString(payload.settings?.promptInstructions?.selfObservation, 6000)
+  const compactRecords = compactModelRecords(payload.records)
+  const coreRecordIndexes = new Set((Array.isArray(conversation.coreRecordIndexes) ? conversation.coreRecordIndexes : []).map(String))
+  const checkIns = Array.isArray(payload.dailyCheckins)
+    ? payload.dailyCheckins.map((checkIn) => ({
+      id: cleanString(checkIn?.id, 120), date: cleanString(checkIn?.date, 20),
+      mood: Number.isFinite(Number(checkIn?.mood)) ? Number(checkIn.mood) : null,
+      sleepHours: Number.isFinite(Number(checkIn?.sleepHours)) ? Number(checkIn.sleepHours) : null,
+      medication: cleanString(checkIn?.medication, 24) || null,
+      alcohol: cleanString(checkIn?.alcohol, 24) || null,
+      mainFocus: cleanString(checkIn?.mainFocus, 360) || null,
+      note: cleanString(checkIn?.note, 1200) || null,
+    })).filter((checkIn) => checkIn.id && checkIn.date).slice(0, 90)
+    : []
+  return [
+    'You are extracting evidence-backed observations about the app user from their own writing. This is not diagnosis, therapy, scoring, or prediction.',
+    `This is chronological self-analysis window ${Number(conversation.segmentIndex) || 1}/${Number(conversation.segmentCount) || 1}. Rows are [RecordRef, sentAt, content, speakerRole]. Every row has been locally verified as self-authored. RecordRef is the only evidence reference you may return.`,
+    `Rows ${compactRecordRefRanges(coreRecordIndexes, compactRecords.length)} are this window's new core range. Earlier rows are overlap context only. Every observation must cite at least one core-range RecordRef.`,
+    'Extract only concrete observations that help reconstruct a life timeline: events, actions, decisions, expressed emotions or thoughts, relationship interactions, routines, stressors, coping attempts, explicit uncertainty, and clearly evidenced changes. A proposed plan, joke, isolated phrase, or one emotional moment is not a stable trait. Preserve time and uncertainty in the wording.',
+    'Each observation needs a concise Simplified-Chinese text and one or more evidence items. Each evidence quote must be an exact contiguous substring (2-180 characters) of the cited row. Cite every essential claim. If an observation cannot be expressed without adding an interpretation, omit it.',
+    'Never diagnose or label the user with a disorder, personality type, attachment style, trauma, addiction, or other clinical conclusion. Do not infer motives, hidden feelings, risk, gender, relationship status, causes of a gap in contact, or events not stated in the records. Terms such as stress, fatigue, avoidance, rumination, coping, or emotional fluctuation are allowed only as ordinary descriptive observations when the user explicitly describes the relevant experience; no medical claim follows from them.',
+    'Daily check-ins are self-authored structured anchors. They may support an observation only when the matching check-in id is also present as a row RecordRef; otherwise they are chronology context, not evidence. Do not manufacture a missing message from a snapshot.',
+    `User-editable self-observation instructions are subordinate to these evidence rules: ${workflowInstructions || 'none'}`,
+    `Structured daily check-ins in this time window: ${JSON.stringify(checkIns)}`,
+    `Self-authored rows: ${JSON.stringify(compactRecords)}`,
+    'Return exactly {"observations":[{"kind":"event","text":"...","evidence":[{"sourceId":"1","quote":"..."}]}]}. Return an empty array when nothing satisfies every requirement.',
+  ].join('\n')
+}
+
+function buildSelfMergePrompt(payload) {
+  const workflowInstructions = cleanString(payload.settings?.promptInstructions?.selfMerge, 6000)
+  return [
+    'Write a detailed, readable, chronological self-analysis from the verified observation registry below. This is a source-linked reflection, not a medical, psychological, or personality diagnosis.',
+    'Create one or more periods only when the cited observations form a coherent time range. In each narrative, explain concrete events, actions, expressed inner state, decisions, relationships, and subsequent change only when the selected observations support them. Keep past and current states distinct; do not make old evidence sound current.',
+    'Every narrative paragraph must cite its own observationIds. Do not add facts, causes, motives, traits, or details beyond that paragraph\'s cited observations. Do not write generic evidence disclaimers in a narrative. Put coverage limits only in limitations.',
+    'Professional contexts are optional explanatory vocabulary, not diagnoses. Allowed examples include coping strategy, avoidance response, rumination, sleep-related fatigue risk, social support, or decision conflict only when directly grounded. Never output clinical disorders, personality disorders, bipolarity, depression, anxiety disorder, ADHD, trauma diagnosis, addiction diagnosis, self-harm risk, medication advice, or treatment instructions. Explain the term in ordinary language and cite the observations it refers to.',
+    'A period must not claim that one observation proves a stable pattern. Describe a single occurrence as that occurrence. Use cautious language for interpretations, but write useful natural prose rather than discussing the evidence process.',
+    `User-editable self-analysis style instructions are subordinate to all source and safety rules: ${workflowInstructions || 'none'}`,
+    `Analysis range: ${JSON.stringify(payload.range ?? null)}`,
+    `Verified observation registry: ${JSON.stringify(payload.observations)}`,
+    'Return exactly {"periods":[{"title":"...","paragraphs":[{"text":"...","observationIds":["..."]}],"themes":["..."],"professionalContexts":[{"term":"...","explanation":"...","observationIds":["..."]}]}],"currentSummary":null,"limitations":[]}. currentSummary may summarize only the latest cited period; use null when not warranted.',
+  ].join('\n')
+}
+
 function attachmentContent(attachments) {
   return attachments.map((attachment) => {
     if (attachment.mimeType.startsWith('image/')) return { type: 'input_image', image_url: attachment.data, detail: 'high' }
@@ -1517,6 +1676,22 @@ function parsePersonMerge(raw) {
     if (!structured && !legacy) throw new Error('invalid shape')
     return parsed
   } catch { throw new Error('人物信息归并结果无法解析') }
+}
+
+function parseSelfObservations(raw) {
+  try {
+    const parsed = JSON.parse(raw || '{"observations":[]}')
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.observations)) throw new Error('invalid shape')
+    return parsed.observations
+  } catch { throw new Error('Self-observation result could not be parsed') }
+}
+
+function parseSelfMerge(raw) {
+  try {
+    const parsed = JSON.parse(raw || '{}')
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.periods) || !Array.isArray(parsed.limitations)) throw new Error('invalid shape')
+    return parsed
+  } catch { throw new Error('Self-analysis consolidation result could not be parsed') }
 }
 
 function restoreVerifiedActionOwner(candidates, records) {
@@ -2284,6 +2459,60 @@ async function mergePeopleWithChat(provider, model, payload, trace, signal) {
   }
 }
 
+async function observeSelfWithResponses(provider, model, payload, trace, signal) {
+  const response = await providerRequest(provider, 'responses', {
+    model,
+    input: [{ role: 'user', content: [{ type: 'input_text', text: buildSelfObservationPrompt(payload) }] }],
+    text: { format: selfObservationResponseFormat },
+    max_output_tokens: 2_400,
+  }, trace, signal)
+  return parseSelfObservations(responseOutputText(response))
+}
+
+async function observeSelfWithChat(provider, model, payload, trace, signal) {
+  const content = [{ type: 'text', text: `${buildSelfObservationPrompt(payload)}\nReturn only the requested JSON object, without Markdown.` }]
+  try {
+    const response = await providerRequest(provider, 'chat/completions', {
+      model, messages: [{ role: 'user', content }], response_format: selfObservationChatResponseFormat, max_tokens: 2_400,
+    }, trace, signal)
+    return parseSelfObservations(response?.choices?.[0]?.message?.content || '')
+  } catch (error) {
+    if (!canFallbackToJsonObject(error)) throw error
+    markProviderFallback(trace, 'chat-completions/json-schema', 'chat-completions/json-object', 'structured-output-unsupported')
+    const response = await providerRequest(provider, 'chat/completions', {
+      model, messages: [{ role: 'user', content }], response_format: { type: 'json_object' }, max_tokens: 2_400,
+    }, trace, signal)
+    return parseSelfObservations(response?.choices?.[0]?.message?.content || '')
+  }
+}
+
+async function mergeSelfWithResponses(provider, model, payload, trace, signal) {
+  const response = await providerRequest(provider, 'responses', {
+    model,
+    input: [{ role: 'user', content: [{ type: 'input_text', text: buildSelfMergePrompt(payload) }] }],
+    text: { format: selfMergeResponseFormat },
+    max_output_tokens: 3_200,
+  }, trace, signal)
+  return parseSelfMerge(responseOutputText(response))
+}
+
+async function mergeSelfWithChat(provider, model, payload, trace, signal) {
+  const content = [{ type: 'text', text: `${buildSelfMergePrompt(payload)}\nReturn only the requested JSON object, without Markdown.` }]
+  try {
+    const response = await providerRequest(provider, 'chat/completions', {
+      model, messages: [{ role: 'user', content }], response_format: selfMergeChatResponseFormat, max_tokens: 3_200,
+    }, trace, signal)
+    return parseSelfMerge(response?.choices?.[0]?.message?.content || '')
+  } catch (error) {
+    if (!canFallbackToJsonObject(error)) throw error
+    markProviderFallback(trace, 'chat-completions/json-schema', 'chat-completions/json-object', 'structured-output-unsupported')
+    const response = await providerRequest(provider, 'chat/completions', {
+      model, messages: [{ role: 'user', content }], response_format: { type: 'json_object' }, max_tokens: 3_200,
+    }, trace, signal)
+    return parseSelfMerge(response?.choices?.[0]?.message?.content || '')
+  }
+}
+
 function parseTaskGuidance(raw) {
   try {
     const parsed = JSON.parse(raw || '{}')
@@ -2446,6 +2675,126 @@ async function analyzePeopleRecords(payload, signal) {
       receivedRecordCount: payload.records.length,
       metadata: { provider: providerTraceMetadata(trace) },
     }
+  }, signal)
+}
+
+function restoreSelfObservationReferences(observations, records) {
+  const idsByReference = new Map(records.map((record, index) => [String(index + 1), String(record?.id ?? '')]))
+  return (Array.isArray(observations) ? observations : []).map((observation) => ({
+    ...observation,
+    evidence: Array.isArray(observation?.evidence)
+      ? observation.evidence.map((item) => ({ ...item, sourceId: idsByReference.get(String(item?.sourceId)) || String(item?.sourceId ?? '') }))
+      : [],
+  }))
+}
+
+function validateSelfObservationPayload(payload) {
+  validatePayload(payload)
+  if (payload.analysisTarget !== 'self') throw new Error('Self-analysis target must be explicit')
+  if (!payload.records.every((record) => record?.speakerRole === 'self')) {
+    throw new Error('Self analysis accepts only locally verified self-authored records')
+  }
+  const dailyCheckins = Array.isArray(payload.dailyCheckins)
+    ? payload.dailyCheckins.filter((item) => item && typeof item === 'object').map((item) => ({
+      id: cleanString(item.id, 120),
+      date: cleanString(item.date, 20),
+      mood: Number.isFinite(Number(item.mood)) ? Number(item.mood) : null,
+      sleepHours: Number.isFinite(Number(item.sleepHours)) ? Number(item.sleepHours) : null,
+      medication: cleanString(item.medication, 24) || null,
+      alcohol: cleanString(item.alcohol, 24) || null,
+      mainFocus: cleanString(item.mainFocus, 360) || null,
+      note: cleanString(item.note, 1200) || null,
+    })).filter((item) => item.id && /^\d{4}-\d{2}-\d{2}$/.test(item.date)).slice(0, 90)
+    : []
+  return { ...payload, dailyCheckins }
+}
+
+function validateSelfMergePayload(payload) {
+  const allowedKinds = new Set(['event', 'behavior', 'emotional-state', 'cognition', 'relationship', 'decision', 'routine', 'stressor', 'coping', 'change', 'uncertainty'])
+  const observations = Array.isArray(payload?.observations)
+    ? payload.observations.filter((item) => item && typeof item === 'object').map((item) => ({
+      id: cleanString(item.id, 160),
+      kind: allowedKinds.has(item.kind) ? item.kind : 'uncertainty',
+      text: cleanString(item.text, 600),
+      sourceIds: Array.isArray(item.sourceIds) ? [...new Set(item.sourceIds.map(String).filter(Boolean))].slice(0, 16) : [],
+      observedFrom: validIsoTimestamp(item.observedFrom),
+      observedTo: validIsoTimestamp(item.observedTo),
+    })).filter((item) => item.id && item.text && item.sourceIds.length && item.observedFrom && item.observedTo).slice(0, 180)
+    : []
+  if (!observations.length) throw new Error('Self-analysis consolidation requires verified observations')
+  const range = payload?.range && typeof payload.range === 'object'
+    ? { startAt: validIsoTimestamp(payload.range.startAt), endAt: validIsoTimestamp(payload.range.endAt) }
+    : null
+  return {
+    observations,
+    range,
+    settings: { promptInstructions: { selfMerge: cleanString(payload?.settings?.promptInstructions?.selfMerge, 6000) } },
+  }
+}
+
+async function analyzeSelfObservations(payload, signal) {
+  const normalized = validateSelfObservationPayload(payload)
+  return withProviderChannel(async (provider, lease) => {
+    const trace = createProviderTrace(provider, lease.queueWaitMs)
+    let observations
+    let apiModeUsed = provider.apiMode
+    try {
+      const preferredMode = preferredAutoMode(provider)
+      if (preferredMode === 'responses') {
+        try {
+          observations = await observeSelfWithResponses(provider, provider.model, normalized, trace, signal)
+          rememberAutoMode(provider, 'responses')
+          apiModeUsed = 'responses'
+        } catch (error) {
+          if (provider.apiMode !== 'auto' || !canFallbackToChat(error)) throw error
+          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-protocol-incompatible')
+          rememberAutoMode(provider, 'chat-completions')
+          observations = await observeSelfWithChat(provider, provider.model, normalized, trace, signal)
+          apiModeUsed = 'chat-completions'
+        }
+      } else if (preferredMode === 'chat-completions') {
+        observations = await observeSelfWithChat(provider, provider.model, normalized, trace, signal)
+        rememberAutoMode(provider, 'chat-completions')
+        apiModeUsed = 'chat-completions'
+      } else throw new Error(`Unsupported provider API mode: ${preferredMode}`)
+    } catch (error) { throw attachProviderMetadata(error, trace) }
+    return {
+      model: provider.model,
+      apiModeUsed,
+      observations: restoreSelfObservationReferences(observations, normalized.records),
+      receivedRecordCount: normalized.records.length,
+      metadata: { provider: providerTraceMetadata(trace) },
+    }
+  }, signal)
+}
+
+async function analyzeSelfMerge(payload, signal) {
+  const normalized = validateSelfMergePayload(payload)
+  return withProviderChannel(async (provider, lease) => {
+    const trace = createProviderTrace(provider, lease.queueWaitMs)
+    let result
+    let apiModeUsed = provider.apiMode
+    try {
+      const preferredMode = preferredAutoMode(provider)
+      if (preferredMode === 'responses') {
+        try {
+          result = await mergeSelfWithResponses(provider, provider.model, normalized, trace, signal)
+          rememberAutoMode(provider, 'responses')
+          apiModeUsed = 'responses'
+        } catch (error) {
+          if (provider.apiMode !== 'auto' || !canFallbackToChat(error)) throw error
+          markProviderFallback(trace, 'responses', 'chat-completions', 'responses-protocol-incompatible')
+          rememberAutoMode(provider, 'chat-completions')
+          result = await mergeSelfWithChat(provider, provider.model, normalized, trace, signal)
+          apiModeUsed = 'chat-completions'
+        }
+      } else if (preferredMode === 'chat-completions') {
+        result = await mergeSelfWithChat(provider, provider.model, normalized, trace, signal)
+        rememberAutoMode(provider, 'chat-completions')
+        apiModeUsed = 'chat-completions'
+      } else throw new Error(`Unsupported provider API mode: ${preferredMode}`)
+    } catch (error) { throw attachProviderMetadata(error, trace) }
+    return { model: provider.model, apiModeUsed, ...result, metadata: { provider: providerTraceMetadata(trace) } }
   }, signal)
 }
 
@@ -3362,6 +3711,34 @@ export const server = http.createServer(async (request, response) => {
     }
     return
   }
+  if (requestPath === '/api/sync/intel/conversations' && request.method === 'GET') {
+    try {
+      const parameters = new URL(request.url || '/', 'http://127.0.0.1').searchParams
+      sendJson(response, 200, await loadSharedIntelConversationIndex({
+        query: parameters.get('q') || '',
+        cursor: parameters.get('cursor') || '',
+        limit: parameters.get('limit') || undefined,
+      }))
+    } catch (error) {
+      sendJson(response, 500, { error: error instanceof Error ? error.message : '无法读取本机归档会话索引' })
+    }
+    return
+  }
+  const archiveConversationMatch = requestPath.match(/^\/api\/sync\/intel\/conversations\/([^/]+)$/)
+  if (archiveConversationMatch && request.method === 'GET') {
+    try {
+      const parameters = new URL(request.url || '/', 'http://127.0.0.1').searchParams
+      let conversationId
+      try { conversationId = decodeURIComponent(archiveConversationMatch[1]) } catch { conversationId = archiveConversationMatch[1] }
+      sendJson(response, 200, await loadSharedIntelConversationPage(conversationId, {
+        cursor: parameters.get('cursor') || '',
+        limit: parameters.get('limit') || undefined,
+      }))
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : '无法读取本机会话内容' })
+    }
+    return
+  }
   if (requestPath === '/api/sync/intel' && request.method === 'GET') {
     try {
       const archive = await loadSharedIntel()
@@ -3507,7 +3884,7 @@ export const server = http.createServer(async (request, response) => {
       const results = await Promise.all(entries.map(async (entry, index) => {
         const id = Number(entry?.id)
         const safeId = Number.isSafeInteger(id) ? id : index + 1
-        const path = entry?.workflow === 'people' ? '/api/ai/people' : entry?.workflow === 'tasks' ? '/api/ai/analyze' : ''
+        const path = entry?.workflow === 'people' ? '/api/ai/people' : entry?.workflow === 'tasks' ? '/api/ai/analyze' : entry?.workflow === 'self-observe' ? '/api/ai/self/observe' : entry?.workflow === 'self-merge' ? '/api/ai/self/merge' : ''
         if (!path || !entry?.payload || typeof entry.payload !== 'object') {
           return { id: safeId, ok: false, status: 400, error: '批量模型子请求无效' }
         }
@@ -3583,6 +3960,66 @@ export const server = http.createServer(async (request, response) => {
         error: cleanString(error instanceof Error ? error.message : '模型分析失败', 2_000),
       })
       sendRequestError(response, error, '模型分析失败')
+    }
+    return
+  }
+  if (request.url === '/api/ai/self/observe' && request.method === 'POST') {
+    const signal = requestAbortSignal(request, response)
+    let payload
+    let taskLog
+    const startedAt = Date.now()
+    try {
+      payload = await readBody(request)
+      taskLog = await startTaskLog('self-observation', payload)
+      const conversation = payload?.conversation ?? {}
+      logAiDebug('self_observation_started', {
+        conversationId: cleanString(conversation.id, 180) || 'self',
+        conversationName: 'self analysis', recordCount: Array.isArray(payload?.records) ? payload.records.length : 0,
+        ...segmentDebugFields(conversation),
+      })
+      const result = await analyzeSelfObservations(payload, signal)
+      logAiDebug('self_observation_succeeded', {
+        conversationId: cleanString(conversation.id, 180) || 'self',
+        conversationName: 'self analysis', recordCount: Array.isArray(payload?.records) ? payload.records.length : 0,
+        ...segmentDebugFields(conversation), model: result.model,
+        candidateCount: Array.isArray(result.observations) ? result.observations.length : 0,
+        ...providerDebugFields(result), durationMs: Date.now() - startedAt,
+      })
+      await finishTaskLog(taskLog, 'succeeded', { durationMs: Date.now() - startedAt, response: result })
+      sendJson(response, 200, result)
+    } catch (error) {
+      logAiDebug('self_observation_failed', {
+        conversationId: cleanString(payload?.conversation?.id, 180) || 'self', recordCount: Array.isArray(payload?.records) ? payload.records.length : 0,
+        status: Number(error?.status) || null, retryAfter: Number(error?.retryAfter) || null,
+        ...providerDebugFields(error), error: cleanString(error instanceof Error ? error.message : 'Self observation failed', 500), durationMs: Date.now() - startedAt,
+      })
+      await finishTaskLog(taskLog, 'failed', { durationMs: Date.now() - startedAt, status: Number(error?.status) || null, error: cleanString(error instanceof Error ? error.message : 'Self observation failed', 2_000) })
+      sendRequestError(response, error, 'Self observation failed')
+    }
+    return
+  }
+  if (request.url === '/api/ai/self/merge' && request.method === 'POST') {
+    const signal = requestAbortSignal(request, response)
+    let payload
+    let taskLog
+    const startedAt = Date.now()
+    try {
+      payload = await readBody(request)
+      taskLog = await startTaskLog('self-consolidation', payload)
+      const result = await analyzeSelfMerge(payload, signal)
+      logAiDebug('self_merge_succeeded', {
+        conversationId: 'self', candidateCount: Array.isArray(result.periods) ? result.periods.length : 0,
+        model: result.model, ...providerDebugFields(result), durationMs: Date.now() - startedAt,
+      })
+      await finishTaskLog(taskLog, 'succeeded', { durationMs: Date.now() - startedAt, response: result })
+      sendJson(response, 200, result)
+    } catch (error) {
+      logAiDebug('self_merge_failed', {
+        conversationId: 'self', status: Number(error?.status) || null, retryAfter: Number(error?.retryAfter) || null,
+        ...providerDebugFields(error), error: cleanString(error instanceof Error ? error.message : 'Self analysis consolidation failed', 500), durationMs: Date.now() - startedAt,
+      })
+      await finishTaskLog(taskLog, 'failed', { durationMs: Date.now() - startedAt, status: Number(error?.status) || null, error: cleanString(error instanceof Error ? error.message : 'Self analysis consolidation failed', 2_000) })
+      sendRequestError(response, error, 'Self analysis consolidation failed')
     }
     return
   }

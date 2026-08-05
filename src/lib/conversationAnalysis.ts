@@ -1,4 +1,4 @@
-import type { IntelItem } from '../types'
+import type { AiMultiModelSegmentProfile, IntelItem } from '../types'
 
 const HISTORY_WINDOW_MS = 61 * 24 * 60 * 60 * 1000
 // Keep each provider request well below the context/timeout edge of
@@ -18,6 +18,30 @@ const PEOPLE_SEGMENT_CORE_RECORDS = 320
 const PEOPLE_SEGMENT_CORE_CHARS = 24_000
 const PEOPLE_OVERLAP_RECORDS = 16
 const PEOPLE_OVERLAP_CHARS = 3_000
+
+/**
+ * The established single-model task window. Future ensemble participants may
+ * select another profile, but this value deliberately preserves the proven
+ * request size which avoids compatibility-relay 502s.
+ */
+export const DEFAULT_TASK_SEGMENT_PROFILE: AiMultiModelSegmentProfile = {
+  id: 'task-standard',
+  maxCoreRecords: MAX_SEGMENT_CORE_RECORDS,
+  maxCoreChars: MAX_SEGMENT_CORE_CHARS,
+  overlapRecords: MAX_OVERLAP_RECORDS,
+  overlapChars: MAX_OVERLAP_CHARS,
+  maxOutputTokens: 3_000,
+}
+
+/** Wider context is reserved for people evidence extraction, not task calls. */
+export const DEFAULT_PEOPLE_SEGMENT_PROFILE: AiMultiModelSegmentProfile = {
+  id: 'people-context',
+  maxCoreRecords: PEOPLE_SEGMENT_CORE_RECORDS,
+  maxCoreChars: PEOPLE_SEGMENT_CORE_CHARS,
+  overlapRecords: PEOPLE_OVERLAP_RECORDS,
+  overlapChars: PEOPLE_OVERLAP_CHARS,
+  maxOutputTokens: 5_500,
+}
 
 export interface ConversationAnalysisJob {
   /** Stable parent conversation ID, not a per-segment surrogate. */
@@ -200,6 +224,16 @@ export interface ConversationAnalysisPlanOptions {
   overlapChars?: number
 }
 
+/** Converts a persisted model capability profile into the existing planner contract. */
+export function analysisPlanOptionsForSegmentProfile(profile: Pick<AiMultiModelSegmentProfile, 'maxCoreRecords' | 'maxCoreChars' | 'overlapRecords' | 'overlapChars'>): ConversationAnalysisPlanOptions {
+  return {
+    coreRecords: profile.maxCoreRecords,
+    coreChars: profile.maxCoreChars,
+    overlapRecords: profile.overlapRecords,
+    overlapChars: profile.overlapChars,
+  }
+}
+
 export function buildConversationAnalysisPlan(
   items: IntelItem[],
   now = Date.now(),
@@ -242,15 +276,23 @@ export function buildConversationAnalysisPlan(
 }
 
 /**
+ * Builds a complete, deterministic coverage plan for one model capability.
+ * It is intentionally pure: callers can compare plans before making any API
+ * request, and overlap remains contextual rather than independent evidence.
+ */
+export function buildConversationAnalysisPlanForProfile(
+  items: IntelItem[],
+  profile: Pick<AiMultiModelSegmentProfile, 'maxCoreRecords' | 'maxCoreChars' | 'overlapRecords' | 'overlapChars'>,
+  now = Date.now(),
+) {
+  return buildConversationAnalysisPlan(items, now, analysisPlanOptionsForSegmentProfile(profile))
+}
+
+/**
  * Person evidence is merged after all windows have completed, so it benefits
  * from fewer, wider chronological requests. Every core record is still sent
  * exactly once; overlap is context only and is removed from coverage counts.
  */
 export function buildPeopleConversationAnalysisPlan(items: IntelItem[], now = Date.now()) {
-  return buildConversationAnalysisPlan(items, now, {
-    coreRecords: PEOPLE_SEGMENT_CORE_RECORDS,
-    coreChars: PEOPLE_SEGMENT_CORE_CHARS,
-    overlapRecords: PEOPLE_OVERLAP_RECORDS,
-    overlapChars: PEOPLE_OVERLAP_CHARS,
-  })
+  return buildConversationAnalysisPlanForProfile(items, DEFAULT_PEOPLE_SEGMENT_PROFILE, now)
 }

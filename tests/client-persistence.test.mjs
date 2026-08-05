@@ -174,7 +174,7 @@ test('retry checkpoint keeps the failed workflow stage and only failed conversat
   const checkpoint = {
     version: 1,
     stage: 'people',
-    targets: { tasks: true, people: true },
+    targets: { tasks: true, people: true, self: false },
     scope: 'all',
     timelineMode: 'last-chat',
     conversationIds: ['a', 'b', 'c'],
@@ -342,6 +342,7 @@ const shared = (overrides = {}) => ({
   dismissedPersonConversationIds: [],
   peopleDismissalVersion: 5,
   peopleModelVersion: 5,
+  dailyCheckins: [],
   aiCandidates: [],
   atlas: { categoryPositions: {} },
   ...overrides,
@@ -417,6 +418,13 @@ test('three-way shared merge does not revive a remote deletion with a stale loca
     shared({ people: [] }),
   )
   assert.deepEqual(result.people, [])
+})
+
+test('three-way shared merge retains independent daily check-ins', () => {
+  const dayOne = { id: 'self-checkin-2026-08-05', date: '2026-08-05', medication: 'no', alcohol: 'none', createdAt: '2026-08-05T12:00:00.000Z', updatedAt: '2026-08-05T12:00:00.000Z' }
+  const dayTwo = { id: 'self-checkin-2026-08-06', date: '2026-08-06', medication: 'yes', alcohol: 'low', createdAt: '2026-08-06T12:00:00.000Z', updatedAt: '2026-08-06T12:00:00.000Z' }
+  const result = mergeSharedChanges(shared(), shared({ dailyCheckins: [dayOne] }), shared({ dailyCheckins: [dayTwo] }))
+  assert.deepEqual(result.dailyCheckins, [dayOne, dayTwo])
 })
 
 test('late task guidance is rejected after task, place, or character edits', () => {

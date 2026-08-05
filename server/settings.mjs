@@ -25,6 +25,26 @@ const defaultPromptInstructions = {
   peopleMerge: '将已核验聊天事实与关键互动事件按时间线收敛成简洁的人物志：只写原文能支持的经历、明确偏好、重复互动模式、重要的一次性事件和有证据的变化或延续；单次表达保留单次强度。人物底稿也可包含你确认过的日期与时间线注记，用于解释聊天无法证明的删好友、重新添加或其他偶然节点，但必须与聊天事实分开，不能补写未知背景。证据不足时明确说明边界。',
   taskGuidance: '建议要具体、尊重边界，优先给出可执行的准备、确认和备选方案。不足时建议优先补充时间、地点或对方偏好。',
 }
+const multiModelWorkflows = new Set(['tasks', 'people'])
+const multiModelRoles = new Set(['task-extractor', 'task-judge', 'people-claim-extractor', 'people-judge', 'extractor', 'reviewer'])
+const multiModelBuiltInProfiles = [
+  { id: 'task-standard', maxCoreRecords: 48, maxCoreChars: 4_000, overlapRecords: 6, overlapChars: 1_000, maxOutputTokens: 3_000 },
+  { id: 'people-context', maxCoreRecords: 320, maxCoreChars: 24_000, overlapRecords: 16, overlapChars: 3_000, maxOutputTokens: 5_500 },
+]
+const multiModelBuiltInProfileIds = new Set(multiModelBuiltInProfiles.map((profile) => profile.id))
+const maxMultiModelParticipants = 24
+const maxMultiModelExtractors = 8
+const maxMultiModelProfiles = 16
+
+function defaultMultiModelSettings() {
+  return {
+    version: 1,
+    mode: 'single',
+    maxExtractorsPerConversation: 2,
+    segmentProfiles: multiModelBuiltInProfiles.map((profile) => ({ ...profile })),
+    participants: [],
+  }
+}
 
 function text(value, max = 2000) {
   return typeof value === 'string' ? value.trim().slice(0, max) : ''
@@ -33,6 +53,62 @@ function text(value, max = 2000) {
 function clamp(value, min, max, fallback) {
   const number = Number(value)
   return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : fallback
+}
+
+function normalizedInteger(value, min, max, fallback) {
+  const number = Math.floor(Number(value))
+  return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : fallback
+}
+
+function normalizeMultiModelProfileId(value, index) {
+  return text(value, 80).replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || `segment-profile-${index + 1}`
+}
+
+function normalizeMultiModelSegmentProfile(value, index) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const maxCoreRecords = normalizedInteger(value.maxCoreRecords, 1, 2_000, 0)
+  const maxCoreChars = normalizedInteger(value.maxCoreChars, 256, 160_000, 0)
+  if (!maxCoreRecords || !maxCoreChars) return null
+  return {
+    id: normalizeMultiModelProfileId(value.id, index),
+    maxCoreRecords,
+    maxCoreChars,
+    overlapRecords: normalizedInteger(value.overlapRecords, 0, maxCoreRecords, 0),
+    overlapChars: normalizedInteger(value.overlapChars, 0, maxCoreChars, 0),
+    ...(Number.isFinite(Number(value.maxOutputTokens)) ? { maxOutputTokens: normalizedInteger(value.maxOutputTokens, 128, 64_000, 3_000) } : {}),
+  }
+}
+
+function normalizeMultiModelProfiles(value) {
+  const profiles = multiModelBuiltInProfiles.map((profile) => ({ ...profile }))
+  const seen = new Set(profiles.map((profile) => profile.id))
+  for (const [index, item] of (Array.isArray(value) ? value : []).entries()) {
+    const profile = normalizeMultiModelSegmentProfile(item, index)
+    // Built-in profiles protect the existing, proven single-model envelope.
+    if (!profile || seen.has(profile.id) || multiModelBuiltInProfileIds.has(profile.id)) continue
+    seen.add(profile.id)
+    profiles.push(profile)
+    if (profiles.length >= maxMultiModelProfiles) break
+  }
+  return profiles
+}
+
+function multiModelRoleWorkflow(role) {
+  return role.startsWith('task-') ? 'tasks' : 'people'
+}
+
+function normalizeMultiModelRole(value, workflow) {
+  if (!multiModelRoles.has(value)) return ''
+  if (['task-extractor', 'task-judge', 'people-claim-extractor', 'people-judge'].includes(value)) {
+    return !multiModelWorkflows.has(workflow) || workflow === multiModelRoleWorkflow(value) ? value : ''
+  }
+  if (value === 'extractor') return workflow === 'tasks' ? 'task-extractor' : workflow === 'people' ? 'people-claim-extractor' : ''
+  if (value === 'reviewer') return workflow === 'tasks' ? 'task-judge' : workflow === 'people' ? 'people-judge' : ''
+  return ''
+}
+
+function defaultMultiModelProfileId(workflow) {
+  return workflow === 'people' ? 'people-context' : 'task-standard'
 }
 
 function defaultBackgrounds() {
@@ -54,6 +130,7 @@ function defaultSettings() {
       // Client-side parallelism; provider channel capacity is independent.
       concurrency: 4,
       feedback: [],
+      multiModel: defaultMultiModelSettings(),
     },
     mapSettings: { tileProvider: 'osm-de', searchProvider: 'balanced', cacheMaxMb: 128 },
     provider,
@@ -186,6 +263,35 @@ function normalizeAiCheckpoint(value) {
   }
 }
 
+export function normalizeMultiModelSettings(value) {
+  const segmentProfiles = normalizeMultiModelProfiles(value?.segmentProfiles)
+  const profiles = new Map(segmentProfiles.map((profile) => [profile.id, profile]))
+  const seen = new Set()
+  const participants = (Array.isArray(value?.participants) ? value.participants : []).flatMap((item, index) => {
+    const role = normalizeMultiModelRole(item?.role, item?.workflow)
+    const channelId = text(item?.channelId, 80)
+    const model = text(item?.model, 200)
+    if (!role || !channelId || !model) return []
+    const workflow = multiModelRoleWorkflow(role)
+    const requestedProfileId = text(item?.segmentProfileId, 80)
+    const segmentProfileId = role.endsWith('extractor')
+      ? profiles.has(requestedProfileId) ? requestedProfileId : defaultMultiModelProfileId(workflow)
+      : ''
+    const identity = `${role}\u0000${channelId}\u0000${model}`
+    if (seen.has(identity)) return []
+    seen.add(identity)
+    const id = text(item?.id, 80).replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || `model-pass-${index + 1}`
+    return [{ id, workflow, role, channelId, model, ...(segmentProfileId ? { segmentProfileId } : {}), enabled: item?.enabled !== false }]
+  }).slice(0, maxMultiModelParticipants)
+  return {
+    version: 1,
+    mode: value?.mode === 'ensemble' ? 'ensemble' : 'single',
+    maxExtractorsPerConversation: normalizedInteger(value?.maxExtractorsPerConversation, 1, maxMultiModelExtractors, 2),
+    segmentProfiles,
+    participants,
+  }
+}
+
 function normalizeAiSettings(input, fallback) {
   // Keep the local review history useful to the user. Request builders apply
   // their own much smaller model-context limit.
@@ -227,6 +333,7 @@ function normalizeAiSettings(input, fallback) {
     concurrency: Math.round(clamp(input?.concurrency, 1, 64, Math.round(clamp(fallback?.concurrency, 1, 64, 4)))),
     feedback,
     promptInstructions,
+    multiModel: normalizeMultiModelSettings(input?.multiModel),
     ...(tasksWatermarks || peopleWatermarks ? {
       analysisWatermarks: {
         ...(tasksWatermarks ? { tasks: tasksWatermarks } : {}),
@@ -368,6 +475,7 @@ function serializeSettings(settings, protectedCredentials = false) {
     `concurrency=${encode(settings.aiSettings.concurrency)}`,
     `feedback=${encode(JSON.stringify(settings.aiSettings.feedback))}`,
     `promptInstructions=${encode(JSON.stringify(settings.aiSettings.promptInstructions))}`,
+    `multiModel=${encode(JSON.stringify(settings.aiSettings.multiModel ?? defaultMultiModelSettings()))}`,
     `analysisWatermarks=${encode(JSON.stringify(settings.aiSettings.analysisWatermarks ?? null))}`,
     `lastRunAt=${encode(settings.aiSettings.lastRunAt ?? '')}`,
     `lastPeopleFollowupAt=${encode(settings.aiSettings.lastPeopleFollowupAt ?? '')}`,
@@ -419,6 +527,7 @@ function fromIni(raw) {
       concurrency: value(parsed, 'ai', 'concurrency'),
       feedback: jsonValue(parsed, 'ai', 'feedback', []),
       promptInstructions: jsonValue(parsed, 'ai', 'promptInstructions', {}),
+      multiModel: jsonValue(parsed, 'ai', 'multiModel', {}),
       analysisWatermarks: jsonValue(parsed, 'ai', 'analysisWatermarks', undefined),
       lastRunAt: value(parsed, 'ai', 'lastRunAt'),
       lastPeopleFollowupAt: value(parsed, 'ai', 'lastPeopleFollowupAt'),

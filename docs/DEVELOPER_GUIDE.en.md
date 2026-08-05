@@ -2,7 +2,7 @@
 
 [简体中文](DEVELOPER_GUIDE.md) | [English](DEVELOPER_GUIDE.en.md)
 
-This guide is for engineers who maintain, review, extend, or package THEIA. It describes source version `0.4.2` and treats `package-lock.json`, `server/index.mjs`, and the current implementation as authoritative. Planned capabilities are not described as complete. For field-level local HTTP, upstream model JSON, session batching, and log formats, use [API_PROTOCOL.md](API_PROTOCOL.md) alongside this guide.
+This guide is for engineers who maintain, review, extend, or package THEIA. It describes source version `0.5.0` and treats `package-lock.json`, `server/index.mjs`, and the current implementation as authoritative. Planned capabilities are not described as complete. For field-level local HTTP, upstream model JSON, session batching, and log formats, use [API_PROTOCOL.md](API_PROTOCOL.md) alongside this guide.
 
 ## 1. System and Engineering Boundary
 
@@ -173,6 +173,40 @@ Snapshot writes use an `updatedAt` watermark. Conflicts return 409 and the clien
 
 Do not put raw messages back into lightweight shared state. Do not rewrite the complete archive for a small directory change. Preserve old migration sources until the new schema is confirmed readable.
 
+### 6.1 Large-Archive Baseline (In Development)
+
+The append-only body remains `theia-intel-archive/v1`: an initial snapshot is followed by stable-ID upsert/delete deltas. Compaction writes a new snapshot first, records metadata, removes old segments only after that snapshot is durable, then writes final metadata. At every point there is a replayable current-state path.
+
+`chat-archive.meta.json` now carries `metadataVersion: 2`, with SHA-256, compressed byte length, operation count, and health data for every live segment. Metadata is a rebuildable index cache, not the source of truth: missing metadata is rebuilt from segments as `recovered-unindexed`; a digest mismatch stops reads; a delta with no actual change writes no empty segment. A running service compares the segment-name inventory and reuses its loaded map when it has not changed, rather than decompressing all segments for every small sync.
+
+`GET /api/sync/intel/conversations` supplies a paged conversation index and `GET /api/sync/intel/conversations/:id` supplies one paged conversation. `ConversationBrowser` now uses that surface: startup and directory browsing retain only a conversation ID, name, time range, count, and a preview capped at 420 characters. The preview prefers the final `speakerRole=other` message and falls back to the final message only when no counterpart message exists; opening a conversation reads its body in 250-record pages. Archives above 25,000 records are not copied into React state during startup. A user-started extraction loads the archive on demand while retaining the established complete-conversation, continuous-segment, and evidence-validation semantics. Legacy `GET /api/sync/intel` remains a compatibility read and must not be used for list rendering, shared state, or localStorage.
+
+Use only synthetic data for scale checks:
+
+```powershell
+npm run bench:archive -- --records=100000 --batch-size=5000
+npm run bench:archive -- --records=1000000 --batch-size=10000
+```
+
+Record write time, cold read plus digest verification, segment count, first-page size, heap, and RSS together with the Node/Electron version and storage medium. Never commit a benchmark fixture based on a personal archive.
+
+### 6.2 Operational Scale Boundaries
+
+These are implementation boundaries, not promises of unlimited scale:
+
+| Surface | Current behavior | Practical boundary / action |
+| --- | --- | --- |
+| Startup | Archives above **25,000 records** are not copied into React state when the local archive index is available. | Below that threshold, legacy compatibility hydration may still occur. Above it, investigate any unexpected full-state load. |
+| Conversation browsing | The list reads compact server-side summaries; opening a conversation loads **250 records** per page and virtualizes the loaded rows. | The list can remain responsive with many conversations, but an individual conversation is still read into the browser page as the user continues loading. |
+| Import parsing | Files larger than **1 MiB** use the parsing Worker. | A malformed or exceptionally deep export can still exhaust browser memory; import in folders and retain the source export. |
+| Archive storage | Disk writes are append-only gzip JSONL deltas, with SHA-256 metadata and compaction. | Reload currently reconstructs an in-memory `Map`; archive size is therefore still bounded by available Node/Electron memory. |
+| Extraction | The user-started extraction bridge currently obtains the full selected archive before creating complete chronological plans. | This is not million-record-safe. Treat **100,000+ records** as a high-scale mode requiring a synthetic benchmark and memory check; **1,000,000 records** is an unverified target, not a supported claim. |
+| Model requests | Task baseline is 48 core records / ~4,000 compact characters; people baseline is 320 / ~24,000, with bounded overlap. | A custom ensemble profile may be larger only after testing that specific provider. Too-large prompts can still produce relay timeouts or 502 responses. |
+
+Before changing any boundary, run the synthetic archive benchmark, record cold-load and extraction memory, and test crash recovery. The next scalability milestone is server-side conversation-scoped extraction so a run never hydrates an unrelated raw archive in the renderer.
+
+Reference only: the synthetic 100,000-record archive benchmark recorded on 2026-08-06 with Node `v24.13.0` on Windows x64 used 5,000-record batches, wrote in 646 ms, cold-read plus verified in 646 ms, used 174.7 MiB heap / 345.2 MiB RSS, and returned a 160-record first conversation page. This is a regression reference for one machine, not a supported-scale guarantee or a substitute for extraction-memory measurement.
+
 ## 7. Import Pipeline
 
 Directory discovery is recursive and accepts supported JSON, CSV, and TXT. One folder is treated as one conversation when the exporter provides that structure. Stable IDs combine source identity and record identity so rescans update or delete authoritative records instead of accumulating duplicates.
@@ -208,25 +242,49 @@ Long-running callbacks read current state through refs or functional updates. Ca
 
 The service validates provider selection, model, API mode, prompt templates, record shapes, output schema, evidence ranges, and response size before forwarding. Provider keys never enter debug logs. Full work-unit logs are sensitive because prompts and responses may contain complete conversation text.
 
-### 9.3 Prompt hierarchy
+### 9.3 Multi-Model Adjudication Foundation (Planned, Not Enabled)
+
+Multiple provider channels are throughput capacity, not an instruction to broadcast one conversation to every model. `aiSettings.multiModel` defaults to `mode: 'single'`; the current extraction route neither reads ensemble participants nor makes additional calls. Saving this configuration is therefore safe and does not change the established provider-pool routing, request envelope, retry policy, or quota use.
+
+The stored contract uses explicit roles rather than generic "extractor" and "reviewer": `task-extractor`, `task-judge`, `people-claim-extractor`, and `people-judge`. Old `{ workflow, role: 'extractor' | 'reviewer' }` values are migrated deterministically. Every extractor declares a `segmentProfileId`; a profile fixes `maxCoreRecords`, `maxCoreChars`, overlap limits, and an optional output-token budget. Built-in `task-standard` (48/4,000/6/1,000) and `people-context` (320/24,000/16/3,000) profiles preserve the currently proven single-model envelopes. A custom profile must use a new ID, so it cannot silently make the baseline request heavier.
+
+The planned people pipeline is LLM-as-judge, but its evidence rules are deterministic:
+
+```text
+one direct conversation
+  -> each people-claim extractor receives complete chronological coverage
+     using its own declared segment profile
+  -> each claim cites only a core archive RecordRef
+  -> source/speaker/quote validation happens per extractor result
+  -> observations are grouped by exact cited RecordRef
+  -> distinct model participants, not overlap windows, determine corroboration
+  -> a people-judge receives observations + citation clusters only
+  -> cited portrait blocks, accepted claims, needs-verification claims, rejected claims
+```
+
+Evidence states are categorical: `single-source`, `corroborated`, `needs-review`, and `rejected`. They are provenance labels, not probability or confidence scores. A one-model observation remains visible to the judge as `needs-verification`; it is not silently deleted merely because another model missed it. The judge may only cite provided claim IDs and source IDs, must prefer corroborated evidence, and must keep transient states separate from durable traits, habits, interests, boundaries, and relationship changes. Coverage limitations belong in metadata, never in portrait prose.
+
+`src/lib/multiModel.ts` currently contains only normalization, profile-aware deterministic planning, exact-citation clustering, judge-input construction, and task-candidate grouping. Before real fan-out is enabled, implementation must add per-pass work logs, cancellation/retry state, provider usage accounting, output-schema validation, and a review UI for `needs-verification` claims. Do not add a hidden broadcast path.
+
+### 9.4 Prompt hierarchy
 
 System safety and evidence rules are stable prefixes. User-editable task, person-evidence, person-merge, and guidance prompts are separate settings. Dynamic feedback, time ranges, and records are appended after stable instructions to improve provider-side prompt caching.
 
 Task prompts must explicitly require speaker-direction fidelity, target/source time separation, actionable relevance, expiration handling, concise summaries instead of raw quotation, and no fabricated time or place.
 
-### 9.4 Structured output and fallback
+### 9.5 Structured output and fallback
 
 Responses API and Chat Completions use strict JSON schema where supported. A 502, timeout, or network failure does not automatically duplicate a large request through another API mode. Mode fallback occurs only when endpoint or structured-output incompatibility is explicitly detected.
 
 Candidate validation rejects missing evidence, mismatched conversations, impossible speaker references, unparseable target times, and unsupported fields. User-visible confidence scores are not used as a substitute for validation.
 
-### 9.5 Provider pool
+### 9.6 Provider pool
 
 Each provider channel has an independent URL, key reference, model, API mode, enabled flag, and concurrency limit. Global concurrency is bounded separately. Scheduler capacity is the minimum of global analysis concurrency, healthy channel capacity, and effective shared-origin capacity.
 
 Channels pointing to the same origin are not guaranteed independent upstream capacity. 429, 502, 503, 504, 524, network failure, and timeout use a short local retry delay capped at two seconds in the established stable baseline. Failed work remains recoverable in the session; results use acknowledgement semantics so a transient polling-response loss does not discard completed provider work.
 
-### 9.6 End-to-end task flow
+### 9.7 End-to-end task flow
 
 ```text
 exported files
@@ -386,8 +444,8 @@ Additional desired coverage includes person claim validation and same-name conve
 ### 18.2 Source and portable packages
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.4.2\THEIA-release-0.4.2
-npm run dist:exe -- ..\staging\v0.4.2\THEIA-0.4.2-portable
+node release-tools/package-release.mjs ..\staging\v0.5.0\THEIA-release-0.5.0
+npm run dist:exe -- ..\staging\v0.5.0\THEIA-0.5.0-portable
 ```
 
 The source packager refuses an existing destination and excludes conversations, tasks, people, places, candidates, keys, provider settings, browser/Electron profiles, logs, downloaded avatars, custom backgrounds, dependencies, builds, caches, and Git metadata. It includes source, lockfiles, canonical documentation, neutral assets, fictional examples, and a manifest.
@@ -424,7 +482,52 @@ The repository must never store signing certificates, passwords, or access token
 
 Avoid `JSON.parse(JSON.stringify(...))` for domain cloning. It silently loses dates and `undefined` and duplicates large arrays. Do not read stale React state inside multi-minute model callbacks.
 
-## 20. Known Risks and Priorities
+## 20. Self-Authored Longitudinal Inputs
+
+THEIA's archive is not limited to imported conversations. A user-authored entry is first-class local data, intended to make later longitudinal self-research possible without turning the product into passive surveillance.
+
+There are three deliberately separate inputs:
+
+| Input | Storage | Authoritative time | Purpose |
+| --- | --- | --- | --- |
+| Journal message | `IntelItem` in `self-journal` | save timestamp | low-friction free text |
+| Daily check-in | `AppData.dailyCheckins` plus one mirrored `IntelItem` | selected local calendar day | queryable state anchor |
+| AI conversation import | normal imported `IntelItem` rows | exporter timestamp | preserve user speech beside other conversations |
+
+The journal contract is stable: `conversationId = "self-journal"`, `conversationKind = "direct"`, `speakerRole = "self"`, source `手动记录`, and status `reviewed`. A daily check-in has exactly one stable ID per day, `self-checkin-YYYY-MM-DD`. Updating the same day replaces the corresponding archive row rather than appending duplicate state snapshots. This dual representation is intentional: structured check-ins support future trend queries, while the mirrored archive row preserves chronological auditability and evidence provenance.
+
+`src/lib/selfJournal.ts` owns normalization, archive-row creation, manual-record retention, and the future analysis contract:
+
+```ts
+buildSelfAnalysisInput(items, dailyCheckins) => {
+  analysisTarget: 'self',
+  records: /* all and only speakerRole === 'self', chronological */,
+  dailyCheckins: /* normalized, one per local day */
+}
+```
+
+This is not a shortcut into `analyzePeople`. The people pipeline intentionally validates counterpart (`other`) quotations, so applying it to the user would invert evidence direction and produce invalid claims. The implemented `analyzeSelf()` workflow accepts only `self` records, preserves timestamps and source IDs, distinguishes observation from inference, and never replaces raw messages with a life-stage interpretation.
+
+### 20.1 Implemented Self-Analysis Pipeline
+
+The user starts this flow explicitly from the Intel view by selecting `self`. Opening Journal, writing a journal entry, or saving a check-in does not send data to a model.
+
+```text
+verified self-authored messages + journal + daily check-ins + imported AI user messages
+  -> one capturedAt-ordered timeline
+  -> continuous windows: at most 56 core rows / about 6,000 characters, with up to 8 preceding overlap rows
+  -> /api/ai/self/observe returns only exact-quote, RecordRef-linked observations
+  -> client restores source IDs and validates direction, contiguous quote, core-range citation, timestamp, and non-clinical text
+  -> overlap/retry observations are deduplicated with merged provenance
+  -> chronological quarterly groups, at most 120 observations per merge request
+  -> /api/ai/self/merge returns source-linked periods; only summaries and complete source IDs persist
+```
+
+An observation may cover a cited event, action, expressed emotion or thought, decision, relationship interaction, routine, stressor, coping attempt, change, or uncertainty. It is not a diagnosis, personality score, treatment recommendation, risk label, hidden-motive inference, or a conversion of one statement into a durable trait. A merge may include an explanatory professional context only when its observation IDs support it; the UI labels it explicitly as non-diagnostic. The 120-observation boundary is a per-request envelope, not a discard limit: dense periods are split chronologically and every verified observation is assigned to a group.
+
+Directory replacement imports must use `retainManualIntelRecords(imported, current)`. An external directory is authoritative for its own exported files only; it must never delete or overwrite `self-journal` rows, including on an accidental ID collision. `dailyCheckins` belongs to lightweight shared state and is merged per stable ID; raw `intel` remains in the append-only archive store.
+
+## 21. Known Risks and Priorities
 
 Version `0.4.2` adds compact model payloads, conversation-level counterpart identity, temporal evidence boundaries, meaningful person events, structured continuous portraits, and more resilient multi-channel recovery. Portrait consolidation starts only after evidence extraction completes, preventing repeated segment-driven cancellation; portrait versioning, persistence, and server logging now advance together so older prose is safely regenerated.
 
@@ -435,6 +538,8 @@ Remaining priorities include:
 - add macOS/Linux packaging validation and signed Windows CI with human publication approval;
 - add per-attachment execution state, retry, and actual provider usage reconciliation;
 - benchmark million-record import time, memory peak, archive compaction, and recovery;
+- establish repeatable synthetic million-record benchmarks with `bench:archive`, then move extraction selection and execution to conversation-scoped server reads so one user-started run does not hydrate a whole archive in the renderer;
+- enable real multi-model fan-out only after budget, per-pass logs, evidence provenance, and human review UI are in place;
 - evolve the data model from current-task snapshots toward revision-aware longitudinal observations, inferences, reflections, and life-stage transitions.
 
 THEIA remains a single-user local application. It does not promise unbounded scale, every export format, public-service availability, or identical behavior from every OpenAI-compatible relay. New protocol work must preserve the established stable provider baseline while moving the system toward its longitudinal self-research purpose.

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
@@ -57,6 +57,85 @@ test('delta commits append only changed records and preserve deletions', async (
   assert.equal(second.recordCount, 1)
   assert.deepEqual((await scope.store.loadSnapshot()).items, [{ id: 'a', content: 'updated' }])
   assert.equal((await readdir(scope.directory)).filter((name) => name.endsWith('.jsonl.gz')).length, 2)
+})
+
+test('unchanged delta is a no-op and does not create an empty archive segment', async (t) => {
+  const scope = await fixture({ compactionSegments: 20 })
+  t.after(() => rm(scope.root, { recursive: true, force: true }))
+  const first = await scope.store.commit({ items: [{ id: 'a', content: 'one' }], sourceFingerprint: 'v1' })
+  const repeated = await scope.store.commitDelta({
+    expectedUpdatedAt: first.updatedAt,
+    upserts: [{ id: 'a', content: 'one' }],
+    deleteIds: ['missing', 'a'],
+    sourceFingerprint: 'v1',
+  })
+  assert.deepEqual(repeated, first)
+  assert.equal((await readdir(scope.directory)).filter((name) => name.endsWith('.jsonl.gz')).length, 1)
+})
+
+test('archive rebuilds its checksum index when metadata is absent', async (t) => {
+  const scope = await fixture({ compactionSegments: 20 })
+  t.after(() => rm(scope.root, { recursive: true, force: true }))
+  await scope.store.commit({ items: [{ id: 'a', content: 'one' }] })
+  await unlink(scope.metadataPath)
+  const recovered = createAppendOnlyArchiveStore({
+    directory: scope.directory,
+    metadataPath: scope.metadataPath,
+    legacyCompressedPath: scope.legacyCompressedPath,
+    legacyJsonPath: scope.legacyJsonPath,
+    compactionSegments: 20,
+  })
+  const recoveredMeta = await recovered.loadMeta()
+  assert.equal(recoveredMeta.integrity.status, 'recovered-unindexed')
+  await recovered.commitDelta({ upserts: [{ id: 'b', content: 'two' }], deleteIds: [] })
+  const verified = await recovered.verifyIntegrity()
+  assert.equal(verified.integrity.status, 'verified')
+  assert.deepEqual((await recovered.loadSnapshot()).items, [{ id: 'a', content: 'one' }, { id: 'b', content: 'two' }])
+})
+
+test('checksum index detects a valid-looking but replaced segment before serving data', async (t) => {
+  const scope = await fixture({ compactionSegments: 20 })
+  t.after(() => rm(scope.root, { recursive: true, force: true }))
+  await scope.store.commit({ items: [{ id: 'a', content: 'one' }] })
+  const name = (await readdir(scope.directory)).find((entry) => entry.endsWith('.jsonl.gz'))
+  assert.ok(name)
+  // This remains valid gzip and JSONL, so a checksum is needed to distinguish
+  // an unexpected replacement from ordinary compression corruption.
+  await writeFile(join(scope.directory, name), gzipSync(Buffer.from([
+    JSON.stringify({ schema: ARCHIVE_STORE_SCHEMA, schemaVersion: 1, kind: 'snapshot', updatedAt: '2026-08-05T00:00:00.000Z', sourceFingerprint: null }),
+    JSON.stringify({ op: 'upsert', item: { id: 'a', content: 'tampered' } }),
+    '',
+  ].join('\n'))))
+  const reopened = createAppendOnlyArchiveStore({
+    directory: scope.directory,
+    metadataPath: scope.metadataPath,
+    legacyCompressedPath: scope.legacyCompressedPath,
+    legacyJsonPath: scope.legacyJsonPath,
+  })
+  await assert.rejects(reopened.loadSnapshot(), /校验和不匹配/)
+})
+
+test('conversation index and pages keep large archive reads bounded', async (t) => {
+  const scope = await fixture({ compactionSegments: 20 })
+  t.after(() => rm(scope.root, { recursive: true, force: true }))
+  await scope.store.commit({ items: [
+    { id: 'a1', source: 'wechat', conversationId: 'alice', conversationName: 'Alice', conversationKind: 'direct', capturedAt: '2026-08-01T09:00:00.000Z', speakerRole: 'other', content: 'counterpart preview' },
+    { id: 'a2', source: 'wechat', conversationId: 'alice', conversationName: 'Alice', conversationKind: 'direct', capturedAt: '2026-08-03T09:00:00.000Z', speakerRole: 'self', content: 'self last message' },
+    { id: 'b1', source: 'qq', conversationId: 'group', conversationName: 'Study group', conversationKind: 'group', capturedAt: '2026-08-02T09:00:00.000Z', content: 'group' },
+  ] })
+  const firstPage = await scope.store.loadConversationIndex({ limit: 1 })
+  assert.equal(firstPage.totalConversations, 2)
+  assert.equal(firstPage.items[0].id, 'alice')
+  assert.equal(firstPage.items[0].latestPreview.content, 'counterpart preview')
+  assert.ok(firstPage.nextCursor)
+  const secondPage = await scope.store.loadConversationIndex({ limit: 1, cursor: firstPage.nextCursor })
+  assert.deepEqual(secondPage.items.map((item) => item.id), ['group'])
+  const records = await scope.store.loadConversationPage('alice', { limit: 1 })
+  assert.equal(records.totalRecords, 2)
+  assert.deepEqual(records.items.map((item) => item.id), ['a1'])
+  assert.ok(records.nextCursor)
+  const laterRecords = await scope.store.loadConversationPage('alice', { limit: 1, cursor: records.nextCursor })
+  assert.deepEqual(laterRecords.items.map((item) => item.id), ['a2'])
 })
 
 test('legacy gzip migration keeps the rollback file and creates a v1 segment', async (t) => {

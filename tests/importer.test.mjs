@@ -60,3 +60,19 @@ test('strict directory import ignores metadata objects without message fields', 
   }), { path: '私聊/A/profile.json' })
   assert.deepEqual(records, [])
 })
+
+test('AI conversation folders keep user direction and receive the explicit AI source', async () => {
+  const records = await parseIntelFile(jsonFile('conversation.json', {
+    session: { displayName: 'ChatGPT', kind: 'direct' },
+    messages: [
+      { formattedTime: '2026-08-06T08:00:00.000Z', content: 'My question', isSelf: true },
+      { formattedTime: '2026-08-06T08:01:00.000Z', content: 'Assistant answer', isSelf: false },
+    ],
+  }), { path: 'direct/AI/ChatGPT/2026-08-06/conversation.json' })
+
+  assert.equal(records.length, 2)
+  assert.equal(records[0].source, 'AI 对话导入')
+  assert.deepEqual(records.map((item) => item.speakerRole), ['self', 'other'])
+  assert.equal(records[0].conversationKind, 'direct')
+  assert.equal(records[0].conversationId, 'folder:direct/AI/ChatGPT/2026-08-06')
+})

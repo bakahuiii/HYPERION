@@ -1,6 +1,6 @@
 # THEIA 本地 API 与模型协议参考
 
-本文是 THEIA `0.4.2` 的协议级参考，面向前端、桌面壳、第三方导出适配器、测试服务和二次开发者。它描述的是当前 `server/index.mjs` 和 `src/lib/aiClient.ts` 的实际行为，不是未来规划。
+本文是 THEIA `0.5.0` 的协议级参考，面向前端、桌面壳、第三方导出适配器、测试服务和二次开发者。它描述的是当前 `server/index.mjs` 和 `src/lib/aiClient.ts` 的实际行为，不是未来规划。
 
 协议有两个边界：
 
@@ -378,7 +378,86 @@ Cache-Control: no-store
 
 服务端只接受 registry 中存在且 `portraitEligible !== false` 的 claim ID；`temporary` 和 `filler` 永远不能进入 portrait 或 advice。`coverageNote` 是元数据，不能混进 portrait 正文。这样比生成自由文本后再做模糊匹配更容易发现幻觉。
 
-### 3.5 任务建议
+### 3.5 自我观察与阶段归并
+
+自我分析不复用人物接口。`POST /api/ai/self/observe` 只接受本地已经确认 `speakerRole = "self"` 的连续时间窗；服务端拒绝任何 `other` 或 `unknown` 行。模型侧的 `RecordRef` 是本段 1-based 短引用，响应离开服务端前会恢复为真实的本地消息 ID：
+
+```json
+{
+  "analysisTarget": "self",
+  "conversation": {
+    "id": "self",
+    "name": "我",
+    "kind": "direct",
+    "recordFormat": "self-v1",
+    "totalRecords": 1840,
+    "recordCount": 56,
+    "segmentIndex": 8,
+    "segmentCount": 33,
+    "coreRecordCount": 48,
+    "overlapRecordCount": 8,
+    "coreRecordIndexes": ["9", "10", "11"]
+  },
+  "records": [
+    {
+      "id": "local-message-91",
+      "sentAt": "2026-07-28T18:31:12.000+08:00",
+      "content": "我决定这周先把材料整理完。",
+      "speakerRole": "self"
+    }
+  ],
+  "attachments": [],
+  "dailyCheckins": [],
+  "settings": {
+    "promptInstructions": {
+      "selfObservation": "只提取可以回到本人原文核验的观察。"
+    }
+  }
+}
+```
+
+模型只返回可核验观察，不能返回自由画像：
+
+```json
+{
+  "observations": [
+    {
+      "kind": "decision",
+      "text": "在该次发言中决定本周先整理材料。",
+      "evidence": [{ "sourceId": "1", "quote": "这周先把材料整理完" }]
+    }
+  ]
+}
+```
+
+客户端会以真实归档再次核验：引用消息必须是本人发言、`quote` 必须是连续原文、至少一个引用在核心范围内，且消息时间可解析。临床诊断、人格标签、治疗建议、未记录动机/因果和风险判断不会被持久化。每日快照仅在其镜像的 `self-checkin-YYYY-MM-DD` 行确实位于本段时才能直接作为证据。
+
+`POST /api/ai/self/merge` 只接收已通过前述校验的观察，不重发原始聊天：
+
+```json
+{
+  "range": { "startAt": "2026-07-01T00:00:00.000Z", "endAt": "2026-09-30T23:59:59.999Z" },
+  "observations": [
+    {
+      "id": "self-observation-k3m",
+      "kind": "decision",
+      "text": "在该次发言中决定本周先整理材料。",
+      "sourceIds": ["local-message-91"],
+      "observedFrom": "2026-07-28T10:31:12.000Z",
+      "observedTo": "2026-07-28T10:31:12.000Z"
+    }
+  ],
+  "settings": {
+    "promptInstructions": {
+      "selfMerge": "用已核验观察写详细、按时间组织的阶段叙事。"
+    }
+  }
+}
+```
+
+响应中的每个 `period.paragraphs[].observationIds` 只能来自输入 registry；没有有效引用的段落整段被丢弃。客户端由全部段落引用本地重建 `startAt`、`endAt` 和**完整** `sourceIds`；模型给出的时间、来源或无引用内容都不被采信。`professionalContexts` 是可选解释性参考，必须列出 observation ID，且固定按非诊断显示。一个归并请求最多承载 120 条观察，超出时客户端按季度继续分组，绝不静默丢弃。
+
+### 3.6 任务建议
 
 `POST /api/ai/task-guidance`：
 
@@ -519,6 +598,8 @@ Accept: application/json
 | `GET` | `/api/sync/meta` | 读取状态时间和归档计数 |
 | `GET` | `/api/sync/intel/meta` | 读取 gzip 原始归档元数据 |
 | `GET` | `/api/sync/intel` | 读取完整原始归档 |
+| `GET` | `/api/sync/intel/conversations` | 分页读取会话索引，不返回消息正文 |
+| `GET` | `/api/sync/intel/conversations/:id` | 分页读取单一会话的原始消息 |
 | `POST` | `/api/sync/intel` | 压缩、加锁并原子写入原始归档 |
 | `POST` | `/api/sync/intel/delta` | 追加 upsert/delete 操作，不上传未变化消息 |
 
@@ -555,9 +636,65 @@ Accept: application/json
 
 服务端会先校验水位，再把操作写入 `theia-intel-archive/v1` 的 gzip JSONL delta segment。`upserts` 中的记录按稳定 `id` 覆盖，`deleteIds` 在 upsert 前执行；同一请求同时更新时以 upsert 为准。首次迁移、未知基线或大规模替换不应调用此接口，客户端会自动回退全量 snapshot。
 
+归档段本体仍保持 `theia-intel-archive/v1` 兼容格式；从本开发基线起，`chat-archive.meta.json` 额外保存 `metadataVersion: 2`、每个现存段的 SHA-256、压缩字节数、操作数和完整性状态。元数据是可重建索引，gzip JSONL 分段才是事实来源：元数据丢失时服务会重读分段并标记 `recovered-unindexed`，下一次成功写入会恢复索引；校验和不匹配会停止读取并给出明确损坏错误，绝不静默返回可能被替换的数据。没有实际 upsert/delete 或 source fingerprint 变化的 delta 是 no-op，不会额外创建空分段。
+
+### 6.1.1 大归档分页读取
+
+完整 `GET /api/sync/intel` 为旧浏览器/桌面客户端保留。新代码处理大归档时应先读取会话索引，再按需请求单个会话，避免把数十万条正文传给 renderer。
+
+```http
+GET /api/sync/intel/conversations?q=Alice&limit=120&cursor=<opaque>
+GET /api/sync/intel/conversations/direct%3Aalice?limit=200&cursor=<opaque>
+```
+
+会话索引响应只含可浏览元数据。`latestPreview` 最多保留 420 个字符，优先选取时间线上最后一条 `speakerRole=other` 消息；没有对方消息时才回退到最后一条消息。它只用于列表预览，不是模型证据：
+
+```json
+{
+  "updatedAt": "2026-08-05T14:30:00.000Z",
+  "recordCount": 273713,
+  "totalConversations": 357,
+  "items": [
+    {
+      "id": "direct:alice",
+      "name": "Alice",
+      "kind": "direct",
+      "source": "wechat",
+      "recordCount": 1024,
+      "firstAt": "2026-03-02T11:00:00.000Z",
+      "lastAt": "2026-08-05T10:00:00.000Z"
+    }
+  ],
+  "nextCursor": "eyJpZCI6ImRpcmVjdDphbGljZSIsImxhc3RBdCI6IjIwMjYtMDgtMDVUMTA6MDA6MDAuMDAwWiJ9"
+}
+```
+
+`cursor` 是不透明游标，调用者只能原样传回；`limit` 限制在 `1..500`。单会话响应的 `items` 为按消息时间升序的完整归档记录，并包含 `totalRecords`、`conversation` 和同样语义的 `nextCursor`。桌面/浏览器默认每次读取 250 条，用户继续查看时再读取下一页。该接口不改变模型输入协议；分析开始前仍按会话加载需要的连续记录。禁止在 React 顶层状态、shared snapshot 或 localStorage 中重新保存整份正文。
+
 ### 6.2 设置
 
 `GET/POST /api/settings` 读写 profile、appearance、AI settings；POST 未携带的 `mapSettings` 会保留，不会被界面设置保存覆盖。模型提示词四个字段为：`task`、`people`、`peopleMerge`、`taskGuidance`。设置文件使用 URL 编码的 INI v4；调用方不要手写 INI 覆盖整个文件，优先使用接口以保留迁移、凭据引用和归一化规则。
+
+`aiSettings.multiModel` 是已定协议、尚未启用发包的多模型策略对象。默认值为单模型，因而不会产生额外请求：
+
+```json
+{
+  "version": 1,
+  "mode": "single",
+  "maxExtractorsPerConversation": 2,
+  "segmentProfiles": [
+    { "id": "task-standard", "maxCoreRecords": 48, "maxCoreChars": 4000, "overlapRecords": 6, "overlapChars": 1000, "maxOutputTokens": 3000 },
+    { "id": "people-context", "maxCoreRecords": 320, "maxCoreChars": 24000, "overlapRecords": 16, "overlapChars": 3000, "maxOutputTokens": 5500 }
+  ],
+  "participants": []
+}
+```
+
+未来启用 `ensemble` 时，participant 只能指定已有通道 ID 与模型 ID，并声明 `workflow: tasks|people`、`role`、可选 `segmentProfileId` 和 `enabled`。规范角色是 `task-extractor`、`task-judge`、`people-claim-extractor`、`people-judge`；旧的 `extractor`/`reviewer` 只作为读取时兼容值，服务端会结合 workflow 迁移为规范角色。提取器必须绑定 profile；裁决器只接收已核验的 observation 与引用聚类，不接收整份聊天正文。
+
+profile 的 `maxCoreRecords`、`maxCoreChars`、`overlapRecords`、`overlapChars` 决定某个模型角色的连续时间线窗口；overlap 仅供上下文理解，不能作为独立证据。内建 profile 不可用同 ID 覆盖，自定义 profile 需新 ID。服务端最多保存 24 个 participant、16 个 profile，每会话最多选择 8 个 extractor，并拒绝相同 role/channel/model 的重复配置。当前稳定执行路径仍只使用通道池的既有单模型调度；保存 `ensemble` 不会自动广播请求，直到客户端显式进入后续的多模型工作流版本。
+
+人物裁决输入以精确 archive RecordRef 聚类，而不是按模型自然语言模糊相似度合并。每个引用簇的状态只能是 `single-source`、`corroborated`、`needs-review`、`rejected`；它们是来源状态，不是置信度分数。不同模型参与者引用同一消息才可形成 `corroborated`，同一参与者因 overlap 重复引用不得增加支持。最终人物段落必须带 claim ID/source ID，引入新事实或无引用段落应被确定性校验拒绝。
 
 `GET /api/storage/overview` 除 `workspace/entries` 外返回：
 
@@ -565,7 +702,7 @@ Accept: application/json
 {
   "health": {
     "sharedState": { "schema": "theia-shared-state/v1", "schemaVersion": 1, "migration": { "state": "ready", "migrated": false }, "rollbackBackups": [] },
-    "archive": { "schema": "theia-intel-archive/v1", "schemaVersion": 1, "storageEngine": "append-only-jsonl-gzip", "recordCount": 273713, "segmentCount": 3, "updatedAt": "2026-08-04T12:00:00.000Z", "migration": { "state": "ready", "migrated": false } },
+    "archive": { "schema": "theia-intel-archive/v1", "schemaVersion": 1, "storageEngine": "append-only-jsonl-gzip", "recordCount": 273713, "segmentCount": 3, "updatedAt": "2026-08-04T12:00:00.000Z", "integrity": { "algorithm": "sha256", "status": "verified", "unindexedSegmentCount": 0 }, "migration": { "state": "ready", "migrated": false } },
     "recovery": { "uncleanShutdownDetected": false },
     "rollbackCommand": "npm run data:rollback -- --latest"
   }

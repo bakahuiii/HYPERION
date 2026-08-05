@@ -399,6 +399,7 @@ function parseCsvMessages(text: string): ParsedLine[] {
 
 function inferSource(fileName: string, path = ''): IntelItem['source'] {
   const normalized = `${path}/${fileName}`.toLowerCase()
+  if (/(?:chatgpt|openai|deepseek|gemini|claude|ai[-_ ]?chat)/i.test(normalized)) return 'AI 对话导入'
   if (normalized.includes('朋友圈') || normalized.includes('moments') || normalized.includes('friendcircle')) return '朋友圈导出'
   if (normalized.includes('微信') || normalized.includes('wechat') || normalized.includes('weixin')) return '微信导出'
   if (normalized.includes('qq')) return 'QQ 导出'
@@ -414,12 +415,21 @@ function conversationContext(file: File, path?: string) {
   const groupIndex = folders.findIndex((folder) => /(群聊|群组|群消息|group|groups|chatroom)/i.test(folder))
   const directIndex = folders.findIndex((folder) => /(私聊|单聊|好友|friend|direct|personal)/i.test(folder))
   const categoryIndex = groupIndex >= 0 ? groupIndex : directIndex
+  // AI exports use one extra namespace level so the provider name is not
+  // mistaken for the actual conversation identity:
+  // direct/AI/<provider>/<conversation>/messages.json.
+  const aiRootIndex = folders.findIndex((folder) => /^(?:ai|ai[-_ ]?chat|对话ai)$/i.test(folder))
+  const hasAiConversationFolder = categoryIndex >= 0
+    && aiRootIndex === categoryIndex + 1
+    && Boolean(folders[aiRootIndex + 2])
   const fileIsGroup = /^(?:群聊|群组|群消息|group|groups|chatroom)[\s_-]*/i.test(fileStem)
   const fileIsDirect = /^(?:私聊|单聊|好友|friend|direct|personal)[\s_-]*/i.test(fileStem)
   const hasCategoryFolder = categoryIndex >= 0
   // Exports commonly place message files inside a shared data/logs subfolder.
   // The folder immediately below 群聊/私聊 is the actual conversation identity.
-  const conversationFolders = hasCategoryFolder && folders[categoryIndex + 1]
+  const conversationFolders = hasAiConversationFolder
+    ? folders.slice(0, aiRootIndex + 3)
+    : hasCategoryFolder && folders[categoryIndex + 1]
     ? folders.slice(0, categoryIndex + 2)
     : folders
   // Some exporters use flat filenames such as “私聊_Alice.json” instead of a

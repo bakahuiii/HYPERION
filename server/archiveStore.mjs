@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, unlink } from 'node:fs/promises'
 import { basename, resolve } from 'node:path'
 import { gzip, gunzip } from 'node:zlib'
@@ -11,6 +12,26 @@ const gunzipAsync = promisify(gunzip)
 export const ARCHIVE_STORE_SCHEMA = 'theia-intel-archive/v1'
 const SEGMENT_SUFFIX = '.jsonl.gz'
 const DEFAULT_COMPACTION_SEGMENTS = 24
+const ARCHIVE_METADATA_VERSION = 2
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function validChecksum(value) {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value) ? value.toLowerCase() : null
+}
+
+function segmentInfo(name, checksum, header, operationCount, byteLength) {
+  return {
+    name,
+    checksum,
+    kind: header.kind,
+    updatedAt: header.updatedAt,
+    operationCount,
+    byteLength,
+  }
+}
 
 function monotonicTimestamp(previous) {
   const previousTime = typeof previous === 'string' ? Date.parse(previous) : Number.NaN
@@ -65,10 +86,16 @@ async function readLegacyArchive(compressedPath, jsonPath) {
   }
 }
 
-async function readSegment(path) {
+async function readSegment(path, expectedChecksum = null) {
+  let bytes
   let raw
   try {
-    raw = (await gunzipAsync(await readFile(path))).toString('utf8')
+    bytes = await readFile(path)
+    const checksum = sha256(bytes)
+    if (expectedChecksum && checksum !== expectedChecksum) {
+      throw new Error(`校验和不匹配（预期 ${expectedChecksum.slice(0, 12)}，实际 ${checksum.slice(0, 12)}）`)
+    }
+    raw = (await gunzipAsync(bytes)).toString('utf8')
   } catch (error) {
     throw new Error(`原始聊天归档已损坏：分段 ${basename(path)} 无法解压（${error instanceof Error ? error.message : String(error)}）`)
   }
@@ -86,7 +113,12 @@ async function readSegment(path) {
       throw new Error(`原始聊天归档已损坏：分段 ${basename(path)} 第 ${index + 2} 行无法解析（${error instanceof Error ? error.message : String(error)}）`)
     }
   }
-  return { header, operations }
+  return {
+    header,
+    operations,
+    checksum: sha256(bytes),
+    byteLength: bytes.length,
+  }
 }
 
 function applySegment(state, segment) {
@@ -108,14 +140,111 @@ async function writeSegment(directory, sequence, header, operations) {
   const bytes = await gzipAsync(Buffer.from(`${lines.join('\n')}\n`, 'utf8'), { level: 6 })
   const name = segmentName(sequence, header.updatedAt)
   await writeFileAtomically(resolve(directory, name), bytes, { mode: 0o600 })
-  return name
+  return segmentInfo(name, sha256(bytes), header, operations.length, bytes.length)
+}
+
+async function readArchiveMetadata(path) {
+  try {
+    const value = JSON.parse(await readFile(path, 'utf8'))
+    return value && typeof value === 'object' && value.schema === ARCHIVE_STORE_SCHEMA ? value : null
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null
+    // Metadata is a cache for integrity and diagnostics. The append-only
+    // segments remain authoritative and can rebuild it after a failed write.
+    return null
+  }
+}
+
+function metadataSegments(value) {
+  if (!Array.isArray(value?.segments)) return new Map()
+  return new Map(value.segments
+    .filter((entry) => entry && typeof entry.name === 'string' && validChecksum(entry.checksum))
+    .map((entry) => [entry.name, entry]))
+}
+
+function sameNames(left, right) {
+  return left.length === right.length && left.every((name, index) => name === right[index])
+}
+
+function recordTimestamp(value) {
+  const timestamp = typeof value === 'string' ? Date.parse(value) : Number.NaN
+  return Number.isFinite(timestamp) ? timestamp : Number.NaN
+}
+
+function archiveConversationKey(item) {
+  if (typeof item?.conversationId === 'string' && item.conversationId.trim()) return item.conversationId.trim()
+  const source = typeof item?.source === 'string' && item.source.trim() ? item.source.trim() : 'unknown'
+  const month = typeof item?.capturedAt === 'string' ? item.capturedAt.match(/^\d{4}-\d{2}/)?.[0] : null
+  return `legacy:${source}:${month ?? 'undated'}`
+}
+
+function conversationPreview(item) {
+  const body = typeof item?.content === 'string' && item.content.trim()
+    ? item.content.trim()
+    : typeof item?.summary === 'string' ? item.summary.trim() : ''
+  return {
+    ...(typeof item?.id === 'string' ? { id: item.id } : {}),
+    ...(body ? { content: body.slice(0, 420) } : {}),
+    ...(typeof item?.speaker === 'string' && item.speaker.trim() ? { speaker: item.speaker.trim().slice(0, 160) } : {}),
+    ...(typeof item?.speakerRole === 'string' ? { speakerRole: item.speakerRole } : {}),
+    ...(typeof item?.messageType === 'string' && item.messageType.trim() ? { messageType: item.messageType.trim().slice(0, 80) } : {}),
+    ...(typeof item?.capturedAt === 'string' && item.capturedAt ? { capturedAt: item.capturedAt } : {}),
+  }
+}
+
+function previewIsLater(candidate, current) {
+  if (!current) return true
+  const candidateTime = recordTimestamp(candidate?.capturedAt)
+  const currentTime = recordTimestamp(current?.capturedAt)
+  if (Number.isFinite(candidateTime) && Number.isFinite(currentTime)) return candidateTime >= currentTime
+  if (Number.isFinite(candidateTime)) return true
+  if (Number.isFinite(currentTime)) return false
+  return String(candidate?.id ?? '') >= String(current?.id ?? '')
+}
+
+function compareConversation(left, right) {
+  const leftTime = recordTimestamp(left.lastAt)
+  const rightTime = recordTimestamp(right.lastAt)
+  if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return rightTime - leftTime
+  if (Number.isFinite(leftTime) !== Number.isFinite(rightTime)) return Number.isFinite(leftTime) ? -1 : 1
+  return left.id.localeCompare(right.id, 'zh-CN')
+}
+
+function compareRecord(left, right) {
+  const leftTime = recordTimestamp(left?.capturedAt)
+  const rightTime = recordTimestamp(right?.capturedAt)
+  if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime
+  if (Number.isFinite(leftTime) !== Number.isFinite(rightTime)) return Number.isFinite(leftTime) ? -1 : 1
+  return String(left?.id ?? '').localeCompare(String(right?.id ?? ''), 'zh-CN')
+}
+
+function normalizedLimit(value, fallback = 120, maximum = 500) {
+  const number = Math.floor(Number(value))
+  return Number.isFinite(number) ? Math.max(1, Math.min(maximum, number)) : fallback
+}
+
+function decodePageCursor(value) {
+  if (typeof value !== 'string' || !value.trim()) return null
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'))
+    return parsed && typeof parsed === 'object' && typeof parsed.id === 'string' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function encodePageCursor(value) {
+  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url')
 }
 
 export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCompressedPath, legacyJsonPath, compactionSegments = DEFAULT_COMPACTION_SEGMENTS }) {
   let state = null
   let knownSegments = []
+  let knownSegmentInfo = new Map()
   let sequence = 0
   let loadedFromLegacy = false
+  let integrity = { status: 'unverified', unindexedSegmentCount: 0 }
+  let conversationIndex = null
 
   async function listSegments() {
     try {
@@ -131,10 +260,20 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
 
   async function reload(force = false) {
     const names = await listSegments()
-    if (!force && state && names.length === knownSegments.length && names.every((name, index) => name === knownSegments[index])) return state
+    if (!force && state && sameNames(names, knownSegments)) return state
     const next = { updatedAt: null, sourceFingerprint: null, items: new Map() }
+    const nextSegmentInfo = new Map()
+    const metadata = await readArchiveMetadata(metadataPath)
+    const manifest = metadataSegments(metadata)
+    let unindexedSegmentCount = 0
     if (names.length) {
-      for (const name of names) applySegment(next, await readSegment(resolve(directory, name)))
+      for (const name of names) {
+        const expectedChecksum = validChecksum(manifest.get(name)?.checksum)
+        const segment = await readSegment(resolve(directory, name), expectedChecksum)
+        applySegment(next, segment)
+        nextSegmentInfo.set(name, segmentInfo(name, segment.checksum, segment.header, segment.operations.length, segment.byteLength))
+        if (!expectedChecksum) unindexedSegmentCount += 1
+      }
       loadedFromLegacy = false
     } else {
       const legacy = await readLegacyArchive(legacyCompressedPath, legacyJsonPath)
@@ -150,7 +289,12 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
     }
     state = next
     knownSegments = names
+    knownSegmentInfo = nextSegmentInfo
+    conversationIndex = null
     sequence = names.reduce((maximum, name) => Math.max(maximum, segmentNumber(name)), 0)
+    integrity = names.length
+      ? { status: unindexedSegmentCount ? 'recovered-unindexed' : 'verified', unindexedSegmentCount }
+      : { status: loadedFromLegacy ? 'legacy-pending-migration' : 'empty', unindexedSegmentCount: 0 }
     return state
   }
 
@@ -163,43 +307,57 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
       sourceFingerprint: state.sourceFingerprint,
       recordCount: state.items.size,
       segmentCount: knownSegments.length,
+      metadataVersion: ARCHIVE_METADATA_VERSION,
+      segments: knownSegments.map((name) => knownSegmentInfo.get(name)).filter(Boolean),
+      integrity: {
+        algorithm: 'sha256',
+        status: integrity.status,
+        unindexedSegmentCount: integrity.unindexedSegmentCount,
+      },
       rollbackSource: loadedFromLegacy ? legacyCompressedPath : undefined,
     }), { encoding: 'utf8', mode: 0o600 })
   }
 
   async function migrate() {
-    await reload(true)
+    await reload()
     if (!loadedFromLegacy) return false
     const updatedAt = monotonicTimestamp(state.updatedAt)
     sequence += 1
     const operations = [...state.items.values()].map((item) => ({ op: 'upsert', item }))
-    const name = await writeSegment(directory, sequence, { kind: 'snapshot', updatedAt, sourceFingerprint: state.sourceFingerprint }, operations)
-    knownSegments = [name]
+    const info = await writeSegment(directory, sequence, { kind: 'snapshot', updatedAt, sourceFingerprint: state.sourceFingerprint }, operations)
+    knownSegments = [info.name]
+    knownSegmentInfo = new Map([[info.name, info]])
     state.updatedAt = updatedAt
     loadedFromLegacy = false
+    integrity = { status: 'verified', unindexedSegmentCount: 0 }
+    conversationIndex = null
     await writeMetadata()
     return true
   }
 
   async function compact() {
-    await reload(true)
+    await reload()
     if (knownSegments.length <= 1) return false
     const oldSegments = [...knownSegments]
     const updatedAt = monotonicTimestamp(state.updatedAt)
     sequence += 1
     const operations = [...state.items.values()].map((item) => ({ op: 'upsert', item }))
-    const name = await writeSegment(directory, sequence, { kind: 'snapshot', updatedAt, sourceFingerprint: state.sourceFingerprint }, operations)
-    knownSegments = [...oldSegments, name]
+    const info = await writeSegment(directory, sequence, { kind: 'snapshot', updatedAt, sourceFingerprint: state.sourceFingerprint }, operations)
+    knownSegments = [...oldSegments, info.name]
+    knownSegmentInfo.set(info.name, info)
     state.updatedAt = updatedAt
     await writeMetadata()
     for (const oldName of oldSegments) await unlink(resolve(directory, oldName)).catch((error) => { if (error?.code !== 'ENOENT') throw error })
-    knownSegments = [name]
+    knownSegments = [info.name]
+    knownSegmentInfo = new Map([[info.name, info]])
+    integrity = { status: 'verified', unindexedSegmentCount: 0 }
+    conversationIndex = null
     await writeMetadata()
     return true
   }
 
   async function commit(payload) {
-    await reload(true)
+    await reload()
     const values = Array.isArray(payload?.items) ? payload.items : Array.isArray(payload) ? payload : null
     if (!values) throw new Error('原始聊天归档格式无效')
     if (Object.hasOwn(payload ?? {}, 'expectedUpdatedAt')) {
@@ -231,18 +389,24 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
 
     const updatedAt = monotonicTimestamp(state.updatedAt)
     const sourceFingerprint = typeof payload?.sourceFingerprint === 'string' ? payload.sourceFingerprint : null
+    if (!operations.length && sourceFingerprint === state.sourceFingerprint) {
+      return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
+    }
     sequence += 1
-    const name = await writeSegment(directory, sequence, { kind: writeSnapshot ? 'snapshot' : 'delta', updatedAt, sourceFingerprint }, operations)
-    knownSegments.push(name)
+    const info = await writeSegment(directory, sequence, { kind: writeSnapshot ? 'snapshot' : 'delta', updatedAt, sourceFingerprint }, operations)
+    knownSegments.push(info.name)
+    knownSegmentInfo.set(info.name, info)
     state = { updatedAt, sourceFingerprint, items: next }
     loadedFromLegacy = false
+    integrity = { status: 'verified', unindexedSegmentCount: 0 }
+    conversationIndex = null
     await writeMetadata()
     if (knownSegments.length >= Math.max(2, Math.floor(compactionSegments))) await compact()
     return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
   }
 
   async function commitDelta(payload) {
-    await reload(true)
+    await reload()
     const upserts = Array.isArray(payload?.upserts) ? payload.upserts : null
     const deleteIds = Array.isArray(payload?.deleteIds) ? payload.deleteIds : null
     if (!upserts || !deleteIds) throw new Error('原始聊天归档增量格式无效')
@@ -256,29 +420,45 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
       }
     }
 
-    const next = new Map(state.items)
-    for (const id of deleteIds) if (typeof id === 'string') next.delete(id)
+    const requestedDeletes = [...new Set(deleteIds.filter((id) => typeof id === 'string'))]
+    const requestedUpserts = new Map()
     for (const value of upserts) {
       const item = compactItem(value)
-      if (item) next.set(item.id, item)
+      if (item) requestedUpserts.set(item.id, item)
+    }
+    const next = new Map(state.items)
+    const effectiveDeleteIds = requestedDeletes.filter((id) => !requestedUpserts.has(id) && next.delete(id))
+    const effectiveUpserts = []
+    for (const item of requestedUpserts.values()) {
+      const current = next.get(item.id)
+      if (!current || JSON.stringify(current) !== JSON.stringify(item)) {
+        next.set(item.id, item)
+        effectiveUpserts.push(item)
+      }
     }
 
     const writeSnapshot = loadedFromLegacy || knownSegments.length === 0
     const operations = writeSnapshot
       ? [...next.values()].map((item) => ({ op: 'upsert', item }))
       : [
-          ...deleteIds.filter((id) => typeof id === 'string').map((id) => ({ op: 'delete', id })),
-          ...upserts.map(compactItem).filter(Boolean).map((item) => ({ op: 'upsert', item })),
+          ...effectiveDeleteIds.map((id) => ({ op: 'delete', id })),
+          ...effectiveUpserts.map((item) => ({ op: 'upsert', item })),
         ]
     const updatedAt = monotonicTimestamp(state.updatedAt)
     const sourceFingerprint = Object.hasOwn(payload ?? {}, 'sourceFingerprint')
       ? (typeof payload.sourceFingerprint === 'string' ? payload.sourceFingerprint : null)
       : state.sourceFingerprint
+    if (!operations.length && sourceFingerprint === state.sourceFingerprint) {
+      return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
+    }
     sequence += 1
-    const name = await writeSegment(directory, sequence, { kind: writeSnapshot ? 'snapshot' : 'delta', updatedAt, sourceFingerprint }, operations)
-    knownSegments.push(name)
+    const info = await writeSegment(directory, sequence, { kind: writeSnapshot ? 'snapshot' : 'delta', updatedAt, sourceFingerprint }, operations)
+    knownSegments.push(info.name)
+    knownSegmentInfo.set(info.name, info)
     state = { updatedAt, sourceFingerprint, items: next }
     loadedFromLegacy = false
+    integrity = { status: 'verified', unindexedSegmentCount: 0 }
+    conversationIndex = null
     await writeMetadata()
     if (knownSegments.length >= Math.max(2, Math.floor(compactionSegments))) await compact()
     return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
@@ -291,8 +471,105 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
 
   async function loadMeta() {
     await reload()
-    return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, schemaVersion: 1, storageEngine: 'append-only-jsonl-gzip', segmentCount: knownSegments.length }
+    return {
+      updatedAt: state.updatedAt,
+      sourceFingerprint: state.sourceFingerprint,
+      recordCount: state.items.size,
+      schemaVersion: 1,
+      metadataVersion: ARCHIVE_METADATA_VERSION,
+      storageEngine: 'append-only-jsonl-gzip',
+      segmentCount: knownSegments.length,
+      integrity: { ...integrity, algorithm: 'sha256' },
+    }
   }
 
-  return { commit, commitDelta, compact, loadMeta, loadSnapshot, migrate }
+  function buildConversationIndex() {
+    if (conversationIndex) return conversationIndex
+    const grouped = new Map()
+    for (const item of state.items.values()) {
+      const id = archiveConversationKey(item)
+      const current = grouped.get(id)
+      const capturedAt = typeof item?.capturedAt === 'string' ? item.capturedAt : undefined
+      if (current) {
+        current.recordCount += 1
+        if (!current.name && typeof item?.conversationName === 'string') current.name = item.conversationName
+        if (!current.kind && typeof item?.conversationKind === 'string') current.kind = item.conversationKind
+        if (!current.firstAt || (Number.isFinite(recordTimestamp(capturedAt)) && recordTimestamp(capturedAt) < recordTimestamp(current.firstAt))) current.firstAt = capturedAt
+        if (!current.lastAt || (Number.isFinite(recordTimestamp(capturedAt)) && recordTimestamp(capturedAt) > recordTimestamp(current.lastAt))) current.lastAt = capturedAt
+        const preview = conversationPreview(item)
+        if (previewIsLater(preview, current.latestPreview)) current.latestPreview = preview
+        if (item?.speakerRole === 'other' && previewIsLater(preview, current.latestCounterpartPreview)) current.latestCounterpartPreview = preview
+        continue
+      }
+      const preview = conversationPreview(item)
+      grouped.set(id, {
+        id,
+        name: typeof item?.conversationName === 'string' && item.conversationName.trim() ? item.conversationName.trim() : (typeof item?.source === 'string' ? item.source : '未命名会话'),
+        kind: typeof item?.conversationKind === 'string' ? item.conversationKind : 'unknown',
+        source: typeof item?.source === 'string' ? item.source : 'unknown',
+        recordCount: 1,
+        firstAt: capturedAt,
+        lastAt: capturedAt,
+        latestPreview: preview,
+        ...(item?.speakerRole === 'other' ? { latestCounterpartPreview: preview } : {}),
+      })
+    }
+    conversationIndex = [...grouped.values()].map(({ latestCounterpartPreview, ...entry }) => ({
+      ...entry,
+      latestPreview: latestCounterpartPreview ?? entry.latestPreview,
+    })).sort(compareConversation)
+    return conversationIndex
+  }
+
+  async function loadConversationIndex({ query, cursor, limit } = {}) {
+    await reload()
+    const normalizedQuery = typeof query === 'string' ? query.trim().toLocaleLowerCase('zh-CN') : ''
+    const entries = normalizedQuery
+      ? buildConversationIndex().filter((entry) => `${entry.name}\u0000${entry.id}\u0000${entry.source}`.toLocaleLowerCase('zh-CN').includes(normalizedQuery))
+      : buildConversationIndex()
+    const decodedCursor = decodePageCursor(cursor)
+    const offset = decodedCursor
+      ? Math.max(0, entries.findIndex((entry) => entry.id === decodedCursor.id && entry.lastAt === decodedCursor.lastAt) + 1)
+      : 0
+    const page = entries.slice(offset, offset + normalizedLimit(limit))
+    const final = page.at(-1)
+    return {
+      updatedAt: state.updatedAt,
+      recordCount: state.items.size,
+      totalConversations: entries.length,
+      items: page,
+      nextCursor: final && offset + page.length < entries.length ? encodePageCursor({ id: final.id, lastAt: final.lastAt ?? null }) : null,
+    }
+  }
+
+  async function loadConversationPage(conversationId, { cursor, limit } = {}) {
+    await reload()
+    const id = typeof conversationId === 'string' ? conversationId.trim().slice(0, 600) : ''
+    if (!id) throw new Error('会话标识无效')
+    const records = [...state.items.values()].filter((item) => archiveConversationKey(item) === id).sort(compareRecord)
+    const decodedCursor = decodePageCursor(cursor)
+    const offset = decodedCursor
+      ? Math.max(0, records.findIndex((item) => item.id === decodedCursor.id && item.capturedAt === decodedCursor.capturedAt) + 1)
+      : 0
+    const page = records.slice(offset, offset + normalizedLimit(limit, 200))
+    const final = page.at(-1)
+    return {
+      updatedAt: state.updatedAt,
+      conversation: buildConversationIndex().find((entry) => entry.id === id) ?? null,
+      totalRecords: records.length,
+      items: page,
+      nextCursor: final && offset + page.length < records.length ? encodePageCursor({ id: final.id, capturedAt: final.capturedAt ?? null }) : null,
+    }
+  }
+
+  async function verifyIntegrity() {
+    await reload(true)
+    return {
+      recordCount: state.items.size,
+      segmentCount: knownSegments.length,
+      integrity: { ...integrity, algorithm: 'sha256' },
+    }
+  }
+
+  return { commit, commitDelta, compact, loadMeta, loadSnapshot, loadConversationIndex, loadConversationPage, migrate, verifyIntegrity }
 }

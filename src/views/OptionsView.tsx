@@ -73,12 +73,14 @@ export function OptionsView({ settings, onSettingsChange, onAppearance, personCo
     promptInstructions: { ...promptInstructions, ...(update.promptInstructions ?? {}) },
   })
   const updatePrompt = (key: keyof AiSettings['promptInstructions'], value: string) => updateSettings({ promptInstructions: { ...promptInstructions, [key]: value } })
-  const promptLabels: Record<keyof AiSettings['promptInstructions'], string> = { task: '任务提炼', people: '人物证据', peopleMerge: '人物归并', taskGuidance: '任务建议' }
+  const promptLabels: Record<keyof AiSettings['promptInstructions'], string> = { task: '任务提炼', people: '人物证据', peopleMerge: '人物归并', taskGuidance: '任务建议', selfObservation: '自我观察', selfMerge: '自我归并' }
   const promptGuards: Record<keyof AiSettings['promptInstructions'], string> = {
     task: '模型只能根据导出记录提炼“仍需你处理”的事项。发言方向、引用消息、时间锚点与过期判断均以原记录为准，不能由自定义文字改写。',
     people: '每一条事实或偏好都必须给出消息 ID 和对方原话；客户端会核对该原话确实来自该人物的 other 消息。单次表达不得写成稳定习惯、性格或关系结论。',
     peopleMerge: '事实、偏好和关键互动事件只能保留已有引文；人物志可以把多条已核验陈述按时间线组织成连贯文字，并区分变化与延续，但不得引入新事实。人物底稿与日期明确的时间线注记是独立的用户确认来源，不能伪装成聊天结论。线索不足时必须说明边界。',
     taskGuidance: '建议只能使用任务、地点、天气和已核验人物信息。不得虚构消费、路线、场所、关系、同意或个人属性；单次偏好必须建议再次确认。',
+    selfObservation: '每条自我观察都必须引用本人发言或日记的精确原文与消息 ID；本地会核验引文与时间。不得将一次表达扩展为稳定人格、诊断、动机或未记录事件。',
+    selfMerge: '阶段叙事只能引用已核验观察。时期起止、来源消息和专业概念的证据关系均由本地重建；专业概念仅作非诊断性的解释，不能输出疾病、人格或治疗结论。',
   }
   const feedbackReasonLabels: Record<AiSettings['feedback'][number]['reason'], string> = { useful: '有用', expired: '已过期', ownership: '归属错误', completed: '已完成', 'not-actionable': '不构成任务', incorrect: '内容错误', other: '其他' }
   const feedbackEntries = [...(settings.feedback ?? [])].sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime())

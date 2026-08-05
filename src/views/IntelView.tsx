@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import { Check, ChevronDown, Trash2 } from 'lucide-react'
-import type { AiExtractionCheckpoint, AiFeedbackReason, AiSettings, AiTaskCandidate, ArchiveAnalysisSummary, ArchiveSummary, IntelItem, Person } from '../types'
+import type { AiExtractionCheckpoint, AiFeedbackReason, AiSettings, AiTaskCandidate, ArchiveAnalysisSummary, ArchiveSummary, DailyCheckIn, IntelItem, Person, SelfAnalysis } from '../types'
 import { parseIntelFile } from '../lib/importer'
 import { chooseExportDirectory, DIRECTORY_IMPORT_SIGNATURE_VERSION, ensureDirectoryPermission, loadDirectoryHandle, saveDirectoryHandle, scanExportDirectory, supportsDirectorySync, type LocalDirectoryHandle } from '../lib/directorySync'
 import { planDirectoryImport } from '../lib/directoryManifest'
@@ -13,6 +13,8 @@ import { ArchivePanel, type AutomationState } from './intel/ArchivePanel'
 import { AnalysisPanel } from './intel/AnalysisPanel'
 import { useIntelAnalysisSelection, type AnalysisScope, type AnalysisTargets, type TimelineFilterMode } from '../hooks/useIntelAnalysisSelection'
 import { useAiWorkflow, type AnalysisWorkState } from '../hooks/useAiWorkflow'
+import { useArchiveConversationIndex } from '../hooks/useArchiveConversationIndex'
+import { loadIntelSnapshot, loadSharedIntelSnapshot, type ArchiveConversationSummary } from '../lib/intelStore'
 
 interface IntelViewProps {
   active: boolean
@@ -21,17 +23,20 @@ interface IntelViewProps {
   archiveLoadError?: string
   archive: ArchiveSummary
   candidates: AiTaskCandidate[]
+  dailyCheckins: DailyCheckIn[]
   aiSettings: AiSettings
   onImport: (items: IntelItem[], options?: { replace?: boolean; replaceFiles?: string[]; fileCount?: number; sourceFingerprint?: string }) => { added: number; updated: number; duplicates: number; archiveMessageCount: number; conversationCount: number }
   onAiAnalysis: (candidates: AiTaskCandidate[], analyzedIds: string[], settings: AiSettings, summary: Omit<ArchiveAnalysisSummary, 'analyzedAt'>, completedSuccessfully: boolean, watermarkEligible?: boolean) => void
   onDirectPeopleDetected: (people: Person[]) => void
   onPeopleAnalysis: (items: IntelItem[], settings: AiSettings, onProgress?: (progress: AiProgress) => void) => Promise<{ started: boolean; reason?: string; failedConversationIds?: string[]; analyzedIds?: string[] }>
+  onSelfAnalysis: (analysis: SelfAnalysis) => void
   onAnalysisWatermark: (analyzedIds: string[], eligible: boolean) => void
   onStopPeopleAnalysis: () => void
   onAnalysisCheckpoint: (checkpoint?: AiExtractionCheckpoint) => void
   onCreateAiQuests: (candidates: AiTaskCandidate[]) => number
   onDismissAiCandidates: (ids: string[], reason?: AiFeedbackReason) => void
   onAnalysisWorkChange: (state: AnalysisWorkState | null) => void
+  onArchiveLoaded?: (items: IntelItem[]) => void
   conversationRequest?: { id: string; sequence: number }
 }
 
@@ -69,6 +74,15 @@ function debugEventLabel(event: string) {
     people_merge_failed: '人物归并失败',
     people_merge_aborted: '人物归并取消',
     people_run_completed: '人物处理结束',
+    self_observation_segment_started: '自我观察请求',
+    self_observation_segment_succeeded: '自我观察完成',
+    self_observation_segment_failed: '自我观察失败',
+    self_observation_started: '自我观察开始',
+    self_observation_succeeded: '自我观察完成',
+    self_observation_failed: '自我观察失败',
+    self_merge_succeeded: '自我阶段归并完成',
+    self_merge_failed: '自我阶段归并失败',
+    self_analysis_completed: '自我分析完成',
     run_completed: '提炼结束',
   }
   return labels[event] ?? event
@@ -122,7 +136,7 @@ async function directoryFingerprint(value: string) {
   return `fnv1a:${(hash >>> 0).toString(16)}:${value.length}`
 }
 
-export function IntelView({ active, items, intelHydrated, archiveLoadError, archive, candidates, aiSettings, onImport, onAiAnalysis, onDirectPeopleDetected, onPeopleAnalysis, onAnalysisWatermark, onStopPeopleAnalysis, onAnalysisCheckpoint, onCreateAiQuests: createAiQuests, onDismissAiCandidates, onAnalysisWorkChange, conversationRequest }: IntelViewProps) {
+export function IntelView({ active, items, intelHydrated, archiveLoadError, archive, candidates, dailyCheckins, aiSettings, onImport, onAiAnalysis, onDirectPeopleDetected, onPeopleAnalysis, onSelfAnalysis, onAnalysisWatermark, onStopPeopleAnalysis, onAnalysisCheckpoint, onCreateAiQuests: createAiQuests, onDismissAiCandidates, onAnalysisWorkChange, onArchiveLoaded, conversationRequest }: IntelViewProps) {
   const inputRef = useRef<HTMLInputElement>(null)
   const attachmentRef = useRef<HTMLInputElement>(null)
   const handleRef = useRef<LocalDirectoryHandle | null>(null)
@@ -140,11 +154,13 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
   const [attachmentFiles, setAttachmentFiles] = useState<File[]>([])
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null)
   const [analysisRetained, setAnalysisRetained] = useState(false)
+  const [deferredAnalysisItems, setDeferredAnalysisItems] = useState<IntelItem[] | null>(null)
+  const pendingDeferredRunRef = useRef(false)
   const [debugLog, setDebugLog] = useState<AiDebugEntry[]>(loadAiDebugLog)
   const [timelineStart, setTimelineStart] = useState('')
   const [timelineEnd, setTimelineEnd] = useState('')
   const [timelineMode, setTimelineMode] = useState<TimelineFilterMode>('last-chat')
-  const [analysisTargets, setAnalysisTargets] = useState<AnalysisTargets>({ tasks: true, people: true })
+  const [analysisTargets, setAnalysisTargets] = useState<AnalysisTargets>({ tasks: true, people: true, self: true })
   const [analysisConversationId, setAnalysisConversationId] = useState('')
   const [openSections, setOpenSections] = useState({ intake: true, analysis: true, debug: true, created: false, candidates: true, conversations: true })
   const [selectedCandidates, setSelectedCandidates] = useState<Set<string>>(new Set())
@@ -159,16 +175,54 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
   const conversationIndexEnabled = active || analysisRetained || aiSettings.autoEnabled || Boolean(aiSettings.interruptedRun) || Boolean(conversationRequest)
   // Keep directory discovery mounted, but avoid indexing hundreds of
   // thousands of records while the archive screen is hidden and idle.
-  const indexedItems = conversationIndexEnabled ? items : null
+  const workflowItems = deferredAnalysisItems ?? items
+  const indexedItems = conversationIndexEnabled ? workflowItems : null
   const intelById = useMemo(() => indexedItems ? new Map(indexedItems.map((item) => [item.id, item])) : new Map<string, IntelItem>(), [indexedItems])
   const { conversations, conversationFingerprints, conversationKinds, filteredConversations, analysisConversation, analysisMessages, analysisConversationCount, automaticWorkPending } = useIntelAnalysisSelection({ indexedItems, aiSettings, scope, timelineMode, timelineStart, timelineEnd, analysisConversationId, analysisTargets })
+  const archiveConversationIndex = useArchiveConversationIndex(conversationIndexEnabled, `${archive.sourceFingerprint ?? ''}:${archive.lastImport?.importedAt ?? ''}:${archive.messageCount}`)
+  const browserConversationFallback = useMemo<ArchiveConversationSummary[]>(() => conversations.map((conversation) => {
+    let latestPreview = conversation.records.at(-1)
+    for (let index = conversation.records.length - 1; index >= 0; index -= 1) {
+      if (conversation.records[index].speakerRole === 'other') {
+        latestPreview = conversation.records[index]
+        break
+      }
+    }
+    return {
+      id: conversation.id,
+      name: conversation.name,
+      kind: conversation.kind,
+      source: conversation.source,
+      recordCount: conversation.records.length,
+      firstAt: conversation.firstAt,
+      lastAt: conversation.lastAt,
+      latestPreview,
+    }
+  }), [conversations])
+  const usePagedConversationIndex = !archiveConversationIndex.error && (archiveConversationIndex.loading || archiveConversationIndex.conversations.length > 0 || archive.messageCount === 0)
+  const browserConversations = usePagedConversationIndex ? archiveConversationIndex.conversations : browserConversationFallback
+  const browserFilteredConversations = useMemo(() => browserConversations.filter((conversation) => {
+    if (timelineMode === 'last-chat') {
+      if (!timelineStart && !timelineEnd) return true
+      const lastAt = Date.parse(conversation.lastAt ?? '')
+      const startAt = timelineStart ? Date.parse(`${timelineStart}T00:00:00`) : Number.NEGATIVE_INFINITY
+      const endAt = timelineEnd ? Date.parse(`${timelineEnd}T23:59:59.999`) : Number.POSITIVE_INFINITY
+      return Number.isFinite(lastAt) && lastAt >= startAt && lastAt <= endAt
+    }
+    if (!timelineStart && !timelineEnd) return true
+    const firstAt = Date.parse(conversation.firstAt ?? '')
+    const lastAt = Date.parse(conversation.lastAt ?? '')
+    const startAt = timelineStart ? Date.parse(`${timelineStart}T00:00:00`) : Number.NEGATIVE_INFINITY
+    const endAt = timelineEnd ? Date.parse(`${timelineEnd}T23:59:59.999`) : Number.POSITIVE_INFINITY
+    return Number.isFinite(firstAt) && Number.isFinite(lastAt) && firstAt <= endAt && lastAt >= startAt
+  }), [browserConversations, timelineEnd, timelineMode, timelineStart])
   const configuredProviderCapacity = aiStatus?.scheduler?.totalMaxConcurrency ?? aiStatus?.totalMaxConcurrency ?? 0
   // Preserve the user's configured pool behavior. Request size is controlled
   // by the conversation segment planner, not by silently lowering channel
   // concurrency at the UI layer.
   const effectiveConcurrency = normalizeAiConcurrency(Math.max(Number(aiSettings.concurrency) || 0, configuredProviderCapacity))
   useEffect(() => { onImportRef.current = onImport }, [onImport])
-  useEffect(() => { itemsRef.current = items }, [items])
+  useEffect(() => { itemsRef.current = workflowItems }, [workflowItems])
   useEffect(() => { archiveRef.current = archive }, [archive])
   const appendDebugLog = useCallback((entry: AiDebugEntry) => {
     setDebugLog((current) => {
@@ -202,11 +256,11 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
     message: aiMessage,
     setMessage: setAiMessage,
     retryConversationIds,
-    run: runAiAnalysis,
+    run: runAiAnalysisDirect,
     stop: stopAiAnalysis,
     retry: retryFailedAnalysis,
   } = useAiWorkflow({
-    items,
+    items: workflowItems,
     aiSettings,
     aiStatus,
     scope,
@@ -222,10 +276,12 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
     automaticWorkPending,
     effectiveConcurrency,
     attachmentFiles,
+    dailyCheckins,
     appendDebugLog,
     onAiAnalysis,
     onDirectPeopleDetected,
     onPeopleAnalysis,
+    onSelfAnalysis,
     onAnalysisWatermark,
     onStopPeopleAnalysis,
     onAnalysisCheckpoint,
@@ -234,6 +290,36 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
     onCandidatesSelected: selectWorkflowCandidates,
     onCandidatesAvailable: showCandidateQueue,
   })
+  const loadDeferredArchive = useCallback(async () => {
+    if (deferredAnalysisItems?.length) return deferredAnalysisItems
+    let loaded: IntelItem[]
+    try {
+      loaded = (await loadSharedIntelSnapshot()).items
+    } catch {
+      loaded = (await loadIntelSnapshot())?.items ?? []
+    }
+    if (!loaded.length) throw new Error('本地归档没有可供提炼的消息。')
+    setDeferredAnalysisItems(loaded)
+    onArchiveLoaded?.(loaded)
+    return loaded
+  }, [deferredAnalysisItems, onArchiveLoaded])
+  const runAiAnalysis = useCallback(async () => {
+    if (!workflowItems.length && archive.messageCount > 0) {
+      pendingDeferredRunRef.current = true
+      setAiMessage('正在按需读取归档，读取完成后会自动开始提炼。')
+      try { await loadDeferredArchive() } catch (error) {
+        pendingDeferredRunRef.current = false
+        setAiMessage(error instanceof Error ? error.message : '归档读取失败。')
+      }
+      return
+    }
+    return runAiAnalysisDirect()
+  }, [archive.messageCount, loadDeferredArchive, runAiAnalysisDirect, setAiMessage, workflowItems.length])
+  useEffect(() => {
+    if (!pendingDeferredRunRef.current || !workflowItems.length) return
+    pendingDeferredRunRef.current = false
+    void runAiAnalysisDirect()
+  }, [runAiAnalysisDirect, workflowItems.length])
   useEffect(() => {
     void getAiStatus().then(setAiStatus).catch(() => setAiMessage('无法连接本机模型代理，请在选项中配置模型通道。'))
     const updateStatus = (event: Event) => setAiStatus((event as CustomEvent<AiStatus>).detail)
@@ -518,8 +604,8 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
 
       <ConversationBrowser
         open={openSections.conversations}
-        conversations={conversations}
-        filteredConversations={filteredConversations}
+        conversations={browserConversations}
+        filteredConversations={browserFilteredConversations}
         analysisConversationId={analysisConversationId}
         conversationRequest={conversationRequest}
         onToggleOpen={() => setOpenSections((current) => ({ ...current, conversations: !current.conversations }))}

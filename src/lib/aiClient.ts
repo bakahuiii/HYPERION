@@ -1,4 +1,4 @@
-import type { AiSettings, AiTaskCandidate, IntelItem, Person, PersonEvidence, PersonEvidenceCategory, PersonPortraitBlock, PersonPortraitCoverage, Place, Quest } from '../types'
+import type { AiSettings, AiTaskCandidate, DailyCheckIn, IntelItem, Person, PersonEvidence, PersonEvidenceCategory, PersonPortraitBlock, PersonPortraitCoverage, Place, Quest, SelfAnalysis, SelfAnalysisPeriod, SelfObservation } from '../types'
 import { buildConversationAnalysisPlan, buildPeopleConversationAnalysisPlan, inferConversationKind } from './conversationAnalysis'
 import { apiUrl, localProxyUrl } from './apiUrl'
 import { normalizeAiConcurrency } from './aiConcurrency'
@@ -19,6 +19,8 @@ import {
   summarizePersonEvidenceTime,
   type PersonTemporalSummary,
 } from './personTemporal'
+import { buildSelfAnalysisInput } from './selfJournal'
+import { analysisRange, buildSelfAnalysisPlan, groupSelfObservationsForMerge, isSelfObservationKind, mergeSelfObservations, selfObservationId, selfRecordText } from './selfAnalysis'
 
 export interface AiAttachment {
   name: string
@@ -281,7 +283,7 @@ const SESSION_POLL_INTERVAL_MS = 120
 // A previous fixed value of four left most configured channels idle.
 const PEOPLE_WORKFLOW_CONCURRENCY = 64
 
-type BatchWorkflow = 'tasks' | 'people'
+type BatchWorkflow = 'tasks' | 'people' | 'self-observe' | 'self-merge'
 
 interface BatchResult {
   id: number
@@ -379,7 +381,13 @@ class AiRequestBatcher {
     while (this.activeBatches < maximumActiveRequests && this.queue.length) {
       const entry = this.queue.shift()!
       this.activeBatches += 1
-      const path = entry.workflow === 'people' ? '/api/ai/people' : '/api/ai/analyze'
+      const path = entry.workflow === 'people'
+        ? '/api/ai/people'
+        : entry.workflow === 'self-observe'
+          ? '/api/ai/self/observe'
+          : entry.workflow === 'self-merge'
+            ? '/api/ai/self/merge'
+            : '/api/ai/analyze'
       void requestJson<unknown>(path, { body: entry.payload, signal: this.signal })
         .then(entry.resolve)
         .catch((error) => entry.reject(error instanceof Error ? error : new Error('本机模型请求失败')))
@@ -684,7 +692,13 @@ async function requestWithRetry<T>(url: string, body: unknown, onRetry?: (notice
   for (let attempt = 1; attempt <= MAX_SERVICE_ATTEMPTS; attempt += 1) {
     throwIfAborted(signal)
     try {
-      const workflow: BatchWorkflow = url === '/api/ai/people' ? 'people' : 'tasks'
+      const workflow: BatchWorkflow = url === '/api/ai/people'
+        ? 'people'
+        : url === '/api/ai/self/observe'
+          ? 'self-observe'
+          : url === '/api/ai/self/merge'
+            ? 'self-merge'
+            : 'tasks'
       return batcher ? await batcher.request<T>(workflow, body) : await requestJson<T>(url, { body, signal })
     } catch (error) {
       if (wasAborted(error) || signal?.aborted) throw abortError()
@@ -2619,6 +2633,235 @@ export async function analyzePeople(
     .flatMap(([conversationId]) => recordsByConversation.get(conversationId) ?? [])
     .map((record) => record.id)
   return { people, model, failedBatches, failedConversationIds, analyzedIds }
+}
+
+const SELF_ANALYSIS_CLINICAL_TERMS = /(?:抑郁症|躁郁症|双相(?:情感)?障碍|焦虑症|人格障碍|精神分裂|创伤后应激(?:障碍)?|adhd|注意缺陷多动障碍|成瘾(?:症)?|自杀风险|自伤风险|diagnos(?:is|tic)|bipolar|depression disorder|anxiety disorder|personality disorder)/i
+
+function validSelfText(value: unknown, maximum: number) {
+  const text = typeof value === 'string' ? value.trim().slice(0, maximum) : ''
+  return text && !SELF_ANALYSIS_CLINICAL_TERMS.test(text) ? text : ''
+}
+
+function normalizeSelfObservation(value: unknown, recordsById: ReadonlyMap<string, IntelItem>, coreIds: ReadonlySet<string>): SelfObservation | null {
+  if (!value || typeof value !== 'object') return null
+  const input = value as { kind?: unknown; text?: unknown; evidence?: unknown }
+  if (!isSelfObservationKind(input.kind)) return null
+  const text = validSelfText(input.text, 600)
+  if (!text) return null
+  const evidence = (Array.isArray(input.evidence) ? input.evidence : []).flatMap((item) => {
+    if (!item || typeof item !== 'object') return []
+    const sourceId = typeof item.sourceId === 'string' ? item.sourceId : ''
+    const quote = typeof item.quote === 'string' ? item.quote.trim().slice(0, 180) : ''
+    const record = recordsById.get(sourceId)
+    if (!record || record.speakerRole !== 'self' || quote.length < 2 || !selfRecordText(record).includes(quote)) return []
+    return [{ sourceId, quote }]
+  }).filter((item, index, values) => values.findIndex((candidate) => candidate.sourceId === item.sourceId && candidate.quote === item.quote) === index)
+  if (!evidence.length || !evidence.some((item) => coreIds.has(item.sourceId))) return null
+  const timestamps = evidence.map((item) => recordsById.get(item.sourceId)?.capturedAt ?? '').filter((value) => Number.isFinite(Date.parse(value))).sort()
+  if (!timestamps.length) return null
+  return {
+    id: selfObservationId(input.kind, text, evidence),
+    kind: input.kind,
+    text,
+    evidence,
+    sourceIds: [...new Set(evidence.map((item) => item.sourceId))],
+    observedFrom: timestamps[0],
+    observedTo: timestamps.at(-1)!,
+  }
+}
+
+function normalizeSelfPeriod(value: unknown, observationsById: ReadonlyMap<string, SelfObservation>): SelfAnalysisPeriod | null {
+  if (!value || typeof value !== 'object') return null
+  const input = value as { title?: unknown; paragraphs?: unknown; themes?: unknown; professionalContexts?: unknown }
+  const paragraphs = (Array.isArray(input.paragraphs) ? input.paragraphs : []).flatMap((paragraph) => {
+    if (!paragraph || typeof paragraph !== 'object') return []
+    const candidate = paragraph as { text?: unknown; observationIds?: unknown }
+    const text = validSelfText(candidate.text, 1_200)
+    const observationIds = [...new Set((Array.isArray(candidate.observationIds) ? candidate.observationIds : [])
+      .map(String).filter((id) => observationsById.has(id)))].slice(0, 120)
+    if (!text || !observationIds.length) return []
+    return [{
+      text,
+      observationIds,
+      sourceIds: [...new Set(observationIds.flatMap((id) => observationsById.get(id)?.sourceIds ?? []))],
+    }]
+  }).slice(0, 8)
+  const observationIds = [...new Set(paragraphs.flatMap((paragraph) => paragraph.observationIds))]
+  const selected = observationIds.map((id) => observationsById.get(id)!).sort((left, right) => left.observedFrom.localeCompare(right.observedFrom))
+  const title = validSelfText(input.title, 120)
+  const narrative = paragraphs.map((paragraph) => paragraph.text).join('\n\n')
+  if (!title || !narrative || !selected.length) return null
+  const themes: string[] = [...new Set((Array.isArray(input.themes) ? input.themes : [])
+    .map((item) => validSelfText(item, 60)).filter((item): item is string => Boolean(item)))].slice(0, 8)
+  // A period may be concise while its provenance is broad. Keep every cited
+  // archive row so the stored analysis remains fully traceable after this
+  // in-memory observation registry is released.
+  const sourceIds = [...new Set(selected.flatMap((observation) => observation.sourceIds))]
+  const professionalContexts = (Array.isArray(input.professionalContexts) ? input.professionalContexts : []).flatMap((context) => {
+    if (!context || typeof context !== 'object') return []
+    const candidate = context as { term?: unknown; explanation?: unknown; observationIds?: unknown }
+    const term = validSelfText(candidate.term, 80)
+    const explanation = validSelfText(candidate.explanation, 480)
+    const contextObservationIds: string[] = [...new Set((Array.isArray(candidate.observationIds) ? candidate.observationIds : [])
+      .map((id) => String(id)).filter((id) => observationIds.includes(id)))].slice(0, 36)
+    if (!term || !explanation || !contextObservationIds.length) return []
+    return [{
+      term,
+      explanation,
+      observationIds: contextObservationIds,
+      sourceIds: [...new Set(contextObservationIds.flatMap((id) => observationsById.get(id)?.sourceIds ?? []))],
+    }]
+  }).slice(0, 4)
+  return {
+    id: `self-period-${hash(`${selected.map((observation) => observation.id).join('|')}\u0000${title}`)}`,
+    startAt: selected[0].observedFrom,
+    endAt: selected.at(-1)!.observedTo,
+    title,
+    narrative,
+    paragraphs,
+    themes,
+    observationIds,
+    sourceIds,
+    professionalContexts,
+  }
+}
+
+export interface SelfAnalysisResult {
+  analysis?: SelfAnalysis
+  failedSegments: number
+  failedMerges: number
+  model: string
+}
+
+/**
+ * Extracts only exact-source self observations, then consolidates them into
+ * bounded chronological periods. Raw messages are never discarded or replaced
+ * by this result, and every period source ID remains resolvable in the archive.
+ */
+export async function analyzeSelf(
+  items: IntelItem[],
+  dailyCheckins: DailyCheckIn[],
+  settings: AiSettings,
+  onProgress?: (progress: AiProgress) => void,
+  onLog?: AiDebugWriter,
+  options?: { signal?: AbortSignal; concurrency?: number },
+): Promise<SelfAnalysisResult> {
+  const input = buildSelfAnalysisInput(items, dailyCheckins)
+  const plan = buildSelfAnalysisPlan(input)
+  if (!plan.jobs.length) return { failedSegments: 0, failedMerges: 0, model: 'unknown' }
+  const recordsById = new Map(items.filter((item) => item.speakerRole === 'self').map((item) => [item.id, item]))
+  const observations: SelfObservation[] = []
+  const failedSegments: number[] = []
+  const log = (event: string, level: AiDebugEntry['level'], details: Omit<AiDebugEntry, 'at' | 'event' | 'level'> = {}) => {
+    onLog?.({ at: new Date().toISOString(), event, level, ...details })
+  }
+  const concurrency = analysisConcurrency(options?.concurrency ?? settings.concurrency, plan.jobs.length)
+  const batcher = new AiSessionRequestBatcher(bufferedWorkerConcurrency(concurrency, plan.jobs.length), options?.signal)
+  let completed = 0
+  let activeWorkers = 0
+  let model = 'unknown'
+  let nextJob = 0
+  const report = (current?: number) => onProgress?.({
+    completed,
+    total: plan.totalSegments,
+    completedConversations: completed,
+    totalConversations: plan.totalSegments,
+    candidates: observations.length,
+    recordCount: plan.recordCount,
+    failedConversations: failedSegments.length,
+    currentConversation: '我',
+    currentSegment: current,
+    totalSegmentsInConversation: plan.totalSegments,
+    activeWorkers,
+    concurrency,
+  })
+  report(1)
+  const worker = async () => {
+    while (nextJob < plan.jobs.length) {
+      throwIfAborted(options?.signal)
+      const job = plan.jobs[nextJob++]
+      activeWorkers += 1
+      try {
+        log('self_observation_segment_started', 'info', { conversationId: 'self', conversationName: '我', recordCount: job.records.length, segmentIndex: job.segmentIndex, segmentCount: job.segmentCount, coreRecordCount: job.coreRecordCount, overlapRecordCount: job.overlapRecordCount })
+        const coreIds = new Set(job.coreRecordIds)
+        const payload = await requestWithRetry<{ model?: unknown; observations?: unknown; receivedRecordCount?: unknown }>('/api/ai/self/observe', {
+          analysisTarget: 'self',
+          conversation: {
+            id: 'self', name: '我', kind: 'direct', recordFormat: 'self-v1', ...modelAnalysisClock(),
+            totalRecords: job.totalRecords, recordCount: job.records.length,
+            segmentIndex: job.segmentIndex, segmentCount: job.segmentCount,
+            coreRecordCount: job.coreRecordCount, overlapRecordCount: job.overlapRecordCount,
+            coreRecordIndexes: job.records.map((record, index) => coreIds.has(record.id) ? String(index + 1) : null).filter(Boolean),
+          },
+          records: job.records.map((record) => ({ id: record.id, sentAt: record.capturedAt, content: selfRecordText(record), speakerRole: 'self' })),
+          attachments: [],
+          dailyCheckins: job.checkIns,
+          settings: { promptInstructions: { selfObservation: settings.promptInstructions.selfObservation } },
+        }, undefined, options?.signal, batcher)
+        if (Number(payload.receivedRecordCount) !== job.records.length) throw new Error(`Self-analysis segment ${job.segmentIndex}/${job.segmentCount} did not receive every prepared record`)
+        model = String(payload.model ?? model)
+        const accepted = (Array.isArray(payload.observations) ? payload.observations : [])
+          .map((value) => normalizeSelfObservation(value, recordsById, coreIds)).filter((value): value is SelfObservation => Boolean(value))
+        observations.push(...accepted)
+        log('self_observation_segment_succeeded', 'info', { conversationId: 'self', conversationName: '我', recordCount: job.records.length, segmentIndex: job.segmentIndex, segmentCount: job.segmentCount, candidateCount: Array.isArray(payload.observations) ? payload.observations.length : 0, acceptedCandidateCount: accepted.length, model })
+      } catch (error) {
+        if (wasAborted(error) || options?.signal?.aborted) throw abortError()
+        failedSegments.push(job.segmentIndex)
+        log('self_observation_segment_failed', 'error', { conversationId: 'self', conversationName: '我', recordCount: job.records.length, segmentIndex: job.segmentIndex, segmentCount: job.segmentCount, status: Number((error as { status?: number }).status) || undefined, message: (error instanceof Error ? error.message : 'Self observation request failed').slice(0, 280) })
+      } finally {
+        activeWorkers = Math.max(0, activeWorkers - 1)
+        completed += 1
+        report(job.segmentIndex)
+      }
+    }
+  }
+
+  try {
+    await Promise.all(Array.from({ length: Math.min(concurrency, plan.jobs.length) }, () => worker()))
+    throwIfAborted(options?.signal)
+    const verified = mergeSelfObservations(observations)
+    const groups = groupSelfObservationsForMerge(verified)
+    const periods: SelfAnalysisPeriod[] = []
+    const limitations: string[] = []
+    let failedMerges = 0
+    for (const group of groups) {
+      throwIfAborted(options?.signal)
+      try {
+        const result = await requestWithRetry<{ model?: unknown; periods?: unknown; currentSummary?: unknown; limitations?: unknown }>('/api/ai/self/merge', {
+          observations: group,
+          range: analysisRange(group),
+          settings: { promptInstructions: { selfMerge: settings.promptInstructions.selfMerge } },
+        }, undefined, options?.signal, batcher)
+        model = String(result.model ?? model)
+        const groupById = new Map(group.map((observation) => [observation.id, observation]))
+        periods.push(...(Array.isArray(result.periods) ? result.periods : []).map((value) => normalizeSelfPeriod(value, groupById)).filter((value): value is SelfAnalysisPeriod => Boolean(value)))
+        limitations.push(...(Array.isArray(result.limitations) ? result.limitations : []).map((value) => validSelfText(value, 240)).filter(Boolean))
+      } catch (error) {
+        if (wasAborted(error) || options?.signal?.aborted) throw abortError()
+        failedMerges += 1
+        limitations.push('部分时间段未能完成归并；已核验的原始记录仍保留在本地档案中。')
+        log('self_merge_failed', 'error', { conversationId: 'self', conversationName: '我', candidateCount: group.length, status: Number((error as { status?: number }).status) || undefined, message: (error instanceof Error ? error.message : 'Self analysis consolidation failed').slice(0, 280) })
+      }
+    }
+    const uniquePeriods = [...new Map(periods.sort((left, right) => left.startAt.localeCompare(right.startAt) || left.id.localeCompare(right.id)).map((period) => [period.id, period])).values()]
+    const latestPeriod = uniquePeriods.at(-1)
+    const analysis: SelfAnalysis = {
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      analysisAsOf: input.generatedAt,
+      sourceRecordCount: input.records.length,
+      sourceCheckInCount: input.dailyCheckins.length,
+      observationCount: verified.length,
+      periods: uniquePeriods,
+      ...(latestPeriod ? { currentSummary: latestPeriod.narrative } : {}),
+      ...(limitations.length ? { limitations: [...new Set(limitations)].slice(0, 12) } : {}),
+      model,
+    }
+    log('self_analysis_completed', failedSegments.length || failedMerges ? 'warn' : 'info', { conversationId: 'self', conversationName: '我', recordCount: input.records.length, candidateCount: verified.length, acceptedCandidateCount: uniquePeriods.length, model, message: `Verified observations ${verified.length}; periods ${uniquePeriods.length}; failed windows ${failedSegments.length}; failed merges ${failedMerges}.` })
+    return { analysis, failedSegments: failedSegments.length, failedMerges, model }
+  } finally {
+    batcher.dispose()
+  }
 }
 
 export async function fileToAttachment(file: File): Promise<AiAttachment> {
