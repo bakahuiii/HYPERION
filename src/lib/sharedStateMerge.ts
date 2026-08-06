@@ -1,4 +1,4 @@
-import type { AiTaskCandidate, AppData, DailyCheckIn, Person, Place, Quest, TaskAtlasLayout } from '../types'
+import type { AiTaskCandidate, AppData, ContextEvent, DailyCheckIn, Person, Place, Quest, TaskAtlasLayout } from '../types'
 
 type SharedFields = Pick<AppData,
   | 'quests'
@@ -8,6 +8,7 @@ type SharedFields = Pick<AppData,
   | 'peopleDismissalVersion'
   | 'peopleModelVersion'
   | 'dailyCheckins'
+  | 'contextEvents'
   | 'selfAnalysis'
   | 'aiCandidates'
   | 'atlas'
@@ -23,6 +24,7 @@ export function toSharedData(data: AppData): SharedData {
     peopleDismissalVersion: data.peopleDismissalVersion,
     peopleModelVersion: typeof data.peopleModelVersion === 'number' ? data.peopleModelVersion : undefined,
     dailyCheckins: Array.isArray(data.dailyCheckins) ? data.dailyCheckins : [],
+    contextEvents: Array.isArray(data.contextEvents) ? data.contextEvents : [],
     selfAnalysis: data.selfAnalysis,
     aiCandidates: Array.isArray(data.aiCandidates) ? data.aiCandidates : [],
     atlas: data.atlas?.categoryPositions ? data.atlas : { categoryPositions: {} },
@@ -42,6 +44,7 @@ export function sharedDataEqual(left: SharedData, right: SharedData) {
     && left.peopleDismissalVersion === right.peopleDismissalVersion
     && left.peopleModelVersion === right.peopleModelVersion
     && sameValue(left.dailyCheckins, right.dailyCheckins)
+    && sameValue(left.contextEvents, right.contextEvents)
     && sameValue(left.selfAnalysis, right.selfAnalysis)
     && sameValue(left.atlas, right.atlas)
 }
@@ -113,6 +116,7 @@ export function mergeSharedChanges(base: SharedData, local: SharedData, remote: 
     places: mergeEntities<Place>(base.places, local.places, remote.places),
     people: mergeEntities<Person>(base.people, local.people, remote.people),
     dailyCheckins: mergeEntities<DailyCheckIn>(base.dailyCheckins ?? [], local.dailyCheckins ?? [], remote.dailyCheckins ?? []),
+    contextEvents: mergeEntities<ContextEvent>(base.contextEvents ?? [], local.contextEvents ?? [], remote.contextEvents ?? []),
     // Self analysis is regenerated as one source-linked snapshot. Merging its
     // paragraphs would break evidence ownership, so the changed local result
     // wins; otherwise retain the latest remote result.

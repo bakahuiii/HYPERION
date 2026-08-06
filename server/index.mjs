@@ -27,6 +27,7 @@ import { createAppendOnlyArchiveStore } from './archiveStore.mjs'
 import { listSharedStateBackups, migrateSharedStateFile, versionSharedState, SHARED_STATE_SCHEMA, SHARED_STATE_SCHEMA_VERSION } from './schemaMigrations.mjs'
 import { pruneLogDirectory } from './logRetention.mjs'
 import { finishRecoverySession, recordRuntimeFailure, startRecoverySession } from './crashRecovery.mjs'
+import { createSeleneInboxWatcher, mergeContextEvents } from './seleneInbox.mjs'
 
 const port = Number(process.env.AI_PORT || 8787)
 const maxBodyBytes = 256 * 1024 * 1024
@@ -44,6 +45,7 @@ const {
   sharedIntelStoreDirectoryPath,
   sharedIntelMetaPath,
   sharedIntelLegacyPath,
+  seleneInboxStatePath,
   aiDebugLogPath,
   taskLogDirectoryPath,
   crashLogPath,
@@ -74,6 +76,7 @@ let mapTileMaintenanceQueue = Promise.resolve()
 let recoveryStatus = { uncleanShutdownDetected: false, previous: null, session: null }
 let sharedStateMigrationStatus = { state: 'pending', migrated: false }
 let archiveMigrationStatus = { state: 'pending', migrated: false }
+let seleneInboxWatcher = null
 const aiDebugMaxBytes = 8 * 1024 * 1024
 const aiDebugRotationCount = 3
 const taskLogMaxFiles = 2_000
@@ -495,6 +498,68 @@ function saveSharedState(payload) {
   const write = sharedStateWriteQueue.then(() => withFileLock(`${sharedStatePath}.lock`, () => writeSharedState(payload)))
   sharedStateWriteQueue = write.catch(() => undefined)
   return write
+}
+
+/**
+ * Apply a narrow server-side mutation to the current shared state.
+ *
+ * Server-side writes must never use the renderer's fetch-and-replace route:
+ * that route can race a desktop/browser save and would require moving the
+ * whole state document through the bot. The current state is instead read
+ * while holding the same write lock used by normal snapshot saves.
+ */
+function mutateSharedState(mutator) {
+  const write = sharedStateWriteQueue.then(() => withFileLock(`${sharedStatePath}.lock`, async () => {
+    const current = await loadSharedState()
+    if (!current?.data || typeof current.data !== 'object') {
+      const error = new Error('THEIA 尚未初始化共享数据；请先启动一次桌面版或浏览器版。')
+      error.status = 409
+      throw error
+    }
+    const next = await mutator(current.data, current)
+    if (!next || typeof next !== 'object') throw new Error('本机状态更新未返回有效数据')
+    return writeSharedState({ data: next, expectedUpdatedAt: current.updatedAt })
+  }))
+  sharedStateWriteQueue = write.catch(() => undefined)
+  return write
+}
+
+function configuredSeleneInbox() {
+  return typeof process.env.THEIA_SELENE_INBOX === 'string' && process.env.THEIA_SELENE_INBOX.trim()
+    ? resolve(process.env.THEIA_SELENE_INBOX.trim())
+    : null
+}
+
+async function importSeleneInboxEvents(events) {
+  let result = { added: 0, updated: 0, duplicates: Array.isArray(events) ? events.length : 0, contextEventCount: 0 }
+  await mutateSharedState((data) => {
+    const merged = mergeContextEvents(data.contextEvents, events)
+    result = {
+      added: merged.added,
+      updated: merged.updated,
+      duplicates: merged.duplicates,
+      contextEventCount: merged.events.length,
+    }
+    return { ...data, contextEvents: merged.events }
+  })
+  return result
+}
+
+async function startSeleneInboxSync() {
+  const directory = configuredSeleneInbox()
+  if (!directory) return null
+  if (seleneInboxWatcher) return seleneInboxWatcher
+  const watcher = createSeleneInboxWatcher({
+    directory,
+    statePath: seleneInboxStatePath,
+    intervalMs: process.env.THEIA_SELENE_SYNC_INTERVAL_MS,
+    settleMs: process.env.THEIA_SELENE_SYNC_SETTLE_MS,
+    onImport: importSeleneInboxEvents,
+    logger: (level, message) => console[level === 'warn' ? 'warn' : 'log'](`[THEIA] ${message}`),
+  })
+  seleneInboxWatcher = watcher
+  await watcher.start()
+  return watcher
 }
 
 const candidateSchema = {
@@ -3681,6 +3746,13 @@ export const server = http.createServer(async (request, response) => {
     }
     return
   }
+  if (requestPath === '/api/selene-sync/status' && request.method === 'GET') {
+    const directory = configuredSeleneInbox()
+    sendJson(response, 200, seleneInboxWatcher
+      ? seleneInboxWatcher.status()
+      : { enabled: false, directory, reason: directory ? 'starting' : 'THEIA_SELENE_INBOX is not configured' })
+    return
+  }
   if (request.url === '/api/runtime/recovery' && request.method === 'GET') {
     sendJson(response, 200, recoveryStatus)
     return
@@ -4183,7 +4255,10 @@ export function startAiProxy() {
       void startRecoverySession(serviceSessionPath, crashLogPath, { port: listeningPort })
         .then((status) => { recoveryStatus = status })
         .catch((error) => console.warn(`[THEIA] recovery marker unavailable: ${error instanceof Error ? error.message : String(error)}`))
-      server.once('close', () => { void finishRecoverySession(serviceSessionPath).catch(() => undefined) })
+      server.once('close', () => {
+        seleneInboxWatcher?.stop()
+        void finishRecoverySession(serviceSessionPath).catch(() => undefined)
+      })
       void withFileLock(`${sharedStatePath}.lock`, () => migrateSharedStateFile(sharedStatePath, migrationDirectoryPath))
         .then((result) => {
           sharedStateMigrationStatus = { state: 'ready', ...result }
@@ -4200,6 +4275,7 @@ export function startAiProxy() {
           console.warn(`[THEIA] archive migration skipped: ${archiveMigrationStatus.error}`)
         })
       void compactExistingTaskLogs()
+      void startSeleneInboxSync().catch((error) => console.warn(`[THEIA] SELENE inbox disabled: ${error instanceof Error ? error.message : String(error)}`))
       resolve(server)
     })
   })

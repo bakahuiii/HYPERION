@@ -37,6 +37,7 @@ export const seedData: AppData = {
   dismissedPersonConversationIds: [],
   peopleModelVersion: 5,
   dailyCheckins: [],
+  contextEvents: [],
   quests: [
     {
       id: 'q-demo-campus',

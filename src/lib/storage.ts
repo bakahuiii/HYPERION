@@ -8,6 +8,7 @@ import { PERSON_PORTRAIT_PIPELINE_VERSION } from './personTemporal.ts'
 import { recoverArray } from './storageRecovery.ts'
 import { APP_STORAGE_SCHEMA, unwrapAppStorage, wrapAppStorage } from './storageSchema.ts'
 import { normalizeDailyCheckIns } from './selfJournal.ts'
+import { normalizeContextEvents } from './contextEvents.ts'
 
 const STORAGE_KEY = 'theia:v1'
 const STORAGE_ROLLBACK_KEY = 'theia:v1:rollback'
@@ -160,6 +161,7 @@ export function loadData(): AppData {
         : Number(parsed.peopleDismissalVersion) >= 3 ? Number(parsed.peopleDismissalVersion) : undefined,
       peopleModelVersion: 5,
       dailyCheckins: normalizeDailyCheckIns(parsed.dailyCheckins),
+      contextEvents: normalizeContextEvents(parsed.contextEvents),
       archive: parsed.archive?.version === 1 ? parsed.archive : summarizeArchive(Array.isArray(parsed.intel) ? parsed.intel : []),
       // Created candidates are a temporary review archive. Their source IDs
       // are already stored on the quest, so do not restore this duplicate list.
