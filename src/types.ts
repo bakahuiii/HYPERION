@@ -303,7 +303,10 @@ export interface SelfAnalysis {
   generatedAt: string
   analysisAsOf: string
   sourceRecordCount: number
+  /** Legacy snapshots used manually entered daily check-ins. New analyses use ContextEvent instead. */
   sourceCheckInCount: number
+  /** Number of authorized non-text context events used as chronological background. */
+  sourceContextEventCount?: number
   observationCount: number
   periods: SelfAnalysisPeriod[]
   currentSummary?: string
@@ -328,6 +331,55 @@ export interface DailyCheckIn {
   note?: string
   createdAt: string
   updatedAt: string
+}
+
+/**
+ * An imported, timestamped non-text signal. It is context for reflection, not
+ * a statement made by the user and never becomes chat evidence by itself.
+ */
+export type ContextEventKind =
+  | 'calendar'
+  | 'location'
+  | 'movement'
+  | 'screen-time'
+  | 'activity'
+  | 'health'
+  | 'payment'
+  | 'device'
+  | 'custom'
+
+/** Device timeline snapshots are produced only by the standalone SELENE app. */
+export type ContextEventSource = 'selene'
+
+export interface ContextEventLocation {
+  latitude: number
+  longitude: number
+  accuracyMeters?: number
+}
+
+/** Exact location requires an explicit capture mode in the producing client. */
+export interface ContextEventLocationConsent {
+  exactLocation: true
+  captureMode: 'manual' | 'foreground' | 'background'
+  grantedAt: string
+}
+
+export interface ContextEvent {
+  id: string
+  version: 1
+  kind: ContextEventKind
+  source: ContextEventSource
+  startAt: string
+  endAt?: string
+  title: string
+  summary?: string
+  values?: Record<string, string | number | boolean>
+  sourceFile?: string
+  capturedAt: string
+  importedAt: string
+  privacy: 'coarse' | 'precise'
+  location?: ContextEventLocation
+  locationConsent?: ContextEventLocationConsent
 }
 
 /** A lightweight description of the local raw-message archive. Raw messages stay in IndexedDB. */
@@ -553,6 +605,8 @@ export interface AppData {
   peopleModelVersion: 5
   /** Optional daily state anchors, synchronized independently from raw archive rows. */
   dailyCheckins: DailyCheckIn[]
+  /** Authorized device/file context; separate from user-authored messages. */
+  contextEvents: ContextEvent[]
   /** Latest source-linked analysis of the app user's own records. */
   selfAnalysis?: SelfAnalysis
   intel: IntelItem[]
