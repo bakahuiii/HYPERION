@@ -5,13 +5,14 @@ import { AI_STATUS_CHANGED_EVENT, getAiStatus, type AiDebugEntry, type AiProgres
 import { localProxyUrl } from '../lib/apiUrl'
 import { formatQuestTime } from '../lib/questTime'
 import { normalizeAiConcurrency } from '../lib/aiConcurrency'
+import type { ConversationTimeline } from '../lib/intelConversationView'
 import { CandidateQueue } from './intel/CandidateQueue'
 import { ConversationBrowser } from './intel/ConversationBrowser'
 import { AnalysisPanel } from './intel/AnalysisPanel'
 import { useIntelAnalysisSelection, type AnalysisScope, type AnalysisTargets, type TimelineFilterMode } from '../hooks/useIntelAnalysisSelection'
 import { useAiWorkflow, type AnalysisWorkState } from '../hooks/useAiWorkflow'
 import { useArchiveConversationIndex } from '../hooks/useArchiveConversationIndex'
-import { loadIntelSnapshot, loadSharedIntelSnapshot, type ArchiveConversationSummary } from '../lib/intelStore'
+import { loadIntelSnapshot, loadSharedIntelConversationPage, loadSharedIntelSnapshot, type ArchiveConversationSummary } from '../lib/intelStore'
 
 interface IntelViewProps {
   active: boolean
@@ -97,6 +98,7 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null)
   const [analysisRetained, setAnalysisRetained] = useState(false)
   const [deferredAnalysisItems, setDeferredAnalysisItems] = useState<IntelItem[] | null>(null)
+  const [selectedArchiveItems, setSelectedArchiveItems] = useState<IntelItem[] | null>(null)
   const pendingDeferredRunRef = useRef(false)
   const [debugLog, setDebugLog] = useState<AiDebugEntry[]>(loadAiDebugLog)
   const [timelineStart, setTimelineStart] = useState('')
@@ -118,14 +120,28 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
   const conversationIndexEnabled = active || analysisRetained || aiSettings.autoEnabled || Boolean(aiSettings.interruptedRun) || Boolean(conversationRequest)
   // Keep archive list work out of the background. The browser fetches its
   // compact directory only after the user opens this specific section.
-  const archiveBrowserEnabled = (active && openSections.conversations) || Boolean(conversationRequest)
+  // The compact directory also powers the analysis picker while the raw
+  // archive body remains deferred. It is cheap enough to load on activation.
+  const archiveBrowserEnabled = active || Boolean(conversationRequest)
   // Keep directory discovery mounted, but avoid indexing hundreds of
   // thousands of records while the archive screen is hidden and idle.
-  const workflowItems = deferredAnalysisItems ?? items
+  const workflowItems = deferredAnalysisItems ?? selectedArchiveItems ?? items
   const indexedItems = conversationIndexEnabled ? workflowItems : null
   const intelById = useMemo(() => indexedItems ? new Map(indexedItems.map((item) => [item.id, item])) : new Map<string, IntelItem>(), [indexedItems])
   const { conversations, conversationFingerprints, conversationKinds, filteredConversations, analysisConversation, analysisMessages, analysisConversationCount, automaticWorkPending, automaticPendingRecordCount } = useIntelAnalysisSelection({ indexedItems, aiSettings, scope, timelineMode, timelineStart, timelineEnd, analysisConversationId, analysisTargets })
   const archiveConversationIndex = useArchiveConversationIndex(archiveBrowserEnabled, `${archive.sourceFingerprint ?? ''}:${archive.lastImport?.importedAt ?? ''}:${archive.messageCount}`)
+  const analysisConversationOptions: ConversationTimeline[] = conversations.length
+    ? conversations
+    : archiveConversationIndex.conversations.map((conversation) => ({
+      id: conversation.id,
+      name: conversation.name,
+      kind: conversation.kind,
+      source: conversation.source,
+      records: [],
+      recordCount: conversation.recordCount,
+      firstAt: conversation.firstAt,
+      lastAt: conversation.lastAt,
+    }))
   const browserConversationFallback = useMemo<ArchiveConversationSummary[]>(() => conversations.map((conversation) => {
     let latestPreview = conversation.records.at(-1)
     for (let index = conversation.records.length - 1; index >= 0; index -= 1) {
@@ -247,6 +263,32 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
     onArchiveLoaded?.(loaded)
     return loaded
   }, [deferredAnalysisItems, onArchiveLoaded])
+
+  // Large archives expose a compact conversation directory first. Hydrate
+  // only the conversation selected for analysis, page by page, so its full
+  // history remains available without restoring the entire archive at once.
+  useEffect(() => {
+    if (!analysisConversationId) {
+      return
+    }
+    if (conversations.some((conversation) => conversation.id === analysisConversationId)) return
+    if (deferredAnalysisItems?.length) return
+    if (!archiveConversationIndex.conversations.some((conversation) => conversation.id === analysisConversationId)) return
+    let cancelled = false
+    void (async () => {
+      const records: IntelItem[] = []
+      let cursor: string | undefined
+      do {
+        const page = await loadSharedIntelConversationPage(analysisConversationId, { cursor, limit: 500 })
+        records.push(...page.items)
+        cursor = page.nextCursor ?? undefined
+      } while (cursor && !cancelled)
+      if (!cancelled) setSelectedArchiveItems(records)
+    })().catch(() => {
+      if (!cancelled) setSelectedArchiveItems([])
+    })
+    return () => { cancelled = true }
+  }, [analysisConversationId, archiveConversationIndex.conversations, conversations, deferredAnalysisItems])
   const runAiAnalysis = useCallback(async () => {
     // A large archive can stay body-deferred at startup. Local producers may
     // append one journal row meanwhile; treating that single row as a complete
@@ -332,7 +374,12 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
   }, [])
   const analyzeConversation = useCallback((id: string) => {
     setAnalysisConversationId(id)
+    setSelectedArchiveItems(null)
     setOpenSections((current) => ({ ...current, analysis: true }))
+  }, [])
+  const changeAnalysisConversation = useCallback((id: string) => {
+    setAnalysisConversationId(id)
+    setSelectedArchiveItems(null)
   }, [])
   return (
     <div className="intel-view page-width">
@@ -345,7 +392,7 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
         analysisTargets={analysisTargets}
         analysisConversationId={analysisConversationId}
         analysisConversation={analysisConversation}
-        conversations={conversations}
+        conversations={analysisConversationOptions}
         filteredConversationCount={filteredConversations.length}
         timelineMode={timelineMode}
         timelineStart={timelineStart}
@@ -363,7 +410,7 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
         onToggleOpen={() => setOpenSections((current) => ({ ...current, analysis: !current.analysis }))}
         onScopeChange={setScope}
         onTargetsChange={setAnalysisTargets}
-        onConversationChange={setAnalysisConversationId}
+        onConversationChange={changeAnalysisConversation}
         onTimelineModeChange={setTimelineMode}
         onTimelineStartChange={setTimelineStart}
         onTimelineEndChange={setTimelineEnd}

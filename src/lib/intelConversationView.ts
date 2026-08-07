@@ -6,6 +6,7 @@ export interface ConversationTimeline {
   kind: NonNullable<IntelItem['conversationKind']>
   source: IntelItem['source']
   records: IntelItem[]
+  recordCount?: number
   firstAt?: string
   lastAt?: string
 }
