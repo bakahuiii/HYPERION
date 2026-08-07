@@ -10,6 +10,7 @@ const gzipAsync = promisify(gzip)
 const gunzipAsync = promisify(gunzip)
 
 export const ARCHIVE_STORE_SCHEMA = 'hyperion-intel-archive/v1'
+const LEGACY_ARCHIVE_STORE_SCHEMA = 'theia-intel-archive/v1'
 const SEGMENT_SUFFIX = '.jsonl.gz'
 const DEFAULT_COMPACTION_SEGMENTS = 24
 const ARCHIVE_METADATA_VERSION = 3
@@ -111,7 +112,7 @@ async function readSegment(path, expectedChecksum = null) {
   const lines = raw.split('\n').filter(Boolean)
   let header
   try { header = JSON.parse(lines.shift() ?? '{}') } catch { header = null }
-  if (!header || header.schema !== ARCHIVE_STORE_SCHEMA || !['snapshot', 'delta'].includes(header.kind)) {
+  if (!header || ![ARCHIVE_STORE_SCHEMA, LEGACY_ARCHIVE_STORE_SCHEMA].includes(header.schema) || !['snapshot', 'delta'].includes(header.kind)) {
     throw new Error(`原始聊天归档已损坏：分段 ${basename(path)} 的 schema 无效`)
   }
   const operations = []

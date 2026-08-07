@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
@@ -139,6 +139,30 @@ test('archive rebuilds its checksum index when metadata is absent', async (t) =>
   const verified = await recovered.verifyIntegrity()
   assert.equal(verified.integrity.status, 'verified')
   assert.deepEqual((await recovered.loadSnapshot()).items, [{ id: 'a', content: 'one' }, { id: 'b', content: 'two' }])
+})
+
+test('loads a verified THEIA v1 segment after the HYPERION rename', async (t) => {
+  const scope = await fixture()
+  t.after(() => rm(scope.root, { recursive: true, force: true }))
+  await mkdir(scope.directory, { recursive: true })
+  await writeFile(join(scope.directory, '0000000001-20260807000000000.jsonl.gz'), gzipSync(Buffer.from([
+    JSON.stringify({ schema: 'theia-intel-archive/v1', schemaVersion: 1, kind: 'snapshot', updatedAt: '2026-08-07T00:00:00.000Z', sourceFingerprint: 'legacy' }),
+    JSON.stringify({ op: 'upsert', item: { id: 'legacy-a', content: 'kept' } }),
+    '',
+  ].join('\n'))))
+  assert.deepEqual((await scope.store.loadSnapshot()).items, [{ id: 'legacy-a', content: 'kept' }])
+})
+
+test('rejects an archive segment with an unknown schema', async (t) => {
+  const scope = await fixture()
+  t.after(() => rm(scope.root, { recursive: true, force: true }))
+  await mkdir(scope.directory, { recursive: true })
+  await writeFile(join(scope.directory, '0000000001-20260807000000000.jsonl.gz'), gzipSync(Buffer.from([
+    JSON.stringify({ schema: 'unknown-intel-archive/v1', schemaVersion: 1, kind: 'snapshot', updatedAt: '2026-08-07T00:00:00.000Z', sourceFingerprint: null }),
+    JSON.stringify({ op: 'upsert', item: { id: 'invalid', content: 'not accepted' } }),
+    '',
+  ].join('\n'))))
+  await assert.rejects(scope.store.loadSnapshot(), /schema/)
 })
 
 test('checksum index detects a valid-looking but replaced segment before serving data', async (t) => {
