@@ -99,6 +99,7 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
   const [analysisRetained, setAnalysisRetained] = useState(false)
   const [deferredAnalysisItems, setDeferredAnalysisItems] = useState<IntelItem[] | null>(null)
   const [selectedArchiveItems, setSelectedArchiveItems] = useState<IntelItem[] | null>(null)
+  const selectedArchiveConversationRef = useRef<string | null>(null)
   const pendingDeferredRunRef = useRef(false)
   const [debugLog, setDebugLog] = useState<AiDebugEntry[]>(loadAiDebugLog)
   const [timelineStart, setTimelineStart] = useState('')
@@ -118,10 +119,8 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
     return new Set([...selectedCandidates].filter((id) => available.has(id)))
   }, [pendingCandidates, selectedCandidates])
   const conversationIndexEnabled = active || analysisRetained || aiSettings.autoEnabled || Boolean(aiSettings.interruptedRun) || Boolean(conversationRequest)
-  // Keep archive list work out of the background. The browser fetches its
-  // compact directory only after the user opens this specific section.
-  // The compact directory also powers the analysis picker while the raw
-  // archive body remains deferred. It is cheap enough to load on activation.
+  // Keep raw archive work out of the background. The compact directory also
+  // powers the analysis picker while the message body remains deferred.
   const archiveBrowserEnabled = active || Boolean(conversationRequest)
   // Keep directory discovery mounted, but avoid indexing hundreds of
   // thousands of records while the archive screen is hidden and idle.
@@ -130,9 +129,8 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
   const intelById = useMemo(() => indexedItems ? new Map(indexedItems.map((item) => [item.id, item])) : new Map<string, IntelItem>(), [indexedItems])
   const { conversations, conversationFingerprints, conversationKinds, filteredConversations, analysisConversation, analysisMessages, analysisConversationCount, automaticWorkPending, automaticPendingRecordCount } = useIntelAnalysisSelection({ indexedItems, aiSettings, scope, timelineMode, timelineStart, timelineEnd, analysisConversationId, analysisTargets })
   const archiveConversationIndex = useArchiveConversationIndex(archiveBrowserEnabled, `${archive.sourceFingerprint ?? ''}:${archive.lastImport?.importedAt ?? ''}:${archive.messageCount}`)
-  const analysisConversationOptions: ConversationTimeline[] = conversations.length
-    ? conversations
-    : archiveConversationIndex.conversations.map((conversation) => ({
+  const analysisConversationOptions: ConversationTimeline[] = archiveConversationIndex.conversations.length
+    ? archiveConversationIndex.conversations.map((conversation) => ({
       id: conversation.id,
       name: conversation.name,
       kind: conversation.kind,
@@ -142,6 +140,7 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
       firstAt: conversation.firstAt,
       lastAt: conversation.lastAt,
     }))
+    : conversations
   const browserConversationFallback = useMemo<ArchiveConversationSummary[]>(() => conversations.map((conversation) => {
     let latestPreview = conversation.records.at(-1)
     for (let index = conversation.records.length - 1; index >= 0; index -= 1) {
@@ -271,9 +270,11 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
     if (!analysisConversationId) {
       return
     }
-    if (conversations.some((conversation) => conversation.id === analysisConversationId)) return
     if (deferredAnalysisItems?.length) return
+    if (items.length >= archive.messageCount && archive.messageCount > 0) return
     if (!archiveConversationIndex.conversations.some((conversation) => conversation.id === analysisConversationId)) return
+    if (selectedArchiveConversationRef.current === analysisConversationId) return
+    selectedArchiveConversationRef.current = analysisConversationId
     let cancelled = false
     void (async () => {
       const records: IntelItem[] = []
@@ -288,12 +289,16 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
       if (!cancelled) setSelectedArchiveItems([])
     })
     return () => { cancelled = true }
-  }, [analysisConversationId, archiveConversationIndex.conversations, conversations, deferredAnalysisItems])
+  }, [analysisConversationId, archive, archiveConversationIndex.conversations, deferredAnalysisItems, items.length])
   const runAiAnalysis = useCallback(async () => {
+    if (analysisConversationId && !analysisConversation) {
+      setAiMessage('正在读取指定对话，请稍候。')
+      return
+    }
     // A large archive can stay body-deferred at startup. Local producers may
     // append one journal row meanwhile; treating that single row as a complete
     // archive would make self analysis miss the rest of the user's history.
-    if (archive.messageCount > workflowItems.length) {
+    if (!analysisConversationId && archive.messageCount > workflowItems.length) {
       pendingDeferredRunRef.current = true
       setAiMessage('正在按需读取归档，读取完成后会自动开始提炼。')
       try { await loadDeferredArchive() } catch (error) {
@@ -303,7 +308,7 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
       return
     }
     return runAiAnalysisDirect()
-  }, [archive.messageCount, loadDeferredArchive, runAiAnalysisDirect, setAiMessage, workflowItems.length])
+  }, [analysisConversation, analysisConversationId, archive.messageCount, loadDeferredArchive, runAiAnalysisDirect, setAiMessage, workflowItems.length])
   useEffect(() => {
     if (!pendingDeferredRunRef.current || !workflowItems.length) return
     pendingDeferredRunRef.current = false
@@ -375,11 +380,13 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
   const analyzeConversation = useCallback((id: string) => {
     setAnalysisConversationId(id)
     setSelectedArchiveItems(null)
+    selectedArchiveConversationRef.current = null
     setOpenSections((current) => ({ ...current, analysis: true }))
   }, [])
   const changeAnalysisConversation = useCallback((id: string) => {
     setAnalysisConversationId(id)
     setSelectedArchiveItems(null)
+    selectedArchiveConversationRef.current = null
   }, [])
   return (
     <div className="intel-view page-width">
