@@ -165,13 +165,13 @@ export function useSharedSync({
       }
     }
 
-    window.theiaFlush = flush
+    window.hyperionFlush = flush
     const handlePageHide = () => { void flush() }
     window.addEventListener('pagehide', handlePageHide)
     return () => {
       window.removeEventListener('pagehide', handlePageHide)
       void flush()
-      delete window.theiaFlush
+      delete window.hyperionFlush
     }
   }, [checkpointWriteTimerRef, dataRef, flushSettings, pendingCheckpointRef, persistSnapshot])
 

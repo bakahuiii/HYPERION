@@ -527,6 +527,10 @@ export interface AiSettings {
   instructions: string
   autoEnabled: boolean
   intervalHours: number
+  /** The automatic incremental extraction condition selected by the user. */
+  autoTriggerMode: 'time' | 'message-count' | 'either'
+  /** New records required before the message-count trigger runs. */
+  incrementalMessageCount: number
   recencyPolicy: AiRecencyPolicy
   /** Maximum number of independent conversation requests in flight. */
   concurrency?: number

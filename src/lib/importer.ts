@@ -1,5 +1,6 @@
-import type { IntelItem } from '../types'
+import type { ContextEvent, IntelItem } from '../types'
 import { deduplicateIntelAvatars } from './intelPersistence.ts'
+import { isContextEventDocument, parseContextEventDocument } from './contextEvents.ts'
 
 interface ParsedLine {
   text: string
@@ -461,6 +462,9 @@ export async function parseIntelFileContent(file: File, context: ImportContext =
 
   if (file.name.toLowerCase().endsWith('.json')) {
     const parsed = JSON.parse(raw) as unknown
+    // Context-event documents belong to the separate device/file timeline;
+    // never flatten them into chat text when users select a mixed folder.
+    if (isContextEventDocument(parsed)) return []
     const speakerAvatars = collectSpeakerAvatars(parsed)
     const sessionAvatar = sessionAvatarUrl(parsed)
     const strictDirectoryImport = Boolean(context.path)
@@ -503,13 +507,27 @@ export async function parseIntelFileContent(file: File, context: ImportContext =
   }}))
 }
 
+/** Parses the explicit device/file context contract without treating it as chat. */
+export async function parseContextEventFileContent(file: File, context: ImportContext = {}): Promise<ContextEvent[]> {
+  if (!file.name.toLowerCase().endsWith('.json')) return []
+  const parsed = JSON.parse(await file.text()) as unknown
+  return parseContextEventDocument(parsed, { sourceFile: context.path || file.name }) ?? []
+}
+
+export async function parseContextEventFile(file: File, context: ImportContext = {}): Promise<ContextEvent[]> {
+  // Context documents are bounded by their contract (max 180 events in the
+  // model projection) and normally written once per day; avoid a second worker
+  // protocol until a real large-device export demonstrates the need.
+  return parseContextEventFileContent(file, context)
+}
+
 const WORKER_PARSE_THRESHOLD_BYTES = 1024 * 1024
 
 /** Parse large exports off the renderer thread while keeping tests and small files synchronous. */
 export async function parseIntelFile(file: File, context: ImportContext = {}): Promise<IntelItem[]> {
   if (typeof Worker === 'undefined' || Number(file.size) < WORKER_PARSE_THRESHOLD_BYTES) return parseIntelFileContent(file, context)
   return new Promise<IntelItem[]>((resolve, reject) => {
-    const worker = new Worker(new URL('../workers/intelParser.worker.ts', import.meta.url), { type: 'module', name: 'theia-intel-parser' })
+    const worker = new Worker(new URL('../workers/intelParser.worker.ts', import.meta.url), { type: 'module', name: 'hyperion-intel-parser' })
     const finish = () => worker.terminate()
     worker.onmessage = (event: MessageEvent<{ items?: IntelItem[]; error?: string }>) => {
       finish()

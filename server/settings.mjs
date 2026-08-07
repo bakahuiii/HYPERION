@@ -126,6 +126,8 @@ function defaultSettings() {
       instructions: '只把明确可执行、对现实生活有帮助的事项整理成任务；不要臆测隐私或制造压力。',
       autoEnabled: false,
       intervalHours: 24,
+      autoTriggerMode: 'either',
+      incrementalMessageCount: 50,
       recencyPolicy: 'balanced',
       // Client-side parallelism; provider channel capacity is independent.
       concurrency: 4,
@@ -151,7 +153,7 @@ function environmentProvider() {
   // Desktop and IDE processes often inherit unrelated host credentials.
   // Treat environment-provider configuration as an explicit compatibility
   // mode so an ambient OPENAI_API_KEY can never enter the user's settings.
-  const environmentEnabled = process.env.THEIA_USE_ENV_PROVIDER === '1'
+  const environmentEnabled = process.env.HYPERION_USE_ENV_PROVIDER === '1'
   return {
     id: 'primary',
     name: '主通道',
@@ -328,7 +330,9 @@ function normalizeAiSettings(input, fallback) {
     mode: analysisModes.has(input?.mode) ? input.mode : fallback.mode,
     instructions: text(input?.instructions, 4000) || fallback.instructions,
     autoEnabled: input?.autoEnabled === true,
-    intervalHours: clamp(input?.intervalHours, 24, 24 * 30, fallback.intervalHours),
+    intervalHours: clamp(input?.intervalHours, 1, 24 * 30, fallback.intervalHours),
+    autoTriggerMode: ['time', 'message-count', 'either'].includes(input?.autoTriggerMode) ? input.autoTriggerMode : fallback.autoTriggerMode,
+    incrementalMessageCount: Math.round(clamp(input?.incrementalMessageCount, 1, 10_000, fallback.incrementalMessageCount)),
     recencyPolicy: ['strict', 'balanced', 'broad'].includes(input?.recencyPolicy) ? input.recencyPolicy : fallback.recencyPolicy,
     concurrency: Math.round(clamp(input?.concurrency, 1, 64, Math.round(clamp(fallback?.concurrency, 1, 64, 4)))),
     feedback,
@@ -408,7 +412,7 @@ function normalizeSettings(input, fallback = defaultSettings()) {
 }
 
 function credentialReference(channel) {
-  return text(channel?.credentialRef, 160) || `theia/provider/${normalizeProviderId(channel?.id, 'primary')}`
+  return text(channel?.credentialRef, 160) || `hyperion/provider/${normalizeProviderId(channel?.id, 'primary')}`
 }
 
 async function protectProviderCredentials(settings) {
@@ -451,7 +455,7 @@ function serializeSettings(settings, protectedCredentials = false) {
     ? { ...channel, apiKey: undefined, key: undefined, credentialRef: credentialReference(channel) }
     : channel)
   const lines = [
-    '; THEIA local shared settings. Values are URL-encoded to preserve newlines and = characters.',
+    '; HYPERION local shared settings. Values are URL-encoded to preserve newlines and = characters.',
     '[meta]',
     'version=4',
     `appSettingsInitialized=${encode(settings.appSettingsInitialized)}`,
@@ -471,6 +475,8 @@ function serializeSettings(settings, protectedCredentials = false) {
     `instructions=${encode(settings.aiSettings.instructions)}`,
     `autoEnabled=${encode(settings.aiSettings.autoEnabled)}`,
     `intervalHours=${encode(settings.aiSettings.intervalHours)}`,
+    `autoTriggerMode=${encode(settings.aiSettings.autoTriggerMode)}`,
+    `incrementalMessageCount=${encode(settings.aiSettings.incrementalMessageCount)}`,
     `recencyPolicy=${encode(settings.aiSettings.recencyPolicy)}`,
     `concurrency=${encode(settings.aiSettings.concurrency)}`,
     `feedback=${encode(JSON.stringify(settings.aiSettings.feedback))}`,
@@ -523,6 +529,8 @@ function fromIni(raw) {
       instructions: value(parsed, 'ai', 'instructions'),
       autoEnabled: value(parsed, 'ai', 'autoEnabled') === 'true',
       intervalHours: value(parsed, 'ai', 'intervalHours'),
+      autoTriggerMode: value(parsed, 'ai', 'autoTriggerMode'),
+      incrementalMessageCount: value(parsed, 'ai', 'incrementalMessageCount'),
       recencyPolicy: value(parsed, 'ai', 'recencyPolicy'),
       concurrency: value(parsed, 'ai', 'concurrency'),
       feedback: jsonValue(parsed, 'ai', 'feedback', []),

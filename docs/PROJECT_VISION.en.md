@@ -1,20 +1,20 @@
-# THEIA Ultimate Project Purpose
+# HYPERION Ultimate Project Purpose
 
 [简体中文](PROJECT_VISION.md) | [English](PROJECT_VISION.en.md)
 
-[Download the bilingual Word edition](THEIA_PROJECT_VISION_BILINGUAL.docx)
+[Download the bilingual Word edition](HYPERION_PROJECT_VISION_BILINGUAL.docx)
 
 ## Core Statement
 
-> "THEIA is not software for managing life, nor is it a tool for analyzing chat histories. It is a long-term experiment devoted to studying a single subject, and that subject has always been myself. It seeks to connect memory, behavior, emotion, relationships, decisions, and environment along the axis of time, not to predict the future or judge right and wrong, but to answer, as completely as possible, one question that runs through my life: How did I become who I am today, and who am I becoming?"
+> "HYPERION is not software for managing life, nor is it a tool for analyzing chat histories. It is a long-term experiment devoted to studying a single subject, and that subject has always been myself. It seeks to connect memory, behavior, emotion, relationships, decisions, and environment along the axis of time, not to predict the future or judge right and wrong, but to answer, as completely as possible, one question that runs through my life: How did I become who I am today, and who am I becoming?"
 >
 > — GPT-5.5
 
-This is not marketing copy. It is THEIA's product definition, research boundary, and long-term architectural north star. Tasks, conversations, people, relationships, places, schedules, emotions, memories, and environmental context are all building blocks for a traceable, correctable, user-owned personal timeline.
+This is not marketing copy. It is HYPERION's product definition, research boundary, and long-term architectural north star. Tasks, conversations, people, relationships, places, schedules, emotions, memories, and environmental context are all building blocks for a traceable, correctable, user-owned personal timeline.
 
 ## Subject and Time Scale
 
-THEIA studies one subject: the user. Other people, groups, schools, workplaces, places, and events enter the system because they form the context in which the user's experience and development occur. THEIA is not intended to build supposedly objective dossiers on other people or pass judgment on them.
+HYPERION studies one subject: the user. Other people, groups, schools, workplaces, places, and events enter the system because they form the context in which the user's experience and development occur. HYPERION is not intended to build supposedly objective dossiers on other people or pass judgment on them.
 
 The system must support several time scales at once:
 
@@ -27,7 +27,7 @@ Time is more than a message timestamp. It includes source time, event time, user
 
 ## Epistemic Boundary
 
-THEIA does not equate more data with truth, or fluent model output with understanding. The system must distinguish:
+HYPERION does not equate more data with truth, or fluent model output with understanding. The system must distinguish:
 
 1. **Raw observations**: conversations, images, files, places, schedules, or notes deliberately supplied by the user.
 2. **Structured facts**: statements with a clear subject and time that can be traced directly to raw observations.
@@ -57,7 +57,7 @@ Facts answer what happened. Inferences answer what the evidence might mean. Advi
 
 ### 5. No prediction, scoring, or judgment
 
-THEIA may help review patterns and understand choices. It must not predict destiny, score relationships or personalities, or present model advice as the only correct answer.
+HYPERION may help review patterns and understand choices. It must not predict destiny, score relationships or personalities, or present model advice as the only correct answer.
 
 ### 6. User sovereignty
 
@@ -98,7 +98,7 @@ If a feature only increases task count, profile length, engagement time, or visu
 
 ## Success Criteria
 
-THEIA is not successful because it generates many tasks, reads many messages, or writes long profiles. Better measures are:
+HYPERION is not successful because it generates many tasks, reads many messages, or writes long profiles. Better measures are:
 
 - whether a conclusion can be traced back to lived experience;
 - whether the system can admit uncertainty and revise itself when new evidence arrives;

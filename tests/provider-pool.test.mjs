@@ -13,9 +13,9 @@ import { rotateFileCopies } from '../server/fileRotation.mjs'
 // runtimePaths.mjs is intentionally cached by Node. Every dynamically imported
 // proxy in this file must therefore point at the same disposable root; each
 // test removes its contents before the next proxy recreates them.
-const sharedRuntimeRoot = await mkdtemp(join(tmpdir(), 'theia-provider-suite-'))
-process.env.THEIA_RUNTIME_ROOT = sharedRuntimeRoot
-process.env.THEIA_RELEASE_LAYOUT = '1'
+const sharedRuntimeRoot = await mkdtemp(join(tmpdir(), 'hyperion-provider-suite-'))
+process.env.HYPERION_RUNTIME_ROOT = sharedRuntimeRoot
+process.env.HYPERION_RELEASE_LAYOUT = '1'
 
 function listen(server) {
   return new Promise((resolveListen, reject) => {
@@ -43,7 +43,7 @@ function cleanupRuntimeRoot(path) {
 }
 
 test('file rotation creates the first backup and shifts existing copies', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'theia-rotation-'))
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-rotation-'))
   const path = join(root, 'debug.log')
   try {
     await writeFile(path, 'current')
@@ -60,7 +60,7 @@ test('file rotation creates the first backup and shifts existing copies', async 
 })
 
 test('atomic archive writes serialize concurrent writers and clean temporary files', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'theia-atomic-'))
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-atomic-'))
   const path = join(root, 'archive.json.gz')
   const lockPath = `${path}.lock`
   try {
@@ -317,8 +317,8 @@ test('self-analysis endpoints preserve self-only evidence references and structu
   let proxy
   try {
     const providerUrl = await listen(provider.server)
-    process.env.THEIA_RUNTIME_ROOT = runtimeRoot
-    process.env.THEIA_RELEASE_LAYOUT = '1'
+    process.env.HYPERION_RUNTIME_ROOT = runtimeRoot
+    process.env.HYPERION_RELEASE_LAYOUT = '1'
     process.env.AI_PORT = '0'
     process.env.AI_PROVIDER_TIMEOUT_MS = '2000'
     const { startAiProxy } = await import(`../server/index.mjs?self-analysis-test=${Date.now()}`)
@@ -336,14 +336,27 @@ test('self-analysis endpoints preserve self-only evidence references and structu
         conversation: { id: 'self', name: '我', kind: 'direct', totalRecords: 1, recordCount: 1, segmentIndex: 1, segmentCount: 1, coreRecordIndexes: ['1'] },
         records: [{ id: 'self-source-1', sentAt: '2026-08-06T08:00:00.000Z', content: '我决定先完成材料。', speakerRole: 'self' }],
         attachments: [],
-        dailyCheckins: [],
+        contextEvents: [{
+          id: 'precise-location-test', kind: 'location', source: 'selene', startAt: '2026-08-06T08:00:00.000Z',
+          title: 'Exact home coordinate', privacy: 'precise', location: { latitude: 31.234567, longitude: 121.456789 },
+          locationConsent: { exactLocation: true, captureMode: 'manual', grantedAt: '2026-08-06T08:00:00.000Z' },
+        }, {
+          id: 'movement-kind-test', kind: 'movement', source: 'selene', startAt: '2026-08-06T08:10:00.000Z',
+          endAt: '2026-08-06T08:30:00.000Z', title: 'Continuous movement', privacy: 'coarse',
+          values: { durationSeconds: 1200, distanceMeters: 1350, averageSpeedKmh: 4.1 },
+        }],
         settings: { promptInstructions: { selfObservation: 'Use exact citations.' } },
       },
     })
     assert.equal(observation.response.status, 200)
     assert.deepEqual(observation.payload.observations[0].evidence, [{ sourceId: 'self-source-1', quote: '先完成材料' }])
-    assert.match(provider.state.requestBodies[0], /Self-authored rows/)
-    assert.doesNotMatch(provider.state.requestBodies[0], /senderDisplayName/)
+    const selfObservationPrompt = JSON.parse(provider.state.requestBodies[0]).input[0].content[0].text
+    assert.match(selfObservationPrompt, /Self-authored rows/)
+    assert.doesNotMatch(selfObservationPrompt, /senderDisplayName/)
+    assert.match(selfObservationPrompt, /Location capture/)
+    assert.match(selfObservationPrompt, /Continuous movement/)
+    assert.match(selfObservationPrompt, /"kind":"movement"/)
+    assert.doesNotMatch(selfObservationPrompt, /31\.234567|121\.456789|Exact home coordinate/)
 
     const merge = await requestJson(baseUrl, '/api/ai/self/merge', {
       body: {
@@ -369,8 +382,8 @@ test('provider pool balances requests and isolates a failing channel', async () 
   let proxy
   try {
     const [primaryUrl, secondaryUrl] = await Promise.all([listen(primary.server), listen(secondary.server)])
-    process.env.THEIA_RUNTIME_ROOT = runtimeRoot
-    process.env.THEIA_RELEASE_LAYOUT = '1'
+    process.env.HYPERION_RUNTIME_ROOT = runtimeRoot
+    process.env.HYPERION_RELEASE_LAYOUT = '1'
     process.env.AI_PORT = '0'
     process.env.AI_PROVIDER_TIMEOUT_MS = '2000'
     const { startAiProxy } = await import(`../server/index.mjs?provider-pool-test=${Date.now()}`)
@@ -643,8 +656,8 @@ test('provider pool fills each channel capacity before queueing extra work', asy
   let proxy
   try {
     const [primaryUrl, secondaryUrl] = await Promise.all([listen(primary.server), listen(secondary.server)])
-    process.env.THEIA_RUNTIME_ROOT = runtimeRoot
-    process.env.THEIA_RELEASE_LAYOUT = '1'
+    process.env.HYPERION_RUNTIME_ROOT = runtimeRoot
+    process.env.HYPERION_RELEASE_LAYOUT = '1'
     process.env.AI_PORT = '0'
     process.env.AI_PROVIDER_TIMEOUT_MS = '2000'
     const { startAiProxy } = await import(`../server/index.mjs?provider-capacity-test=${Date.now()}`)
@@ -728,8 +741,8 @@ test('same relay aliases share one upstream concurrency ceiling', async () => {
   let proxy
   try {
     const providerUrl = await listen(provider.server)
-    process.env.THEIA_RUNTIME_ROOT = runtimeRoot
-    process.env.THEIA_RELEASE_LAYOUT = '1'
+    process.env.HYPERION_RUNTIME_ROOT = runtimeRoot
+    process.env.HYPERION_RELEASE_LAYOUT = '1'
     process.env.AI_PORT = '0'
     const { startAiProxy } = await import(`../server/index.mjs?shared-origin-test=${Date.now()}`)
     proxy = await startAiProxy()
@@ -780,8 +793,8 @@ test('upstream Retry-After is reported without cooling the local provider slot',
   let proxy
   try {
     const providerUrl = await listen(provider)
-    process.env.THEIA_RUNTIME_ROOT = runtimeRoot
-    process.env.THEIA_RELEASE_LAYOUT = '1'
+    process.env.HYPERION_RUNTIME_ROOT = runtimeRoot
+    process.env.HYPERION_RELEASE_LAYOUT = '1'
     process.env.AI_PORT = '0'
     const { startAiProxy } = await import(`../server/index.mjs?retry-after-test=${Date.now()}`)
     proxy = await startAiProxy()
@@ -816,8 +829,8 @@ test('server-resident AI session keeps provider capacity supplied after individu
   let proxy
   try {
     const [primaryUrl, secondaryUrl] = await Promise.all([listen(primary.server), listen(secondary.server)])
-    process.env.THEIA_RUNTIME_ROOT = runtimeRoot
-    process.env.THEIA_RELEASE_LAYOUT = '1'
+    process.env.HYPERION_RUNTIME_ROOT = runtimeRoot
+    process.env.HYPERION_RELEASE_LAYOUT = '1'
     process.env.AI_PORT = '0'
     process.env.AI_PROVIDER_TIMEOUT_MS = '2000'
     const { startAiProxy } = await import(`../server/index.mjs?provider-session-test=${Date.now()}`)
@@ -920,8 +933,8 @@ test('deleting an AI session aborts active upstream requests and removes queued 
   let proxy
   try {
     const providerUrl = await listen(provider.server)
-    process.env.THEIA_RUNTIME_ROOT = runtimeRoot
-    process.env.THEIA_RELEASE_LAYOUT = '1'
+    process.env.HYPERION_RUNTIME_ROOT = runtimeRoot
+    process.env.HYPERION_RELEASE_LAYOUT = '1'
     process.env.AI_PORT = '0'
     process.env.AI_PROVIDER_TIMEOUT_MS = '10000'
     const { startAiProxy } = await import(`../server/index.mjs?session-cancel-test=${Date.now()}`)
@@ -973,8 +986,8 @@ test('auto mode learns a Responses protocol incompatibility and reuses Chat Comp
   let proxy
   try {
     const providerUrl = await listen(provider.server)
-    process.env.THEIA_RUNTIME_ROOT = runtimeRoot
-    process.env.THEIA_RELEASE_LAYOUT = '1'
+    process.env.HYPERION_RUNTIME_ROOT = runtimeRoot
+    process.env.HYPERION_RELEASE_LAYOUT = '1'
     process.env.AI_PORT = '0'
     process.env.AI_PROVIDER_TIMEOUT_MS = '2000'
     const { startAiProxy } = await import(`../server/index.mjs?provider-protocol-test=${Date.now()}`)
@@ -1061,8 +1074,8 @@ test('people consolidation preserves structured evidence claims for renderer ver
   let proxy
   try {
     const providerUrl = await listen(provider)
-    process.env.THEIA_RUNTIME_ROOT = runtimeRoot
-    process.env.THEIA_RELEASE_LAYOUT = '1'
+    process.env.HYPERION_RUNTIME_ROOT = runtimeRoot
+    process.env.HYPERION_RELEASE_LAYOUT = '1'
     process.env.AI_PORT = '0'
     const { startAiProxy } = await import(`../server/index.mjs?people-merge-test=${Date.now()}`)
     proxy = await startAiProxy()
@@ -1145,8 +1158,8 @@ test('concurrent app and provider settings writes preserve both updates', async 
   const runtimeRoot = sharedRuntimeRoot
   let proxy
   try {
-    process.env.THEIA_RUNTIME_ROOT = runtimeRoot
-    process.env.THEIA_RELEASE_LAYOUT = '1'
+    process.env.HYPERION_RUNTIME_ROOT = runtimeRoot
+    process.env.HYPERION_RELEASE_LAYOUT = '1'
     process.env.AI_PORT = '0'
     const { startAiProxy } = await import(`../server/index.mjs?settings-concurrency-test=${Date.now()}`)
     proxy = await startAiProxy()

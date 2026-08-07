@@ -35,6 +35,7 @@ export function useIntelAnalysisSelection({
   analysisTargets,
 }: UseIntelAnalysisSelectionOptions) {
   const conversations = useMemo(() => indexedItems ? buildConversationTimeline(indexedItems) : [], [indexedItems])
+  const conversationRecordsById = useMemo(() => new Map(conversations.map((conversation) => [conversation.id, conversation.records])), [conversations])
   const conversationFingerprints = useMemo(() => new Map(conversations.map((conversation) => [conversation.id, analysisConversationFingerprint(conversation.records)])), [conversations])
   const conversationKinds = useMemo(() => new Map(conversations.map((conversation) => [conversation.id, conversation.kind])), [conversations])
   const filteredConversations = useMemo(() => conversations.filter((conversation) => timelineMode === 'last-chat'
@@ -50,9 +51,13 @@ export function useIntelAnalysisSelection({
         : records
     }
     const workflowNeedsAnalysis = (item: IntelItem) => {
+      // "All conversations" must mean all archived records, including
+      // reviewed self-journal rows and manually confirmed AI imports. The
+      // previous status-first check made the self pipeline look empty even
+      // when its source counter was non-zero.
+      if (scope === 'all') return true
       if (item.status !== 'new') return false
       if (scope === 'new') return true
-      if (scope === 'all') return true
       const conversationId = analysisConversationKey(item)
       const fingerprint = conversationFingerprints.get(conversationId)
       const taskWatermark = aiSettings.analysisWatermarks?.tasks?.[conversationId]
@@ -74,18 +79,22 @@ export function useIntelAnalysisSelection({
     return fullConversationRecords(indexedItems, timeMatches)
   }, [aiSettings.analysisWatermarks, analysisConversation, analysisConversationId, analysisTargets, conversationFingerprints, conversationKinds, filteredConversations, indexedItems, scope, timelineEnd, timelineMode, timelineStart])
   const analysisConversationCount = useMemo(() => new Set(analysisMessages.map(conversationKey)).size, [analysisMessages])
-  const automaticWorkPending = useMemo(() => conversations.some((conversation) => {
-    if (!conversation.records.some((item) => item.status === 'new')) return false
-    const fingerprint = conversationFingerprints.get(conversation.id)
-    if (!fingerprint) return true
-    const taskWatermark = aiSettings.analysisWatermarks?.tasks?.[conversation.id]
-    const legacyTaskDone = !taskWatermark && conversation.records.every((item) => Boolean(item.aiAnalyzedAt))
+  const automaticPendingRecordCount = useMemo(() => (indexedItems ?? []).reduce((count, item) => {
+    if (item.status !== 'new') return count
+    const conversationId = analysisConversationKey(item)
+    const fingerprint = conversationFingerprints.get(conversationId)
+    if (!fingerprint) return count + 1
+    const taskWatermark = aiSettings.analysisWatermarks?.tasks?.[conversationId]
+    const records = conversationRecordsById.get(conversationId) ?? []
+    const legacyTaskDone = !taskWatermark && records.length > 0 && records.every((record) => Boolean(record.aiAnalyzedAt))
     const taskNeedsAnalysis = taskWatermark !== fingerprint && !legacyTaskDone
-    const peopleNeedsAnalysis = conversation.kind === 'direct' && aiSettings.analysisWatermarks?.people?.[conversation.id] !== fingerprint
-    return analysisTargets.tasks && analysisTargets.people
+    const peopleNeedsAnalysis = conversationKinds.get(conversationId) === 'direct' && aiSettings.analysisWatermarks?.people?.[conversationId] !== fingerprint
+    const needsAnalysis = analysisTargets.tasks && analysisTargets.people
       ? taskNeedsAnalysis || peopleNeedsAnalysis
       : analysisTargets.people ? peopleNeedsAnalysis : taskNeedsAnalysis
-  }), [aiSettings.analysisWatermarks, analysisTargets, conversationFingerprints, conversations])
+    return needsAnalysis ? count + 1 : count
+  }, 0), [aiSettings.analysisWatermarks, analysisTargets, conversationFingerprints, conversationKinds, conversationRecordsById, indexedItems])
+  const automaticWorkPending = automaticPendingRecordCount > 0
 
-  return { conversations, conversationFingerprints, conversationKinds, filteredConversations, analysisConversation, analysisMessages, analysisConversationCount, automaticWorkPending }
+  return { conversations, conversationFingerprints, conversationKinds, filteredConversations, analysisConversation, analysisMessages, analysisConversationCount, automaticWorkPending, automaticPendingRecordCount }
 }

@@ -1,6 +1,6 @@
 import type { ContextEvent, ContextEventKind, ContextEventSource } from '../types'
 
-/** The only device-timeline interchange contract accepted by THEIA. */
+/** The only device-timeline interchange contract accepted by HYPERION. */
 export const SELENE_EVENTS_SCHEMA = 'selene-context-events/v1'
 
 export interface SeleneEventDocument {

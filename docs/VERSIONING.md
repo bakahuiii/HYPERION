@@ -1,13 +1,13 @@
-# THEIA 版本管理规范
+# HYPERION 版本管理规范
 
-本文规定 THEIA 本地工作区、Git 历史和发布物的唯一组织方式。目标是让源码、个人运行数据、待验证构建和正式发布物互不混淆，并确保每个发布版本都能定位、校验和回滚。
+本文规定 HYPERION 本地工作区、Git 历史和发布物的唯一组织方式。目标是让源码、个人运行数据、待验证构建和正式发布物互不混淆，并确保每个发布版本都能定位、校验和回滚。
 
 ## 1. 标准目录布局
 
-统一工作根目录记为 `<THEIA_WORK_ROOT>`；实际路径可由每台机器自行选择：
+统一工作根目录记为 `<HYPERION_WORK_ROOT>`；实际路径可由每台机器自行选择：
 
 ```text
-<THEIA_WORK_ROOT>\
+<HYPERION_WORK_ROOT>\
   README.md                 本机目录入口，不是应用源码 README
   source\                   唯一 Git 工作区
   releases\
@@ -39,11 +39,11 @@
 - `releases` 只保存已经发布或明确标记为历史快照的只读产物。
 - `staging` 只保存待检查产物。检查通过后移动到对应的 `releases\vX.Y.Z`。
 - 用户任务、聊天、模型密钥、头像缓存和日志只属于运行数据，不得进入 `releases` 或 Git。
-- 不在工作根目录直接放置新的 `THEIA-*` 文件；所有新版本必须进入统一根目录。
+- 不在工作根目录直接放置新的 `HYPERION-*` 文件；所有新版本必须进入统一根目录。
 
 ## 2. 版本号
 
-THEIA 使用语义化版本 `MAJOR.MINOR.PATCH`：
+HYPERION 使用语义化版本 `MAJOR.MINOR.PATCH`：
 
 - `MAJOR`：出现不兼容的数据格式、配置或工作流变化。
 - `MINOR`：增加向后兼容的新功能。
@@ -63,12 +63,12 @@ THEIA 使用语义化版本 `MAJOR.MINOR.PATCH`：
 推荐名称：
 
 ```text
-THEIA-X.Y.Z-portable\
-THEIA-X.Y.Z-portable.zip
-THEIA-X.Y.Z-portable.zip.sha256.txt
-THEIA-release-X.Y.Z\
-THEIA-release-X.Y.Z.zip
-THEIA-release-X.Y.Z.zip.sha256.txt
+HYPERION-X.Y.Z-portable\
+HYPERION-X.Y.Z-portable.zip
+HYPERION-X.Y.Z-portable.zip.sha256.txt
+HYPERION-release-X.Y.Z\
+HYPERION-release-X.Y.Z.zip
+HYPERION-release-X.Y.Z.zip.sha256.txt
 ```
 
 同一版本需要重建但内容不同，应先修正版本号。只有整理历史产物时才保留 `r2`、日期等旧名称；新的正式发布不使用含义不清的 `latest`、`new` 或未命名目录。
@@ -87,15 +87,15 @@ npm run build
 工作区必须先干净。然后把新构建写入 staging：
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.3.0\THEIA-release-0.3.0
-npm run dist:exe -- ..\staging\v0.3.0\THEIA-0.3.0-portable
+node release-tools/package-release.mjs ..\staging\v0.3.0\HYPERION-release-0.3.0
+npm run dist:exe -- ..\staging\v0.3.0\HYPERION-0.3.0-portable
 ```
 
 发布前至少检查：
 
 1. 版本号与发布说明一致。
 2. 源码包不含 `.git`、`node_modules`、运行状态、聊天、API Key、日志或头像缓存。
-3. 便携版能在干净目录启动，运行数据写入 `%APPDATA%\THEIA`。
+3. 便携版能在干净目录启动，运行数据写入 `%APPDATA%\HYPERION`。
 4. ZIP 可以完整列出并解压。
 5. ZIP 的 SHA-256 已生成并复核。
 6. README 图片和相对链接正常。
@@ -110,8 +110,8 @@ npm run release:index
 
 ```powershell
 git add package.json package-lock.json README.md docs/RELEASE_NOTES.md
-git commit -m "release: THEIA X.Y.Z"
-git tag -a vX.Y.Z -m "THEIA X.Y.Z"
+git commit -m "release: HYPERION X.Y.Z"
+git tag -a vX.Y.Z -m "HYPERION X.Y.Z"
 git push origin main
 git push origin vX.Y.Z
 ```
@@ -121,7 +121,7 @@ git push origin vX.Y.Z
 `npm run release:index` 默认把 `source` 的父目录视为工作根目录。也可以显式指定：
 
 ```powershell
-node release-tools/update-release-index.mjs <THEIA_WORK_ROOT>
+node release-tools/update-release-index.mjs <HYPERION_WORK_ROOT>
 ```
 
 该工具会：
@@ -146,7 +146,7 @@ node release-tools/update-release-index.mjs <THEIA_WORK_ROOT>
 
 回滚代码时，不覆盖或删除用户运行数据：
 
-1. 先备份 `%APPDATA%\THEIA`。
+1. 先备份 `%APPDATA%\HYPERION`。
 2. 从对应 Git 标签检出源码，或使用 `releases` 中已校验的旧便携包。
 3. 核对 `SHA256SUMS.txt`。
 4. 如果新版本改变了数据结构，先阅读该版本发布说明；没有明确兼容承诺时，不直接用旧版本写入新数据。
@@ -163,7 +163,7 @@ node release-tools/update-release-index.mjs <THEIA_WORK_ROOT>
 
 ## 9. 当前迁移基线
 
-- `v0.6.0`：MNEMO 本机微信持续归档、THEIA 管理的 immutable inbox、备注/昵称可读导出、内容寻址本地头像和会话级增量提炼触发。
+- `v0.6.0`：MNEMO 本机微信持续归档、HYPERION 管理的 immutable inbox、备注/昵称可读导出、内容寻址本地头像和会话级增量提炼触发。
 - `v0.5.0`：手动日记、每日状态快照、AI 对话导入和来源关联的自我分析；追加式归档完整性、恢复与大数据浏览基础；多模型裁决数据契约（未启用实际 fan-out）。
 - `v0.1.0`：首个源码发布、多个历史源码快照和 Windows 便携版。
 - `v0.1.1`：当前 Windows x64 便携版。
@@ -173,6 +173,6 @@ node release-tools/update-release-index.mjs <THEIA_WORK_ROOT>
 - `v0.4.0`：追加式大归档、共享同步、迁移回滚、Web Worker 解析和发布可靠性基线。
 - `v0.4.1`：重叠分段安全去重、人物搜索与联系概览、人际建议边界。
 - `v0.4.2`：紧凑模型协议、会话级人物主体识别、时间边界、关键事件和连续人物画像稳定性。
-- 当前 Git 仓库位于 `<THEIA_WORK_ROOT>\source`，保留现有提交、未提交改动和本地运行数据。
+- 当前 Git 仓库位于 `<HYPERION_WORK_ROOT>\source`，保留现有提交、未提交改动和本地运行数据。
 
-迁移完成后，`<THEIA_WORK_ROOT>\README.md` 和 `releases\INDEX.md` 是本机查找版本的两个入口。
+迁移完成后，`<HYPERION_WORK_ROOT>\README.md` 和 `releases\INDEX.md` 是本机查找版本的两个入口。

@@ -28,7 +28,7 @@
 
 - 新增 [API 协议参考](API_PROTOCOL.md)，逐字段描述 `/api/ai/analyze`、人物证据、人物归并、任务建议、session enqueue/results/ack、通道状态、同步快照、日志和上游协议。
 - 开发者文档更新为 `0.3.0`，补充实际并发、退避、发布布局、测试范围和数据边界。
-- 发布包统一复制 `docs/`、三张界面截图和虚构示例；不会复制 `.theia-*`、API 配置、聊天、任务、人物、头像、背景、日志或 Electron profile。
+- 发布包统一复制 `docs/`、三张界面截图和虚构示例；不会复制 `.hyperion-*`、API 配置、聊天、任务、人物、头像、背景、日志或 Electron profile。
 
 ### 兼容性与升级
 
@@ -130,9 +130,9 @@
 
 ## 0.1.1 Windows portable package
 
-- 提供 Windows x64 便携版，解压后运行 `THEIA.exe`，无需安装 Node.js 或 npm。
+- 提供 Windows x64 便携版，解压后运行 `HYPERION.exe`，无需安装 Node.js 或 npm。
 - 内置本地 API 服务和静态资源加载，桌面包可在独立目录中直接启动。
-- 运行数据统一写入 `%APPDATA%\\THEIA`，发布包不携带开发机的聊天记录、设置、密钥、缓存或日志。
+- 运行数据统一写入 `%APPDATA%\\HYPERION`，发布包不携带开发机的聊天记录、设置、密钥、缓存或日志。
 - 提供 ZIP 分发包与 SHA-256 校验文件。
 
 ## 0.1.0 source release

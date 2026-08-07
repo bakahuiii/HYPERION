@@ -1,13 +1,13 @@
 declare global {
   interface Window {
-    theiaRuntime?: { apiBase?: string }
+    hyperionRuntime?: { apiBase?: string }
     /** Called by the Electron shell before closing the renderer. */
-    theiaFlush?: () => Promise<void>
+    hyperionFlush?: () => Promise<void>
   }
 }
 
 export function apiUrl(path: string) {
-  const base = window.theiaRuntime?.apiBase?.replace(/\/+$/, '')
+  const base = window.hyperionRuntime?.apiBase?.replace(/\/+$/, '')
   return base && path.startsWith('/api/') ? `${base}${path}` : path
 }
 
@@ -22,6 +22,6 @@ export function localProxyUrl(path: string) {
   const { protocol, hostname } = window.location
   const isLocalHttp = protocol === 'http:' && (hostname === '127.0.0.1' || hostname === 'localhost')
   const viteEnvironment = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env
-  const developmentPort = String(viteEnvironment?.VITE_THEIA_API_PORT || '8787').replace(/\D/g, '') || '8787'
+  const developmentPort = String(viteEnvironment?.VITE_HYPERION_API_PORT || '8787').replace(/\D/g, '') || '8787'
   return isLocalHttp ? `${protocol}//${hostname}:${developmentPort}${path}` : path
 }

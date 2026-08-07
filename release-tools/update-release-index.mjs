@@ -131,14 +131,14 @@ for (const versionEntry of versionEntries) {
 
 const generatedAt = new Date().toISOString()
 const index = {
-  product: 'THEIA',
+  product: 'HYPERION',
   generatedAt,
   releasesRoot: releasesRoot,
   versions,
 }
 
 const markdown = [
-  '# THEIA Release Index',
+  '# HYPERION Release Index',
   '',
   `Generated: ${generatedAt}`,
   '',
@@ -171,4 +171,4 @@ await atomicWrite(resolve(releasesRoot, 'INDEX.json'), `${JSON.stringify(index, 
 await atomicWrite(resolve(releasesRoot, 'INDEX.md'), `${markdown.join('\n')}\n`)
 await atomicWrite(resolve(releasesRoot, 'SHA256SUMS.txt'), `${checksumLines.join('\n')}\n`)
 
-console.log(`Indexed ${versions.length} THEIA versions in ${releasesRoot}`)
+console.log(`Indexed ${versions.length} HYPERION versions in ${releasesRoot}`)

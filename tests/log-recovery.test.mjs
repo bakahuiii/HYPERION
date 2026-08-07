@@ -8,7 +8,7 @@ import { finishRecoverySession, startRecoverySession } from '../server/crashReco
 import { pruneLogDirectory } from '../server/logRetention.mjs'
 
 test('log retention removes oldest files while respecting count and byte limits', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'theia-logs-'))
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-logs-'))
   t.after(() => rm(root, { recursive: true, force: true }))
   for (let index = 0; index < 5; index += 1) {
     const path = join(root, `${index}.jsonl.gz`)
@@ -22,7 +22,7 @@ test('log retention removes oldest files while respecting count and byte limits'
   assert.deepEqual((await readdir(root)).sort(), ['3.jsonl.gz', '4.jsonl.gz'])
 })
 test('runtime marker reports an unclean prior session and clears on shutdown', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'theia-recovery-'))
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-recovery-'))
   t.after(() => rm(root, { recursive: true, force: true }))
   const marker = join(root, 'runtime', 'session.json')
   const log = join(root, 'logs', 'crash.jsonl')

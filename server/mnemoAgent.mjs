@@ -7,20 +7,25 @@ function clean(value) {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-/** Starts the independent MNEMO process while keeping lifecycle ownership in THEIA. */
+function environmentValue(name) {
+  return process.env[`HYPERION_${name}`] ?? process.env[`THEIA_${name}`]
+}
+
+/** Starts the independent MNEMO process while keeping lifecycle ownership in HYPERION. */
 export function createMnemoAgentController(options = {}) {
   const workspace = resolve(clean(options.workspace) || process.cwd())
   const outboxDirectory = resolve(clean(options.outboxDirectory) || resolve(workspace, 'mnemo-inbox'))
-  const archiveDirectory = resolve(clean(options.archiveDirectory || process.env.THEIA_MNEMO_ARCHIVE) || resolve(workspace, 'mnemo-export'))
-  const avatarDirectory = resolve(clean(options.avatarDirectory || process.env.THEIA_MNEMO_AVATAR_DIRECTORY) || resolve(workspace, 'avatars'))
-  const configuredHome = clean(options.home || process.env.THEIA_MNEMO_HOME)
+  const archiveDirectory = resolve(clean(options.archiveDirectory || environmentValue('MNEMO_ARCHIVE')) || resolve(workspace, 'mnemo-export'))
+  const avatarDirectory = resolve(clean(options.avatarDirectory || environmentValue('MNEMO_AVATAR_DIRECTORY')) || resolve(workspace, 'avatars'))
+  const configuredHome = clean(options.home || environmentValue('MNEMO_HOME'))
   const home = configuredHome ? resolve(configuredHome) : resolve(workspace, '..', '..', 'WECHAT-Exporter')
-  const script = resolve(clean(options.script || process.env.THEIA_MNEMO_SCRIPT) || resolve(home, 'python', 'mnemo_agent.py'))
-  const python = clean(options.python || process.env.THEIA_MNEMO_PYTHON) || 'python'
-  const account = clean(options.account || process.env.THEIA_MNEMO_ACCOUNT)
-  const interval = Math.min(900, Math.max(10, Math.round(Number(options.interval || process.env.THEIA_MNEMO_INTERVAL_SECONDS) || 30)))
-  const enabled = options.enabled !== false && process.env.THEIA_MNEMO_DISABLED !== '1'
+  const script = resolve(clean(options.script || environmentValue('MNEMO_SCRIPT')) || resolve(home, 'python', 'mnemo_agent.py'))
+  const python = clean(options.python || environmentValue('MNEMO_PYTHON')) || 'python'
+  const account = clean(options.account || environmentValue('MNEMO_ACCOUNT'))
+  const interval = Math.min(900, Math.max(10, Math.round(Number(options.interval || environmentValue('MNEMO_INTERVAL_SECONDS')) || 30)))
+  const enabled = options.enabled !== false && environmentValue('MNEMO_DISABLED') !== '1'
   let child = null
+  let stopping = false
   let status = {
     enabled,
     available: existsSync(script),
@@ -31,6 +36,7 @@ export function createMnemoAgentController(options = {}) {
     intervalSeconds: interval,
     processId: null,
     startedAt: null,
+    runtimeState: enabled ? 'starting' : 'disabled',
     lastExit: null,
     lastError: null,
     lastEvent: null,
@@ -39,12 +45,29 @@ export function createMnemoAgentController(options = {}) {
   function recordAgentLine(line, isError) {
     const message = clean(line)
     if (!message) return
-    if (message.includes('MNEMO setup required')) {
-      status = { ...status, lastError: 'MNEMO setup required: capture the WeChat key once in the MNEMO GUI' }
+    if (isError) {
+      // Python reserves stderr for exceptional local processing failures.
+      // Ignore unrelated runtime notices, which must not surface as a data
+      // error in HYPERION's otherwise silent intake.
+      if (!message.startsWith('MNEMO:')) return
+      const detail = clean(message.slice('MNEMO:'.length)).slice(0, 320)
+      status = {
+        ...status,
+        runtimeState: 'error',
+        lastError: detail ? `MNEMO local processing failed: ${detail}` : 'MNEMO agent reported a local processing error',
+      }
       return
     }
-    if (isError) status = { ...status, lastError: 'MNEMO agent reported a local processing error' }
-    else status = { ...status, lastEvent: 'MNEMO incremental sync completed' }
+    try {
+      const event = JSON.parse(message)
+      if (event?.type === 'mnemo-status' && (event.state === 'waiting' || event.state === 'ready')) {
+        status = { ...status, runtimeState: event.state, lastError: null, lastEvent: event.state === 'ready' ? 'MNEMO local database is ready' : null }
+        return
+      }
+    } catch {
+      // Normal sync payloads are still accepted below without exposing data.
+    }
+    status = { ...status, runtimeState: 'ready', lastError: null, lastEvent: 'MNEMO incremental sync completed' }
   }
 
   function attachOutput(stream, isError) {
@@ -63,13 +86,14 @@ export function createMnemoAgentController(options = {}) {
   async function start() {
     if (!enabled) return { ...status }
     if (child && child.exitCode === null) return { ...status }
+    stopping = false
     await Promise.all([
       mkdir(outboxDirectory, { recursive: true, mode: 0o700 }),
       mkdir(archiveDirectory, { recursive: true, mode: 0o700 }),
       mkdir(avatarDirectory, { recursive: true, mode: 0o700 }),
     ])
     if (!existsSync(script)) {
-      status = { ...status, available: false, lastError: `MNEMO agent was not found: ${script}` }
+      status = { ...status, available: false, runtimeState: 'error', lastError: `MNEMO agent was not found: ${script}` }
       return { ...status }
     }
     const args = [
@@ -84,26 +108,29 @@ export function createMnemoAgentController(options = {}) {
         cwd: dirname(script),
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, THEIA_MNEMO_OUTBOX: outboxDirectory },
+        env: { ...process.env, HYPERION_MNEMO_OUTBOX: outboxDirectory },
       })
       attachOutput(child.stdout, false)
       attachOutput(child.stderr, true)
-      status = { ...status, available: true, processId: child.pid ?? null, startedAt: new Date().toISOString(), lastError: null }
-      child.once('error', () => { status = { ...status, processId: null, lastError: 'Unable to start the MNEMO agent' } })
+      status = { ...status, available: true, processId: child.pid ?? null, startedAt: new Date().toISOString(), runtimeState: 'starting', lastError: null }
+      child.once('error', () => { status = { ...status, processId: null, runtimeState: 'error', lastError: 'Unable to start the MNEMO agent' } })
       child.once('exit', (code, signal) => {
-        status = { ...status, processId: null, lastExit: { at: new Date().toISOString(), code, signal }, lastError: code && code !== 0 ? `MNEMO agent exited with code ${code}` : status.lastError }
+        status = stopping
+          ? { ...status, processId: null, runtimeState: 'stopped', lastExit: { at: new Date().toISOString(), code, signal }, lastError: null }
+          : { ...status, processId: null, runtimeState: 'error', lastExit: { at: new Date().toISOString(), code, signal }, lastError: code && code !== 0 ? `MNEMO agent exited with code ${code}` : 'MNEMO agent exited unexpectedly' }
         child = null
       })
     } catch (error) {
-      status = { ...status, processId: null, lastError: error instanceof Error ? error.message : String(error) }
+      status = { ...status, processId: null, runtimeState: 'error', lastError: error instanceof Error ? error.message : String(error) }
     }
     return { ...status }
   }
 
   function stop() {
+    stopping = true
     if (child && child.exitCode === null) child.kill()
     child = null
-    status = { ...status, processId: null }
+    status = { ...status, processId: null, runtimeState: 'stopped' }
   }
 
   return { start, stop, status: () => ({ ...status }) }

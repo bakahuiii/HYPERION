@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import type { AiExtractionCheckpoint, AiSettings, AiTaskCandidate, ArchiveAnalysisSummary, DailyCheckIn, IntelItem, Person, SelfAnalysis } from '../types'
+import type { AiExtractionCheckpoint, AiSettings, AiTaskCandidate, ArchiveAnalysisSummary, ContextEvent, IntelItem, Person, SelfAnalysis } from '../types'
 import {
   analyzeIntel,
   analyzeSelf,
@@ -12,6 +12,8 @@ import {
 } from '../lib/aiClient'
 import { checkpointForRetry } from '../lib/analysisCheckpoint'
 import { analysisConversationKey } from '../lib/analysisWatermark'
+import { automaticTriggerIsDue } from '../lib/automaticAnalysis'
+import { SELF_JOURNAL_CONVERSATION_ID } from '../lib/selfJournal'
 import {
   conversationKey,
   fullConversationRecords,
@@ -52,9 +54,10 @@ interface UseAiWorkflowOptions {
   conversationFingerprints: ReadonlyMap<string, string>
   conversationKinds: ReadonlyMap<string, IntelItem['conversationKind']>
   automaticWorkPending: boolean
+  automaticPendingRecordCount: number
   effectiveConcurrency: number
   attachmentFiles: File[]
-  dailyCheckins: DailyCheckIn[]
+  contextEvents: ContextEvent[]
   appendDebugLog: (entry: AiDebugEntry) => void
   onAiAnalysis: (
     candidates: AiTaskCandidate[],
@@ -77,7 +80,8 @@ interface UseAiWorkflowOptions {
 }
 
 function isDue(lastRunAt: string | undefined, intervalHours: number) {
-  return !lastRunAt || Date.now() - new Date(lastRunAt).getTime() >= Math.max(24, intervalHours) * 60 * 60 * 1000
+  const lastRunTimestamp = Date.parse(lastRunAt ?? '')
+  return !Number.isFinite(lastRunTimestamp) || Date.now() - lastRunTimestamp >= Math.max(1, Number(intervalHours) || 24) * 60 * 60 * 1000
 }
 
 function formatCount(value: number) {
@@ -104,9 +108,10 @@ export function useAiWorkflow({
   conversationFingerprints,
   conversationKinds,
   automaticWorkPending,
+  automaticPendingRecordCount,
   effectiveConcurrency,
   attachmentFiles,
-  dailyCheckins,
+  contextEvents,
   appendDebugLog,
   onAiAnalysis,
   onDirectPeopleDetected,
@@ -262,7 +267,11 @@ export function useAiWorkflow({
       checkpointRef.current = next
       onAnalysisCheckpoint(next)
     }
-    if (targets.people) onDirectPeopleDetected(buildDirectConversationFallbackPeople(source))
+    // The self journal is intentionally a direct conversation only for the
+    // archive contract. It is evidence about the user, never a counterpart
+    // who should receive a fallback person card or a portrait request.
+    const peopleSource = source.filter((item) => item.conversationId !== SELF_JOURNAL_CONVERSATION_ID)
+    if (targets.people) onDirectPeopleDetected(buildDirectConversationFallbackPeople(peopleSource))
     setRetryConversationIds([])
     busyRef.current = true
     const controller = new AbortController()
@@ -293,7 +302,7 @@ export function useAiWorkflow({
       const selfMessage = `正在提炼自我分析：将覆盖 ${formatCount(selfSource.length)} 条本人发言，并按时间窗提取可核验观察。`
       setMessage(selfMessage)
       onAnalysisWorkChange({ stage: 'self', completed: 0, total: 0, completedConversations: 0, totalConversations: 0, candidates: 0, message: selfMessage })
-      const selfResult = await analyzeSelf(selfSource, dailyCheckins, aiSettings, (nextProgress) => {
+      const selfResult = await analyzeSelf(selfSource, contextEvents, aiSettings, (nextProgress) => {
         const progressMessage = `自我分析进度：时间窗 ${nextProgress.completed}/${nextProgress.total}；已保留 ${nextProgress.candidates} 条可核验观察。`
         setProgress(nextProgress)
         setMessage(progressMessage)
@@ -317,7 +326,7 @@ export function useAiWorkflow({
         return
       }
       if (peopleStage) {
-        const peopleResult = await onPeopleAnalysis(source, aiSettings, (nextProgress) => {
+        const peopleResult = await onPeopleAnalysis(peopleSource, aiSettings, (nextProgress) => {
           const progressMessage = `人物总进度：${nextProgress.completedConversations ?? 0}/${nextProgress.totalConversations ?? selectedConversationCount} 个对话；片段 ${nextProgress.completed}/${nextProgress.total}；已保留 ${nextProgress.candidates} 张人物卡。`
           setProgress(nextProgress)
           persistCompletedConversation(nextProgress)
@@ -342,6 +351,7 @@ export function useAiWorkflow({
         if (peopleResult.failedConversationIds?.length) {
           setRetryConversationIds(peopleResult.failedConversationIds)
           setMessage(`人物提炼已保留成功结果；${peopleResult.failedConversationIds.length} 个会话仍需重试，恢复进度已保存。`)
+          if (targets.self) await runSelfStage()
           return
         }
         if (targets.self) {
@@ -403,7 +413,7 @@ export function useAiWorkflow({
         const peopleCheckpoint = { ...checkpointRef.current!, stage: 'people' as const, completedConversationIds: [] }
         checkpointRef.current = peopleCheckpoint
         onAnalysisCheckpoint(peopleCheckpoint)
-        const peopleResult = await onPeopleAnalysis(source, aiSettings, (nextProgress) => {
+          const peopleResult = await onPeopleAnalysis(peopleSource, aiSettings, (nextProgress) => {
           const peopleMessage = `人物总进度：${nextProgress.completedConversations ?? 0}/${nextProgress.totalConversations ?? selectedConversationCount} 个对话；片段 ${nextProgress.completed}/${nextProgress.total}；已保留 ${nextProgress.candidates} 张人物卡。`
           setProgress(nextProgress)
           persistCompletedConversation(nextProgress)
@@ -424,6 +434,7 @@ export function useAiWorkflow({
           if (peopleResult.failedConversationIds?.length) {
             setRetryConversationIds(peopleResult.failedConversationIds)
             setMessage(`任务提炼已完成，人物提炼保留了成功结果；${peopleResult.failedConversationIds.length} 个会话仍需重试。`)
+            if (targets.self) await runSelfStage()
           } else if (targets.self) {
             await runSelfStage()
           } else {
@@ -450,7 +461,7 @@ export function useAiWorkflow({
       onBusyChange?.(false)
       onAnalysisWorkChange(null)
     }
-  }, [aiSettings, analysisConversationCount, analysisConversationId, analysisMessages, analysisTargets, appendDebugLog, attachmentFiles, conversationFingerprints, conversationKinds, dailyCheckins, effectiveConcurrency, onAiAnalysis, onAnalysisCheckpoint, onAnalysisWatermark, onAnalysisWorkChange, onBusyChange, onCandidatesAvailable, onCandidatesSelected, onDirectPeopleDetected, onPeopleAnalysis, onSelfAnalysis, scope, timelineEnd, timelineMode, timelineStart])
+  }, [aiSettings, analysisConversationCount, analysisConversationId, analysisMessages, analysisTargets, appendDebugLog, attachmentFiles, contextEvents, conversationFingerprints, conversationKinds, effectiveConcurrency, onAiAnalysis, onAnalysisCheckpoint, onAnalysisWatermark, onAnalysisWorkChange, onBusyChange, onCandidatesAvailable, onCandidatesSelected, onDirectPeopleDetected, onPeopleAnalysis, onSelfAnalysis, scope, timelineEnd, timelineMode, timelineStart])
 
   const stop = useCallback(() => {
     if (!busyRef.current) return
@@ -489,14 +500,22 @@ export function useAiWorkflow({
 
   useEffect(() => {
     if (!aiSettings.autoEnabled) return
-    const timer = window.setInterval(() => {
+    const runWhenDue = () => {
       const taskDue = isDue(aiSettings.lastRunAt, aiSettings.intervalHours)
       const peopleDue = isDue(aiSettings.lastPeopleFollowupAt, aiSettings.intervalHours)
-      const due = analysisTargets.tasks && analysisTargets.people ? taskDue || peopleDue : analysisTargets.people ? peopleDue : taskDue
-      if (aiStatus?.configured && !busyRef.current && (due || automaticWorkPending)) void run(true)
-    }, 60_000)
-    return () => window.clearInterval(timer)
-  }, [aiSettings.autoEnabled, aiSettings.intervalHours, aiSettings.lastPeopleFollowupAt, aiSettings.lastRunAt, aiStatus?.configured, analysisTargets, automaticWorkPending, run])
+      const timeDue = analysisTargets.tasks && analysisTargets.people ? taskDue || peopleDue : analysisTargets.people ? peopleDue : taskDue
+      const due = automaticTriggerIsDue(
+        aiSettings.autoTriggerMode,
+        timeDue,
+        automaticPendingRecordCount,
+        aiSettings.incrementalMessageCount,
+      )
+      if (aiStatus?.configured && !busyRef.current && automaticWorkPending && due) void run(true)
+    }
+    const initial = window.setTimeout(runWhenDue, 500)
+    const timer = window.setInterval(runWhenDue, 60_000)
+    return () => { window.clearTimeout(initial); window.clearInterval(timer) }
+  }, [aiSettings.autoEnabled, aiSettings.autoTriggerMode, aiSettings.incrementalMessageCount, aiSettings.intervalHours, aiSettings.lastPeopleFollowupAt, aiSettings.lastRunAt, aiStatus?.configured, analysisTargets, automaticPendingRecordCount, automaticWorkPending, run])
 
   return {
     busy,

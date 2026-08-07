@@ -43,17 +43,17 @@ test('daily snapshots normalize bounds, collapse to one record per day, and mirr
   assert.match(archiveRow.capturedAt, /^2026-08-06T12:00:00\.000$/)
 })
 
-test('self analysis input only includes self-authored messages in chronological order plus structured anchors', () => {
-  const checkIns = normalizeDailyCheckIns([{ date: '2026-08-06', mood: 3, medication: 'no', alcohol: 'none' }])
+test('self analysis input only includes self-authored messages in chronological order plus separate context events', () => {
+  const contextEvents = [{ id: 'screen-day', version: 1, kind: 'screen-time', source: 'selene', startAt: '2026-08-06T00:00:00.000Z', title: 'Screen usage', capturedAt: '2026-08-06T20:00:00.000Z', importedAt: '2026-08-06T20:00:00.000Z', privacy: 'coarse' }]
   const result = buildSelfAnalysisInput([
     { id: 'other', source: 'AI 对话导入', summary: 'assistant reply', content: 'assistant reply', conversationId: 'ai-a', capturedAt: '2026-08-05T10:00:00.000Z', speakerRole: 'other', status: 'reviewed' },
     { id: 'self-late', source: 'AI 对话导入', summary: 'later user message', content: 'later user message', conversationId: 'ai-a', capturedAt: '2026-08-06T10:00:00.000Z', speakerRole: 'self', status: 'reviewed' },
     { id: 'self-early', source: '微信导出', summary: 'earlier user message', content: 'earlier user message', conversationId: 'direct-a', capturedAt: '2026-08-04T10:00:00.000Z', speakerRole: 'self', status: 'reviewed' },
-  ], checkIns, new Date('2026-08-06T12:00:00.000Z'))
+  ], contextEvents, new Date('2026-08-06T12:00:00.000Z'))
 
   assert.equal(result.analysisTarget, 'self')
   assert.deepEqual(result.records.map((item) => item.id), ['self-early', 'self-late'])
-  assert.deepEqual(result.dailyCheckins, checkIns)
+  assert.deepEqual(result.contextEvents, contextEvents)
 })
 
 test('authoritative directory replacements retain manual rows and let them win ID collisions', () => {

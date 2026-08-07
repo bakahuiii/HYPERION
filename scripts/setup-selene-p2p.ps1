@@ -7,14 +7,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$theiaRoot = Split-Path -Parent $PSScriptRoot
-$workspaceRoot = Split-Path -Parent (Split-Path -Parent $theiaRoot)
+$hyperionRoot = Split-Path -Parent $PSScriptRoot
+$workspaceRoot = Split-Path -Parent (Split-Path -Parent $hyperionRoot)
 $defaultInbox = Join-Path $workspaceRoot 'SELENE-Inbox'
 $inbox = [IO.Path]::GetFullPath($(if ($InboxDirectory) { $InboxDirectory } else { $defaultInbox }))
 
 New-Item -ItemType Directory -Force -Path $inbox | Out-Null
-[Environment]::SetEnvironmentVariable('THEIA_SELENE_INBOX', $inbox, 'User')
-$env:THEIA_SELENE_INBOX = $inbox
+[Environment]::SetEnvironmentVariable('HYPERION_SELENE_INBOX', $inbox, 'User')
+$env:HYPERION_SELENE_INBOX = $inbox
 
 function Find-SyncthingBinary {
   $command = Get-Command syncthing -ErrorAction SilentlyContinue
@@ -43,7 +43,7 @@ if ($InstallSyncthing -and -not $syncthingPath) {
   $syncthingPath = Find-SyncthingBinary
 }
 
-$startupShortcutName = 'THEIA SELENE P2P Syncthing.lnk'
+$startupShortcutName = 'HYPERION SELENE P2P Syncthing.lnk'
 if ($RegisterStartAtLogon) {
   $starter = Join-Path $PSScriptRoot 'start-selene-syncthing.ps1'
   if (-not (Test-Path -LiteralPath $starter -PathType Leaf)) { throw 'Syncthing startup helper is missing.' }
@@ -53,7 +53,7 @@ if ($RegisterStartAtLogon) {
   $shortcut = $shell.CreateShortcut($shortcutPath)
   $shortcut.TargetPath = Join-Path $PSHOME 'powershell.exe'
   $shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$starter`""
-  $shortcut.WorkingDirectory = $theiaRoot
+  $shortcut.WorkingDirectory = $hyperionRoot
   $shortcut.WindowStyle = 7
   $shortcut.Description = 'Starts Syncthing for the local SELENE P2P inbox after this user signs in.'
   $shortcut.Save()
@@ -84,15 +84,15 @@ if ($ConfigureSyncthingFolder) {
   }
 }
 
-Write-Output "THEIA_SELENE_INBOX=$inbox"
-Write-Output 'Restart THEIA after this command so its server inherits the user environment variable.'
+Write-Output "HYPERION_SELENE_INBOX=$inbox"
+Write-Output 'Restart HYPERION after this command so its server inherits the user environment variable.'
 if ($RegisterStartAtLogon) { Write-Output "Registered current-user startup shortcut: $startupShortcutName" }
 if ($ConfigureSyncthingFolder) { Write-Output "Configured Syncthing receive-only folder: $syncthingFolderId" }
 if ($syncthingPath) {
   Write-Output "Syncthing=$syncthingPath"
-  Write-Output 'Start Syncthing once, then use its local UI to pair the Android device and share this folder as Receive Only.'
+  Write-Output 'Open SELENE Windows and generate its one-time Android pairing QR; manual Syncthing UI pairing is no longer required.'
 } elseif ($syncthingInstalledThisRun) {
-  Write-Output 'Syncthing was installed successfully. Open a new PowerShell window so it inherits the updated PATH, then start Syncthing once to pair the Android device.'
+  Write-Output 'Syncthing was installed successfully. Open SELENE Windows and generate its one-time Android pairing QR.'
 } else {
   Write-Output 'Syncthing is not installed. Re-run with -InstallSyncthing or install Syncthing.Syncthing through winget.'
 }

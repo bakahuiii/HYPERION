@@ -1,11 +1,11 @@
-# THEIA 本地 API 与模型协议参考
+# HYPERION 本地 API 与模型协议参考
 
-本文是 THEIA `0.6.0` 的协议级参考，面向前端、桌面壳、第三方导出适配器、测试服务和二次开发者。它描述的是当前 `server/index.mjs` 和 `src/lib/aiClient.ts` 的实际行为，不是未来规划。
+本文是 HYPERION `0.6.0` 的协议级参考，面向前端、桌面壳、第三方导出适配器、测试服务和二次开发者。它描述的是当前 `server/index.mjs` 和 `src/lib/aiClient.ts` 的实际行为，不是未来规划。
 
 协议有两个边界：
 
-1. THEIA 本地 HTTP API 只监听 `127.0.0.1`，供浏览器、Electron renderer 和开发脚本使用。
-2. 本地服务再把经过校验的模型请求转发到用户配置的 OpenAI-compatible 服务。外部服务不会直接访问 THEIA 的本地文件。
+1. HYPERION 本地 HTTP API 只监听 `127.0.0.1`，供浏览器、Electron renderer 和开发脚本使用。
+2. 本地服务再把经过校验的模型请求转发到用户配置的 OpenAI-compatible 服务。外部服务不会直接访问 HYPERION 的本地文件。
 
 本地 API 没有用户认证，不能暴露到局域网或公网。设置接口可能向本机界面返回解密后的 API Key；打包桌面版的静态存储使用 Electron `safeStorage`，纯 Node 开发模式可能回退为 INI 明文。
 
@@ -635,9 +635,9 @@ Accept: application/json
 }
 ```
 
-服务端会先校验水位，再把操作写入 `theia-intel-archive/v1` 的 gzip JSONL delta segment。`upserts` 中的记录按稳定 `id` 覆盖，`deleteIds` 在 upsert 前执行；同一请求同时更新时以 upsert 为准。首次迁移、未知基线或大规模替换不应调用此接口，客户端会自动回退全量 snapshot。
+服务端会先校验水位，再把操作写入 `hyperion-intel-archive/v1` 的 gzip JSONL delta segment。`upserts` 中的记录按稳定 `id` 覆盖，`deleteIds` 在 upsert 前执行；同一请求同时更新时以 upsert 为准。首次迁移、未知基线或大规模替换不应调用此接口，客户端会自动回退全量 snapshot。
 
-归档段本体仍保持 `theia-intel-archive/v1` 兼容格式；从本开发基线起，`chat-archive.meta.json` 额外保存 `metadataVersion: 2`、每个现存段的 SHA-256、压缩字节数、操作数和完整性状态。元数据是可重建索引，gzip JSONL 分段才是事实来源：元数据丢失时服务会重读分段并标记 `recovered-unindexed`，下一次成功写入会恢复索引；校验和不匹配会停止读取并给出明确损坏错误，绝不静默返回可能被替换的数据。没有实际 upsert/delete 或 source fingerprint 变化的 delta 是 no-op，不会额外创建空分段。
+归档段本体仍保持 `hyperion-intel-archive/v1` 兼容格式；从本开发基线起，`chat-archive.meta.json` 额外保存 `metadataVersion: 2`、每个现存段的 SHA-256、压缩字节数、操作数和完整性状态。元数据是可重建索引，gzip JSONL 分段才是事实来源：元数据丢失时服务会重读分段并标记 `recovered-unindexed`，下一次成功写入会恢复索引；校验和不匹配会停止读取并给出明确损坏错误，绝不静默返回可能被替换的数据。没有实际 upsert/delete 或 source fingerprint 变化的 delta 是 no-op，不会额外创建空分段。
 
 ### 6.1.1 大归档分页读取
 
@@ -674,7 +674,7 @@ GET /api/sync/intel/conversations/direct%3Aalice?limit=200&cursor=<opaque>
 
 ### 6.1.2 MNEMO 本机增量
 
-MNEMO 不通过公开写入 API 提交聊天。它向 THEIA 所有的 inbox 写入完整不可变目录 `MNEMO-v1-*/records.json`，由服务端 watcher 读取。文档必须满足：
+MNEMO 不通过公开写入 API 提交聊天。它向 HYPERION 所有的 inbox 写入完整不可变目录 `MNEMO-v1-*/records.json`，由服务端 watcher 读取。文档必须满足：
 
 ```json
 {
@@ -693,7 +693,7 @@ MNEMO 不通过公开写入 API 提交聊天。它向 THEIA 所有的 inbox 写�
 }
 ```
 
-THEIA 限制 batch record 数与文件大小，规范化所有文本/时间/枚举，并按 immutable file 的 SHA-256 记录导入状态。无效 record 被丢弃；无有效 record 的 batch 不进入 archive。`avatarId` 仅接受 64 位十六进制内容哈希，归档中被改写为本地 `avatarUrl`，绝不接收 base64 头像或本地路径。`GET /api/mnemo/status` 返回 agent 与 watcher 的无正文状态，不接受写入。
+HYPERION 限制 batch record 数与文件大小，规范化所有文本/时间/枚举，并按 immutable file 的 SHA-256 记录导入状态。无效 record 被丢弃；无有效 record 的 batch 不进入 archive。`avatarId` 仅接受 64 位十六进制内容哈希，归档中被改写为本地 `avatarUrl`，绝不接收 base64 头像或本地路径。`GET /api/mnemo/status` 返回 agent 与 watcher 的无正文状态，不接受写入。
 
 ### 6.2 设置
 
@@ -725,8 +725,8 @@ profile 的 `maxCoreRecords`、`maxCoreChars`、`overlapRecords`、`overlapChars
 ```json
 {
   "health": {
-    "sharedState": { "schema": "theia-shared-state/v1", "schemaVersion": 1, "migration": { "state": "ready", "migrated": false }, "rollbackBackups": [] },
-    "archive": { "schema": "theia-intel-archive/v1", "schemaVersion": 1, "storageEngine": "append-only-jsonl-gzip", "recordCount": 273713, "segmentCount": 3, "updatedAt": "2026-08-04T12:00:00.000Z", "integrity": { "algorithm": "sha256", "status": "verified", "unindexedSegmentCount": 0 }, "migration": { "state": "ready", "migrated": false } },
+    "sharedState": { "schema": "hyperion-shared-state/v1", "schemaVersion": 1, "migration": { "state": "ready", "migrated": false }, "rollbackBackups": [] },
+    "archive": { "schema": "hyperion-intel-archive/v1", "schemaVersion": 1, "storageEngine": "append-only-jsonl-gzip", "recordCount": 273713, "segmentCount": 3, "updatedAt": "2026-08-04T12:00:00.000Z", "integrity": { "algorithm": "sha256", "status": "verified", "unindexedSegmentCount": 0 }, "migration": { "state": "ready", "migrated": false } },
     "recovery": { "uncleanShutdownDetected": false },
     "rollbackCommand": "npm run data:rollback -- --latest"
   }
@@ -739,7 +739,7 @@ profile 的 `maxCoreRecords`、`maxCoreChars`、`overlapRecords`、`overlapChars
 
 `/api/bot/*` 只供同机部署的本地 Iris 使用。服务仍绑定在
 `127.0.0.1`，但这不是一个可安全暴露到局域网或公网的认证协议。Bot 不得调用
-`/api/sync/snapshot`，也不得直接读取 `.theia-shared-intel*`、状态文件、INI 或凭据容器。
+`/api/sync/snapshot`，也不得直接读取 `.hyperion-shared-intel*`、状态文件、INI 或凭据容器。
 
 | 方法 | 路径 | 数据边界 |
 | --- | --- | --- |
@@ -763,7 +763,7 @@ profile 的 `maxCoreRecords`、`maxCoreChars`、`overlapRecords`、`overlapChars
 
 成功响应还会返回 `record`（已写入的完整 `IntelItem`）和 `archiveUpdatedAt`。Iris 必须校验
 `record.conversationId === "self-journal"` 且 `record.speakerRole === "self"`，不能把仅有 HTTP 201
-视为日记已经落盘。运行中的 THEIA 前端通过 `/api/sync/intel/changes?since=<watermark>` 读取这类
+视为日记已经落盘。运行中的 HYPERION 前端通过 `/api/sync/intel/changes?since=<watermark>` 读取这类
 append-only 增量，因此不需要为一条日记重新下载完整聊天归档；遇到 snapshot/compaction 边界时响应
 `requiresReload: true`，客户端应等待下一次完整水合或显式刷新。
 
@@ -806,7 +806,7 @@ QQ 侧 owner 绑定、`.env` 变量、待发送通知队列和命令格式由
 | `POST` | `/api/settings/background` | 保存不超过 20 MiB 的 data URL 资产 |
 | `GET` | `/api/settings/background/:id` | 读取本地背景/头像资产 |
 | `GET` | `/api/media/avatar?src=` | 受白名单限制的 QQ/微信头像代理和缓存 |
-| `GET` | `/api/media/avatar/local?id=` | 读取 THEIA 已保存且经签名校验的 MNEMO 本地头像 |
+| `GET` | `/api/media/avatar/local?id=` | 读取 HYPERION 已保存且经签名校验的 MNEMO 本地头像 |
 | `GET` | `/api/mnemo/status` | MNEMO agent、inbox 和最近错误的无正文状态 |
 | `GET` | `/api/map/tiles/:z/:x/:y.png` | 公共 OSM 瓦片代理，z 0-19 |
 | `GET` | `/api/map/search?q=&provider=` | 公共地理搜索，provider 为 balanced/nominatim/photon |
@@ -814,7 +814,7 @@ QQ 侧 owner 绑定、`.env` 变量、待发送通知队列和命令格式由
 | `POST` | `/api/map/config` | 保存 tileProvider/searchProvider/cacheMaxMb |
 | `GET` | `/api/quote` | 在线语录，失败时离线回退 |
 
-瓦片请求查询参数：`provider=osm-de|osm-standard|osm-hot`，`cacheMaxMb=32..1024`。服务端验证 z/x/y 和 host 白名单，把瓦片写入有界本地缓存，并用 `x-theia-map-cache: hit|miss` 标记命中。所选源失败时可尝试其他白名单 OSM 源。不得用此接口实现批量预取或离线抓图。
+瓦片请求查询参数：`provider=osm-de|osm-standard|osm-hot`，`cacheMaxMb=32..1024`。服务端验证 z/x/y 和 host 白名单，把瓦片写入有界本地缓存，并用 `x-hyperion-map-cache: hit|miss` 标记命中。所选源失败时可尝试其他白名单 OSM 源。不得用此接口实现批量预取或离线抓图。
 
 地图配置 POST：
 

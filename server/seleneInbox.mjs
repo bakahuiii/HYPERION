@@ -258,7 +258,7 @@ export function createSeleneInboxWatcher(options) {
     scanPromise = (async () => {
       try {
         const rootDetails = await stat(root)
-        if (!rootDetails.isDirectory()) throw new Error('THEIA_SELENE_INBOX is not a directory')
+        if (!rootDetails.isDirectory()) throw new Error('HYPERION_SELENE_INBOX is not a directory')
         if (!state) state = await readState(statePath)
         const now = Date.now()
         const files = await snapshotFiles(root, maximumSnapshots)
@@ -339,6 +339,13 @@ export function createSeleneInboxWatcher(options) {
           lastError: null,
         }
       } catch (error) {
+        // The desktop renderer creates the shared state on first launch. Keep
+        // an incoming immutable snapshot pending until then without treating
+        // normal startup ordering as a data error.
+        if (error?.code === 'HYPERION_STATE_UNINITIALIZED') {
+          status = { ...status, lastScanAt: new Date().toISOString(), lastError: null }
+          return status
+        }
         status = { ...status, lastScanAt: new Date().toISOString(), lastError: error instanceof Error ? error.message : String(error) }
         logger('warn', `SELENE inbox scan failed: ${status.lastError}`)
       } finally {

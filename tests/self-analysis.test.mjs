@@ -32,7 +32,7 @@ function observation(id, observedFrom, sourceId = id) {
 
 test('self analysis plan covers every chronological core row exactly once while preserving overlap', () => {
   const records = Array.from({ length: 130 }, (_, index) => record(index, `${index} ${'x'.repeat(68)}`))
-  const plan = buildSelfAnalysisPlan({ analysisTarget: 'self', generatedAt: '2026-08-06T00:00:00.000Z', records, dailyCheckins: [] })
+  const plan = buildSelfAnalysisPlan({ analysisTarget: 'self', generatedAt: '2026-08-06T00:00:00.000Z', records, contextEvents: [] })
 
   const coreIds = plan.jobs.flatMap((job) => job.coreRecordIds)
   assert.equal(plan.recordCount, 130)
@@ -45,20 +45,20 @@ test('self analysis plan covers every chronological core row exactly once while 
   assert.equal(plan.jobs[0].overlapRecordCount, 0)
 })
 
-test('self analysis plan assigns daily anchors only to their chronological windows', () => {
+test('self analysis plan assigns authorized context only to overlapping chronological windows', () => {
   const records = [
     { ...record(1), capturedAt: '2026-01-01T08:00:00.000Z' },
     { ...record(2), capturedAt: '2026-01-10T08:00:00.000Z' },
   ]
   const plan = buildSelfAnalysisPlan({
     analysisTarget: 'self', generatedAt: '2026-08-06T00:00:00.000Z', records,
-    dailyCheckins: [
-      { id: 'jan-1', date: '2026-01-01', medication: 'unknown', alcohol: 'unknown', updatedAt: '2026-01-01T12:00:00.000Z' },
-      { id: 'jan-11', date: '2026-01-11', medication: 'unknown', alcohol: 'unknown', updatedAt: '2026-01-11T12:00:00.000Z' },
+    contextEvents: [
+      { id: 'jan-1', version: 1, kind: 'calendar', source: 'file-import', startAt: '2026-01-01T09:00:00.000Z', title: 'Event', capturedAt: '2026-01-01T09:00:00.000Z', importedAt: '2026-01-01T12:00:00.000Z', privacy: 'coarse' },
+      { id: 'jan-11', version: 1, kind: 'calendar', source: 'file-import', startAt: '2026-01-11T09:00:00.000Z', title: 'Event', capturedAt: '2026-01-11T09:00:00.000Z', importedAt: '2026-01-11T12:00:00.000Z', privacy: 'coarse' },
     ],
   })
 
-  assert.deepEqual(plan.jobs[0].checkIns.map((item) => item.id), ['jan-1'])
+  assert.deepEqual(plan.jobs[0].contextEvents.map((item) => item.id), ['jan-1'])
 })
 
 test('overlapping and retried self observations merge source evidence idempotently', () => {

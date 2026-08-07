@@ -5,9 +5,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { listSharedStateBackups, migrateSharedStateFile, restoreSharedStateBackup, SHARED_STATE_SCHEMA } from '../server/schemaMigrations.mjs'
+import { migrateRuntimePaths } from '../server/runtimePaths.mjs'
 
 test('shared state migration creates a rollback backup and is idempotent', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'theia-schema-'))
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-schema-'))
   t.after(() => rm(root, { recursive: true, force: true }))
   const statePath = join(root, 'state.json')
   const backupDirectory = join(root, 'migrations')
@@ -20,7 +21,7 @@ test('shared state migration creates a rollback backup and is idempotent', async
   assert.deepEqual(await migrateSharedStateFile(statePath, backupDirectory), { migrated: false, reason: 'current' })
 })
 test('rollback restores the selected legacy snapshot and preserves the current state', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'theia-schema-'))
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-schema-'))
   t.after(() => rm(root, { recursive: true, force: true }))
   const statePath = join(root, 'state.json')
   const backupDirectory = join(root, 'migrations')
@@ -31,4 +32,26 @@ test('rollback restores the selected legacy snapshot and preserves the current s
   const restored = await restoreSharedStateBackup(statePath, backupDirectory, backup)
   assert.equal(JSON.parse(await readFile(statePath, 'utf8')).data.quests[0].id, 'old')
   assert.equal(JSON.parse(await readFile(restored.safetyPath, 'utf8')).data.quests[0].id, 'new')
+})
+
+test('runtime migration moves only missing HYPERION destinations', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-runtime-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const oldState = join(root, '.theia-state.json')
+  const newState = join(root, '.hyperion-state.json')
+  const oldSettings = join(root, '.theia-settings.ini')
+  const newSettings = join(root, '.hyperion-settings.ini')
+  await writeFile(oldState, 'legacy state')
+  await writeFile(oldSettings, 'legacy settings')
+  await writeFile(newSettings, 'new settings')
+
+  const result = await migrateRuntimePaths(
+    { sharedStatePath: oldState, settingsPath: oldSettings },
+    { sharedStatePath: newState, settingsPath: newSettings },
+  )
+
+  assert.deepEqual(result.migrated, ['sharedStatePath'])
+  assert.deepEqual(result.skipped, ['settingsPath'])
+  assert.equal(await readFile(newState, 'utf8'), 'legacy state')
+  assert.equal(await readFile(newSettings, 'utf8'), 'new settings')
 })

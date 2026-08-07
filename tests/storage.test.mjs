@@ -25,13 +25,26 @@ test('storage envelope is versioned and preserves legacy payloads', () => {
   assert.equal(envelope.schemaVersion, APP_STORAGE_SCHEMA_VERSION)
   assert.deepEqual(unwrapAppStorage(envelope), { data: payload, schemaVersion: 1 })
   assert.deepEqual(unwrapAppStorage(payload), { data: payload, schemaVersion: 1, migratedFrom: 0 })
+  assert.deepEqual(unwrapAppStorage({ schema: 'theia-app-state', schemaVersion: 1, data: payload }), { data: payload, schemaVersion: 1, migratedFrom: 1 })
+})
+
+test('loading THEIA browser state copies it into the HYPERION storage key', () => {
+  const legacy = createSeedData()
+  legacy.profile.name = 'Migrated user'
+  values.set('theia:v1', JSON.stringify({ schema: 'theia-app-state', schemaVersion: 1, data: legacy }))
+
+  const loaded = loadData()
+
+  assert.equal(loaded.profile.name, 'Migrated user')
+  assert.equal(JSON.parse(values.get('hyperion:v1')).schema, 'theia-app-state')
+  assert.ok(values.has('theia:v1'))
 })
 
 test('saveData writes a versioned compact dashboard snapshot', () => {
   const data = createSeedData()
   data.intel = [{ id: 'raw', source: 'test', content: 'secret', summary: 'secret', title: 'secret', capturedAt: '', status: 'new' }]
   saveData(data)
-  const stored = JSON.parse(values.get('theia:v1'))
+  const stored = JSON.parse(values.get('hyperion:v1'))
   assert.equal(stored.schema, APP_STORAGE_SCHEMA)
   assert.equal(stored.schemaVersion, 1)
   assert.deepEqual(stored.data.intel, [])
@@ -40,12 +53,26 @@ test('saveData writes a versioned compact dashboard snapshot', () => {
 test('loading a legacy payload keeps a rollback copy before migration', () => {
   const legacy = createSeedData()
   legacy.profile.name = 'Legacy user'
-  values.set('theia:v1', JSON.stringify(legacy))
+  values.set('hyperion:v1', JSON.stringify(legacy))
   const loaded = loadData()
   assert.equal(loaded.profile.name, 'Legacy user')
-  assert.equal(JSON.parse(values.get('theia:v1:rollback')).profile.name, 'Legacy user')
+  assert.deepEqual(loaded.intel, [])
+  assert.equal(JSON.parse(values.get('hyperion:v1:rollback')).profile.name, 'Legacy user')
   assert.equal(restoreRollbackData(), true)
-  assert.equal(JSON.parse(values.get('theia:v1')).profile.name, 'Legacy user')
+  assert.equal(JSON.parse(values.get('hyperion:v1')).profile.name, 'Legacy user')
+})
+
+test('loading legacy settings clamps automatic extraction limits', () => {
+  const legacy = createSeedData()
+  legacy.aiSettings.intervalHours = 100_000
+  legacy.aiSettings.incrementalMessageCount = 100_000
+  values.set('hyperion:v1', JSON.stringify(legacy))
+
+  const loaded = loadData()
+
+  assert.equal(loaded.aiSettings.intervalHours, 720)
+  assert.equal(loaded.aiSettings.incrementalMessageCount, 10_000)
+  assert.equal(loaded.aiSettings.autoTriggerMode, 'either')
 })
 
 test('current structured person portraits survive a storage round trip', () => {
@@ -83,10 +110,10 @@ test('current structured person portraits survive a storage round trip', () => {
 
 test('resetData clears the current snapshot and rollback copy', () => {
   saveData(createSeedData())
-  values.set('theia:v1:rollback', '{}')
+  values.set('hyperion:v1:rollback', '{}')
   resetData()
-  assert.equal(values.get('theia:v1'), undefined)
-  assert.equal(values.get('theia:v1:rollback'), undefined)
+  assert.equal(values.get('hyperion:v1'), undefined)
+  assert.equal(values.get('hyperion:v1:rollback'), undefined)
 })
 
 test('single-record signatures use the same compact form as bulk archive writes', () => {

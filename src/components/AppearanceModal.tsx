@@ -92,7 +92,7 @@ export function AppearanceModal({ open, name, avatarUrl, appearance, onClose, on
         <div className="appearance-body">
           <div className={`appearance-preview theme--${draft.theme}`} style={previewStyle} aria-label="外观预览">
             <div className="appearance-preview-image" />
-            <div className="appearance-preview-content"><span>THEIA</span><div className="appearance-preview-identity">{nextAvatarUrl ? <AvatarImage source={nextAvatarUrl} alt="" /> : <UserRound size={20} />}<strong>{nextName.trim() || '访客'}</strong></div></div>
+            <div className="appearance-preview-content"><span>HYPERION</span><div className="appearance-preview-identity">{nextAvatarUrl ? <AvatarImage source={nextAvatarUrl} alt="" /> : <UserRound size={20} />}<strong>{nextName.trim() || '访客'}</strong></div></div>
           </div>
 
           <div className="appearance-profile-grid">

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { normalizeCapturedAt, parseIntelFile } from '../src/lib/importer.ts'
+import { normalizeCapturedAt, parseContextEventFile, parseIntelFile } from '../src/lib/importer.ts'
 
 function jsonFile(name, value) {
   const raw = JSON.stringify(value)
@@ -75,4 +75,23 @@ test('AI conversation folders keep user direction and receive the explicit AI so
   assert.deepEqual(records.map((item) => item.speakerRole), ['self', 'other'])
   assert.equal(records[0].conversationKind, 'direct')
   assert.equal(records[0].conversationId, 'folder:direct/AI/ChatGPT/2026-08-06')
+})
+
+test('SELENE documents are kept out of chat imports and retain their separate contract', async () => {
+  const file = jsonFile('context-events.json', {
+    schema: 'selene-context-events/v1',
+    generatedAt: '2026-08-06T20:00:00.000Z',
+    producer: { name: 'SELENE', version: '0.1.0', layout: 'immutable-snapshot-v1' },
+    events: [{
+      id: 'screen-day', version: 1, kind: 'screen-time', source: 'selene',
+      startAt: '2026-08-06T00:00:00.000Z', endAt: '2026-08-06T20:00:00.000Z',
+      title: 'Screen usage', values: { foregroundMinutes: 180 }, capturedAt: '2026-08-06T20:00:00.000Z',
+      importedAt: '2026-08-06T20:00:00.000Z', privacy: 'coarse',
+    }],
+  })
+  assert.deepEqual(await parseIntelFile(file, { path: 'SELENE-v1-20260806T200000000Z/context-events.json' }), [])
+  const context = await parseContextEventFile(file, { path: 'SELENE-v1-20260806T200000000Z/context-events.json' })
+  assert.equal(context.length, 1)
+  assert.equal(context[0].kind, 'screen-time')
+  assert.equal(context[0].sourceFile, 'SELENE-v1-20260806T200000000Z/context-events.json')
 })

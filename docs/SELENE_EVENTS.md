@@ -1,6 +1,6 @@
 # SELENE Event Import
 
-THEIA accepts device-timeline data only from the standalone **SELENE** Android
+HYPERION accepts device-timeline data only from the standalone **SELENE** Android
 or Windows application. The import is intentionally separate from chat archives and
 journals: SELENE records describe a time-bound device or calendar observation,
 not words written by the user. They can provide chronological background for
@@ -17,7 +17,7 @@ SELENE-v1-20260806T185439123Z/
   context-events.json
 ```
 
-THEIA scans these directories recursively. It accepts only UTF-8 JSON with the
+HYPERION scans these directories recursively. It accepts only UTF-8 JSON with the
 following envelope; old companion formats are deliberately rejected.
 
 ```json
@@ -36,7 +36,7 @@ following envelope; old companion formats are deliberately rejected.
 
 The explicit producer marker prevents an ordinary JSON file or an obsolete
 companion export from being mistaken for SELENE data. Snapshots are never
-rewritten. If collection windows overlap, THEIA deduplicates records by their
+rewritten. If collection windows overlap, HYPERION deduplicates records by their
 stable `id` while retaining the snapshot path as provenance.
 
 ## Event Contract
@@ -69,7 +69,7 @@ interface SeleneEvent {
 ```
 
 Malformed timestamps and events whose `source` is not exactly `selene` are
-discarded. Exact coordinates remain local to THEIA. Model requests receive a
+discarded. Exact coordinates remain local to HYPERION. Model requests receive a
 coarse projection only: coordinate-, address-, and geohash-like values are
 removed; location events may expose only `values.placeTag`.
 

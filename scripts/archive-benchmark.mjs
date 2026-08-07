@@ -18,7 +18,7 @@ function bytes(value) {
 
 const records = Math.min(1_000_000, argument('records', 25_000))
 const batchSize = Math.min(25_000, argument('batch-size', 5_000))
-const root = await mkdtemp(join(tmpdir(), 'theia-archive-benchmark-'))
+const root = await mkdtemp(join(tmpdir(), 'hyperion-archive-benchmark-'))
 const options = {
   directory: join(root, 'archive'),
   metadataPath: join(root, 'archive.meta.json'),
@@ -37,7 +37,7 @@ function batch(start, count) {
       conversationName: `Benchmark ${Math.floor(index / 240)}`,
       conversationKind: 'direct',
       capturedAt: new Date(Date.UTC(2026, 0, 1, 0, Math.floor(index / 60), index % 60)).toISOString(),
-      content: `Synthetic message ${index}; generated only for THEIA archive throughput measurement.`,
+      content: `Synthetic message ${index}; generated only for HYPERION archive throughput measurement.`,
       speakerRole: index % 2 ? 'other' : 'self',
       status: 'new',
     }

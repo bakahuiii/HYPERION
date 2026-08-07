@@ -1,4 +1,4 @@
-const DB_NAME = 'theia-assets'
+const DB_NAME = 'hyperion-assets'
 const STORE_NAME = 'backgrounds'
 
 function openDatabase() {

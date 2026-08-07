@@ -47,7 +47,7 @@ export function Sidebar({ profile, active, open, onChange, onClose, onReset, new
         <div className="brand">
           <div className="brand-mark" aria-hidden="true"><span /></div>
           <div>
-            <strong>THEIA</strong>
+            <strong>HYPERION</strong>
             <span>PERSONAL INTELLIGENCE</span>
           </div>
         </div>
@@ -73,7 +73,7 @@ export function Sidebar({ profile, active, open, onChange, onClose, onReset, new
 
         <div className="sidebar-profile">
           <div className="sidebar-profile-avatar"><AvatarImage source={profile.avatarUrl} alt="" /><i>{profile.name.replace(/\s+/g, '').slice(-2) || '你'}</i></div>
-          <div><span>THEIA USER</span><strong>{profile.name}</strong></div>
+          <div><span>HYPERION USER</span><strong>{profile.name}</strong></div>
         </div>
 
         <div className="sidebar-quote">

@@ -1,24 +1,33 @@
 # Release Notes
 
+## 0.7.0 HYPERION
+
+Release date: 2026-08-07
+
+- THEIA is now named HYPERION.
+- The desktop and browser clients migrate existing local state and runtime data without overwriting an already-created HYPERION destination.
+- MNEMO, SELENE, and IRIS now use the HYPERION integration names, while the HYPERION archive remains the single local authority.
+- Added automatic incremental extraction controls for time, message-count, or either trigger after an initial full-archive extraction.
+
 ## 0.6.0 MNEMO Continuous Local WeChat Archive
 
 Release date: 2026-08-07
 
-Release type: backward-compatible feature release. It establishes MNEMO as a THEIA-managed local WeChat intake without adding a cloud service or changing the authoritative archive format.
+Release type: backward-compatible feature release. It establishes MNEMO as a HYPERION-managed local WeChat intake without adding a cloud service or changing the authoritative archive format.
 
 ### Main Changes
 
-- Added the independent MNEMO agent controller and immutable `mnemo-delta/v1` inbox. THEIA owns process lifecycle, batch validation, deduplication, archive writes, status reporting, and restart-safe resume; no repeated manual import is needed after one local key capture.
+- Added the independent MNEMO agent controller and immutable `mnemo-delta/v1` inbox. HYPERION owns process lifecycle, batch validation, deduplication, archive writes, status reporting, and restart-safe resume; with a signed-in local WeChat desktop session, no GUI, directory grant, manual key capture, or repeated manual import is needed.
 - Stable records use account/database/table/local-message identity, so name changes, avatar updates, sidecar restarts, and bounded replays cannot create new logical messages.
 - Readable conversation copies now use the counterpart's remark first and nickname second for both directory and JSON filename. Windows-safe collision handling adds a short hash only when necessary; a changed remark moves the readable copy without changing archive identity.
-- MNEMO reads local avatar blobs only from its read-only snapshot, checks JPEG/PNG/GIF/WebP/AVIF signatures, and writes SHA-256 addressed files directly to THEIA's avatar cache. Archive rows expose only a verified loopback avatar URL.
+- MNEMO reads local avatar blobs only from its read-only snapshot, checks JPEG/PNG/GIF/WebP/AVIF signatures, and writes SHA-256 addressed files directly to HYPERION's avatar cache. Archive rows expose only a verified loopback avatar URL.
 - Documented the sidecar contract, backup boundary, status endpoint, local avatar route, export layout, and incremental-analysis timing across the user, developer, API, and export-format guides.
 
 ### Compatibility And Verification
 
-- Existing JSON/CSV/TXT imports, append-only `theia-intel-archive/v1` segments, settings, and analysis watermarks remain compatible. MNEMO is an additional intake source, not a second archive database.
+- Existing JSON/CSV/TXT imports, append-only `hyperion-intel-archive/v1` segments, settings, and analysis watermarks remain compatible. MNEMO is an additional intake source, not a second archive database.
 - A changed MNEMO conversation becomes eligible at the next automatic analysis check; the existing workflow sends changed records plus bounded prior context rather than the full history.
-- Verification covers Python MNEMO unit tests, immutable inbox normalization, archive import idempotence, local avatar path/signature handling, THEIA regression tests, build, lint, and a live local MNEMO agent status check.
+- Verification covers Python MNEMO unit tests, immutable inbox normalization, archive import idempotence, local avatar path/signature handling, HYPERION regression tests, build, lint, and a live local MNEMO agent status check.
 
 ## 0.5.0 长期自我研究与大归档基础
 
@@ -88,7 +97,7 @@ Release type: backward-compatible feature release. It establishes MNEMO as a THE
 
 ### 主要变化
 
-- 原始聊天归档采用 `theia-intel-archive/v1` append-only gzip JSONL segment。首个写入是 snapshot，后续写入是带 `upsert/delete` 操作的 delta；达到段数阈值后自动 compaction。旧 gzip/JSON 文件不会被直接删除，迁移失败可回滚。
+- 原始聊天归档采用 `hyperion-intel-archive/v1` append-only gzip JSONL segment。首个写入是 snapshot，后续写入是带 `upsert/delete` 操作的 delta；达到段数阈值后自动 compaction。旧 gzip/JSON 文件不会被直接删除，迁移失败可回滚。
 - 新增 `POST /api/sync/intel/delta`。客户端在确认本地与共享归档版本一致后只发送 `upserts` 和 `deleteIds`；无法证明基线、首次导入或变更过大时自动回退 `POST /api/sync/intel` 全量协议。
 - 浏览器缓存 schema 升级为 IndexedDB v2：`intelRecords` 按消息存储，`intelMeta` 存水位和 fingerprint，保留旧 `snapshots` store 用于一次性迁移。
 - 新增 `useSharedSync`、`useIntelAnalysisSelection` 和候选队列组件；共享状态按字段比较，修复字段顺序不同导致的多端无意义回写。
@@ -112,7 +121,7 @@ Release type: backward-compatible feature release. It establishes MNEMO as a THE
 - `npm test`：客户端、导入、分段、候选校验、存储、append-only archive、schema migration、恢复日志和 provider pool 全部通过。
 - `npm run test:e2e`：任务图视觉基线、缩放、主题拖拽、无文本误选、地图配置和存储健康状态通过。
 - `npm run test:desktop-smoke`：隔离 runtime 下 Electron 启动与 API Key 明文迁移通过。
-- `npm run dist:unpacked` + `npm run test:unpacked-smoke`：ASAR 打包和打包后 `THEIA.exe` 实际启动通过。
+- `npm run dist:unpacked` + `npm run test:unpacked-smoke`：ASAR 打包和打包后 `HYPERION.exe` 实际启动通过。
 - `npm run lint`、`npm run build`、`node --check server/index.mjs`、`node --check electron/main.mjs`、`git diff --check` 通过。
 
 ## 0.3.0 稳定并发与协议文档
@@ -143,7 +152,7 @@ Release type: backward-compatible feature release. It establishes MNEMO as a THE
 
 - 新增 [API 协议参考](API_PROTOCOL.md)，逐字段描述 `/api/ai/analyze`、人物证据、人物归并、任务建议、session enqueue/results/ack、通道状态、同步快照、日志和上游协议。
 - 开发者文档更新为 `0.3.0`，补充实际并发、退避、发布布局、测试范围和数据边界。
-- 发布包统一复制 `docs/`、三张界面截图和虚构示例；不会复制 `.theia-*`、API 配置、聊天、任务、人物、头像、背景、日志或 Electron profile。
+- 发布包统一复制 `docs/`、三张界面截图和虚构示例；不会复制 `.hyperion-*`、API 配置、聊天、任务、人物、头像、背景、日志或 Electron profile。
 
 ### 兼容性与升级
 
@@ -245,9 +254,9 @@ Release type: backward-compatible feature release. It establishes MNEMO as a THE
 
 ## 0.1.1 Windows portable package
 
-- 提供 Windows x64 便携版，解压后运行 `THEIA.exe`，无需安装 Node.js 或 npm。
+- 提供 Windows x64 便携版，解压后运行 `HYPERION.exe`，无需安装 Node.js 或 npm。
 - 内置本地 API 服务和静态资源加载，桌面包可在独立目录中直接启动。
-- 运行数据统一写入 `%APPDATA%\\THEIA`，发布包不携带开发机的聊天记录、设置、密钥、缓存或日志。
+- 运行数据统一写入 `%APPDATA%\\HYPERION`，发布包不携带开发机的聊天记录、设置、密钥、缓存或日志。
 - 提供 ZIP 分发包与 SHA-256 校验文件。
 
 ## 0.1.0 source release

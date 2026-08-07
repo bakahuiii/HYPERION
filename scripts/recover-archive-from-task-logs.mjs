@@ -2,8 +2,8 @@ import { readFile, readdir, rename, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '..')
-const taskLogDirectory = resolve(root, '.theia-task-logs')
-const archivePath = resolve(root, '.theia-shared-intel.json')
+const taskLogDirectory = resolve(root, '.hyperion-task-logs')
+const archivePath = resolve(root, '.hyperion-shared-intel.json')
 
 function conversationKind(value) {
   if (/(?:群聊|群组|群消息|group|groups|chatroom)/i.test(value)) return 'group'

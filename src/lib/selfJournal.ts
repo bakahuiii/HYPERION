@@ -1,8 +1,8 @@
-import type { DailyAlcoholLevel, DailyCheckIn, DailyMedicationStatus, IntelItem, Profile } from '../types'
+import type { ContextEvent, DailyAlcoholLevel, DailyCheckIn, DailyMedicationStatus, IntelItem, Profile } from '../types'
 
 export const SELF_JOURNAL_CONVERSATION_ID = 'self-journal'
 export const SELF_JOURNAL_CONVERSATION_NAME = '我'
-export const SELF_JOURNAL_SOURCE_FILE = 'theia://self-journal'
+export const SELF_JOURNAL_SOURCE_FILE = 'hyperion://self-journal'
 
 function hash(value: string) {
   let result = 2166136261
@@ -165,15 +165,16 @@ export interface SelfAnalysisInput {
   analysisTarget: 'self'
   generatedAt: string
   records: Array<Pick<IntelItem, 'id' | 'capturedAt' | 'content' | 'summary' | 'conversationId' | 'conversationName' | 'source'>>
-  dailyCheckins: DailyCheckIn[]
+  /** Authorized device/file records; never treated as self-authored messages. */
+  contextEvents: ContextEvent[]
 }
 
 /**
  * The future self-analysis route consumes this contract, never the
  * counterpart-only person pipeline. It combines every confirmed self message
- * with journals and structured daily anchors in chronological order.
+ * with journals and separately authorized chronological context.
  */
-export function buildSelfAnalysisInput(items: IntelItem[], checkIns: DailyCheckIn[], now = new Date()): SelfAnalysisInput {
+export function buildSelfAnalysisInput(items: IntelItem[], contextEvents: ContextEvent[], now = new Date()): SelfAnalysisInput {
   const records = items
     .filter((item) => item.speakerRole === 'self')
     .map((item) => ({
@@ -190,6 +191,6 @@ export function buildSelfAnalysisInput(items: IntelItem[], checkIns: DailyCheckI
     analysisTarget: 'self',
     generatedAt: now.toISOString(),
     records,
-    dailyCheckins: normalizeDailyCheckIns(checkIns),
+    contextEvents: [...contextEvents].sort((left, right) => left.startAt.localeCompare(right.startAt) || left.id.localeCompare(right.id)),
   }
 }

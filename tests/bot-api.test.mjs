@@ -5,11 +5,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 test('Bot API keeps archive writes incremental and state mutations serialized', async (context) => {
-  const root = await mkdtemp(join(tmpdir(), 'theia-bot-api-'))
-  const inheritedSeleneInbox = process.env.THEIA_SELENE_INBOX
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-bot-api-'))
+  const inheritedSeleneInbox = process.env.HYPERION_SELENE_INBOX
+  const inheritedLegacySeleneInbox = process.env.THEIA_SELENE_INBOX
+  delete process.env.HYPERION_SELENE_INBOX
   delete process.env.THEIA_SELENE_INBOX
-  process.env.THEIA_RUNTIME_ROOT = root
-  process.env.THEIA_RELEASE_LAYOUT = '1'
+  process.env.HYPERION_RUNTIME_ROOT = root
+  process.env.HYPERION_RELEASE_LAYOUT = '1'
   process.env.AI_PORT = '0'
 
   const { versionSharedState } = await import('../server/schemaMigrations.mjs')
@@ -31,8 +33,10 @@ test('Bot API keeps archive writes incremental and state mutations serialized', 
   await startAiProxy()
   context.after(async () => {
     await new Promise((resolve) => server.close(resolve))
-    if (inheritedSeleneInbox === undefined) delete process.env.THEIA_SELENE_INBOX
-    else process.env.THEIA_SELENE_INBOX = inheritedSeleneInbox
+    if (inheritedSeleneInbox === undefined) delete process.env.HYPERION_SELENE_INBOX
+    else process.env.HYPERION_SELENE_INBOX = inheritedSeleneInbox
+    if (inheritedLegacySeleneInbox === undefined) delete process.env.THEIA_SELENE_INBOX
+    else process.env.THEIA_SELENE_INBOX = inheritedLegacySeleneInbox
     await rm(root, { recursive: true, force: true })
   })
   const address = server.address()

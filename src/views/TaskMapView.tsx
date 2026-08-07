@@ -495,7 +495,7 @@ export function TaskMapView({ profile, quests, places, people, intelById, atlas,
 
   return <div className="task-atlas-view">
     <section className="task-atlas-canvas" aria-label="按主题组织的任务图">
-      <header className="task-atlas-hud"><div><span className="section-kicker">THEIA · OBJECTIVE ATLAS</span><h2>任务图</h2></div><p>{quests.length} 项行动 · {categories.filter((category) => byCategory.get(category.id)?.length).length} 个主题</p></header>
+      <header className="task-atlas-hud"><div><span className="section-kicker">HYPERION · OBJECTIVE ATLAS</span><h2>任务图</h2></div><p>{quests.length} 项行动 · {categories.filter((category) => byCategory.get(category.id)?.length).length} 个主题</p></header>
       <div className="task-atlas-controls" aria-label="任务图视图控制">
         <button type="button" className="icon-button" title="放大任务图" aria-label="放大任务图" onClick={() => updateZoom(cameraRef.current.scale + .12)}><Plus size={16} /></button>
         <button type="button" className="icon-button" title="缩小任务图" aria-label="缩小任务图" onClick={() => updateZoom(cameraRef.current.scale - .12)}><Minus size={16} /></button>

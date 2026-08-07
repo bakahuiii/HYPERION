@@ -1,4 +1,4 @@
-import type { AiSettings, AiTaskCandidate, DailyCheckIn, IntelItem, Person, PersonEvidence, PersonEvidenceCategory, PersonPortraitBlock, PersonPortraitCoverage, Place, Quest, SelfAnalysis, SelfAnalysisPeriod, SelfObservation } from '../types'
+import type { AiSettings, AiTaskCandidate, ContextEvent, IntelItem, Person, PersonEvidence, PersonEvidenceCategory, PersonPortraitBlock, PersonPortraitCoverage, Place, Quest, SelfAnalysis, SelfAnalysisPeriod, SelfObservation } from '../types'
 import { buildConversationAnalysisPlan, buildPeopleConversationAnalysisPlan, inferConversationKind } from './conversationAnalysis'
 import { apiUrl, localProxyUrl } from './apiUrl'
 import { normalizeAiConcurrency } from './aiConcurrency'
@@ -21,6 +21,7 @@ import {
 } from './personTemporal'
 import { buildSelfAnalysisInput } from './selfJournal'
 import { analysisRange, buildSelfAnalysisPlan, groupSelfObservationsForMerge, isSelfObservationKind, mergeSelfObservations, selfObservationId, selfRecordText } from './selfAnalysis'
+import { projectContextEventsForModel } from './contextEvents'
 
 export interface AiAttachment {
   name: string
@@ -139,7 +140,7 @@ export interface AiModelsResult {
   models: string[]
 }
 
-export const AI_STATUS_CHANGED_EVENT = 'theia:ai-status-changed'
+export const AI_STATUS_CHANGED_EVENT = 'hyperion:ai-status-changed'
 
 function notifyAiStatusChanged(status: AiStatus) {
   if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent<AiStatus>(AI_STATUS_CHANGED_EVENT, { detail: status }))
@@ -2740,13 +2741,13 @@ export interface SelfAnalysisResult {
  */
 export async function analyzeSelf(
   items: IntelItem[],
-  dailyCheckins: DailyCheckIn[],
+  contextEvents: ContextEvent[],
   settings: AiSettings,
   onProgress?: (progress: AiProgress) => void,
   onLog?: AiDebugWriter,
   options?: { signal?: AbortSignal; concurrency?: number },
 ): Promise<SelfAnalysisResult> {
-  const input = buildSelfAnalysisInput(items, dailyCheckins)
+  const input = buildSelfAnalysisInput(items, contextEvents)
   const plan = buildSelfAnalysisPlan(input)
   if (!plan.jobs.length) return { failedSegments: 0, failedMerges: 0, model: 'unknown' }
   const recordsById = new Map(items.filter((item) => item.speakerRole === 'self').map((item) => [item.id, item]))
@@ -2795,7 +2796,7 @@ export async function analyzeSelf(
           },
           records: job.records.map((record) => ({ id: record.id, sentAt: record.capturedAt, content: selfRecordText(record), speakerRole: 'self' })),
           attachments: [],
-          dailyCheckins: job.checkIns,
+          contextEvents: projectContextEventsForModel(job.contextEvents),
           settings: { promptInstructions: { selfObservation: settings.promptInstructions.selfObservation } },
         }, undefined, options?.signal, batcher)
         if (Number(payload.receivedRecordCount) !== job.records.length) throw new Error(`Self-analysis segment ${job.segmentIndex}/${job.segmentCount} did not receive every prepared record`)
@@ -2850,7 +2851,8 @@ export async function analyzeSelf(
       generatedAt: new Date().toISOString(),
       analysisAsOf: input.generatedAt,
       sourceRecordCount: input.records.length,
-      sourceCheckInCount: input.dailyCheckins.length,
+      sourceCheckInCount: 0,
+      sourceContextEventCount: input.contextEvents.length,
       observationCount: verified.length,
       periods: uniquePeriods,
       ...(latestPeriod ? { currentSummary: latestPeriod.narrative } : {}),

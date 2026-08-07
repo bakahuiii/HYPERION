@@ -10,7 +10,7 @@ export default defineConfig({
       // are runtime data, not source modules. Ignoring them prevents a large
       // archive from triggering rescans or UI rebuilds while analysis runs.
       ignored: [
-        '**/.theia-*/**',
+        '**/.hyperion-*/**',
         '**/.exe-*/**',
         '**/release/**',
         '**/release-bin/**',

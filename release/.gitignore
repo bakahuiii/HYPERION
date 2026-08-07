@@ -18,7 +18,7 @@ assets/img/avatars/*
 assets/img/backgrounds/*
 !assets/img/avatars/.gitkeep
 !assets/img/backgrounds/.gitkeep
-!assets/img/backgrounds/theia-default-background.svg
+!assets/img/backgrounds/hyperion-default-background.svg
 !logs/tasks/.gitkeep
 
 # Local installation output

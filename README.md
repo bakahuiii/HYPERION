@@ -1,19 +1,19 @@
-# THEIA
+# HYPERION
 
 [简体中文](README.md) | [English](README.en.md)
 
-THEIA 是一个本地优先的个人现实任务图工具。它将聊天记录与主动记录整理为可审核的任务、行程、人物和地点信息，并保留可追溯的原始来源。
+HYPERION 是一个本地优先的个人现实任务图工具。它将聊天记录与主动记录整理为可审核的任务、行程、人物和地点信息，并保留可追溯的原始来源。
 
-除 JSON、CSV、TXT 的手动导入外，THEIA 还可管理本机 MNEMO 微信适配器。用户在 MNEMO 中完成一次本人账号的本地密钥捕获后，MNEMO 仅在本机对该账号创建只读快照，持续把增量记录交给 THEIA；它不联网发送密钥、正文或头像。只有在你启动模型提炼后，选中的归档记录才会发送到你配置的模型服务。
+HYPERION 启动时会自动管理本机 MNEMO 微信适配器。保持本机微信桌面版已登录后，MNEMO 仅在本机检测当前账号数据库、创建只读快照并持续把增量记录交给 HYPERION；不需要 GUI、目录授权或手工密钥捕获，也不联网发送密钥、正文或头像。没有可用微信数据库时会静默等待，只有归档或批次数据异常才会显示错误。只有在你启动模型提炼后，选中的归档记录才会发送到你配置的模型服务。
 
-> 当前源码版本：`0.6.0`。Windows x64 NSIS 安装器、便携版与源码发布包分别生成；安装器和便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js，任务、设置、聊天归档和日志保存在 `%APPDATA%\\THEIA`。重要数据请定期备份。
+> 当前源码版本：`0.6.0`。Windows x64 NSIS 安装器、便携版与源码发布包分别生成；安装器和便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js，任务、设置、聊天归档和日志保存在 `%APPDATA%\\HYPERION`。重要数据请定期备份。
 
 ## 更新日志
 
 **0.6.0**
 
-- 新增 MNEMO 本机微信持续归档：THEIA 启动、管理和监控独立 sidecar，无需重复手工导入；稳定消息 ID 让重启和重放保持幂等。
-- 会话导出统一按“备注优先、昵称回退”命名为 `备注或昵称/备注或昵称.json`；本地头像由 THEIA 内容寻址缓存并经签名校验后提供。
+- 新增 MNEMO 本机微信持续归档：HYPERION 启动、管理和监控独立 sidecar，无需重复手工导入；稳定消息 ID 让重启和重放保持幂等。
+- 会话导出统一按“备注优先、昵称回退”命名为 `备注或昵称/备注或昵称.json`；本地头像由 HYPERION 内容寻址缓存并经签名校验后提供。
 - 增量写入会触发已有的会话级分析水位检查，下一轮自动分析只携带新消息与有限上下文。
 
 **0.5.0**
@@ -27,21 +27,20 @@ THEIA 是一个本地优先的个人现实任务图工具。它将聊天记录�
 ## 界面预览
 
 <p align="center">
-  <img src="docs/screenshots/task-atlas.png" alt="THEIA 可缩放任务图界面" width="100%">
+  <img src="docs/screenshots/task-atlas.png" alt="HYPERION 可缩放任务图界面" width="100%">
 </p>
 <p align="center"><sub>可缩放、可平移并支持拖拽归类的任务图</sub></p>
 
 <table>
   <tr>
-    <td width="50%" align="center"><img src="docs/screenshots/intel-workbench.png" alt="THEIA 情报库与模型提炼工作台"><br><sub>情报接入与模型提炼工作台</sub></td>
-    <td width="50%" align="center"><img src="docs/screenshots/appearance-customization.png" alt="THEIA 界面外观自定义"><br><sub>主题、头像与全局背景自定义</sub></td>
+    <td width="50%" align="center"><img src="docs/screenshots/intel-workbench.png" alt="HYPERION 情报库与模型提炼工作台"><br><sub>聊天归档与模型提炼工作台</sub></td>
+    <td width="50%" align="center"><img src="docs/screenshots/appearance-customization.png" alt="HYPERION 界面外观自定义"><br><sub>主题、头像与全局背景自定义</sub></td>
   </tr>
 </table>
 
 ## 能做什么
 
-- 递归扫描导出目录，识别 JSON、CSV、TXT，并按会话归档和去重。
-- 在授权的一次性密钥捕获后，管理 MNEMO 的静默微信增量归档、按联系人备注/昵称的可读会话文件和 THEIA 本地头像缓存。
+- 自动检测本机微信数据库，并管理 MNEMO 的静默增量归档、按联系人备注/昵称的可读会话文件和 HYPERION 本地头像缓存；只需保持本机微信已登录。
 - 保留原始消息正文、时间、发言人、发言方向、消息类型、平台、会话和头像 URL。
 - 按“最后聊天时间”筛选整段会话，或用“严格时间”只提交指定时间段内的消息。
 - 对超长会话做连续分段，覆盖全部记录，并在相邻段之间保留少量上下文重叠；不会用固定消息条数随机抽样。
@@ -82,7 +81,7 @@ npm install
 npm run desktop
 ```
 
-也可以双击 `启动桌面版.cmd`。脚本会结束由当前项目启动的旧 THEIA 实例和占用本地 API 端口的旧进程，再启动新的桌面窗口。
+也可以双击 `启动桌面版.cmd`。脚本会结束由当前项目启动的旧 HYPERION 实例和占用本地 API 端口的旧进程，再启动新的桌面窗口。
 
 浏览器开发模式：
 
@@ -105,7 +104,7 @@ npm run dist:installer
 
 ### 从安装器、便携版或源码发布包启动
 
-NSIS 安装器和自带运行时的便携版不需要 Node.js，也不用执行 `npm install`。安装版可从开始菜单或桌面快捷方式启动；可变数据位于 `%APPDATA%\THEIA\`。
+NSIS 安装器和自带运行时的便携版不需要 Node.js，也不用执行 `npm install`。安装版可从开始菜单或桌面快捷方式启动；可变数据位于 `%APPDATA%\HYPERION\`。
 
 源码发布包用于审查和自定义。第一次使用时，在发布包的 `app` 目录打开 PowerShell：
 
@@ -115,8 +114,8 @@ npm install
 
 安装完成后回到发布包根目录，双击：
 
-- `启动 THEIA 桌面版.cmd`：推荐，独立窗口，支持 GPU 加速。
-- `启动 THEIA 浏览器版.cmd`：启动本地服务后，在 Chrome/Edge 中使用。
+- `启动 HYPERION 桌面版.cmd`：推荐，独立窗口，支持 GPU 加速。
+- `启动 HYPERION 浏览器版.cmd`：启动本地服务后，在 Chrome/Edge 中使用。
 
 发布包用户应优先阅读 [用户手册](docs/USER_GUIDE.md)。
 
@@ -125,26 +124,22 @@ npm install
 1. 打开“选项”，先设置显示名称、头像、主题和全局背景。
 2. 在“模型通道池”填入 API 根地址和 API Key，并点击检测模型列表；单条 API 受限时可再添加独立通道。
 3. 选择用于结构化输出的对话模型，保留 API 模式为“自动”即可。
-4. 在“情报库”导入少量示例或自己的一个私聊会话。
+4. 登录本机微信并保持 HYPERION 运行；MNEMO 会自动检测数据库并写入统一归档。
 5. 打开会话，检查时间、发言人以及“你/对方”方向是否正确。
 6. 用严格时间范围做第一次模型提炼，先看候选和人物卡，再扩大范围。
 7. 候选确认后生成任务；不合适的候选要选择原因后忽略，磨合记录会影响后续提示。
 
-微信持续归档的首次设置、目录和状态接口见 [MNEMO 集成](docs/MNEMO.md)。它不替代已有的 JSON/CSV/TXT 导入。
+微信持续归档的首次设置、状态接口和异常处理见 [MNEMO 集成](docs/MNEMO.md)。情报库的外部 JSON/CSV/TXT 与目录导入目前已停用。
 
-模型通道与导入格式的完整说明见 [用户手册](docs/USER_GUIDE.md) 和 [聊天导出格式](docs/CHAT_EXPORT_FORMAT.md)。
+模型通道与使用说明见 [用户手册](docs/USER_GUIDE.md)。[聊天导出格式](docs/CHAT_EXPORT_FORMAT.md) 仅保留为历史兼容参考，当前没有对应的手动导入界面。
 
 ## 数据如何流动
 
 ```text
-用户主动导出的 JSON / CSV / TXT        本机 MNEMO 只读快照
-                |
-                v
-      浏览器内本地解析与去重                 不可变增量批次
-                |                              |
-                +---------------+--------------+
-                |
-                +----> 原始归档（gzip JSONL 分段 / IndexedDB v2）
+本机微信数据库 -> MNEMO 只读快照 -> HYPERION 自有不可变 outbox
+                                           |
+                                           v
+                         原始归档（gzip JSONL 分段 / IndexedDB v2）
                 |
                 v
       用户选择会话、范围并启动提炼
@@ -166,10 +161,10 @@ npm install
 
 ## 开发与发布目录
 
-开发工作区为了兼容历史版本，仍使用根目录下的 `.theia-*` 文件。发布包启用清晰的运行时布局：
+开发工作区为了兼容历史版本，仍使用根目录下的 `.hyperion-*` 文件。发布包启用清晰的运行时布局：
 
 ```text
-THEIA-release/
+HYPERION-release/
   app/                       应用源码、依赖清单和运行脚本
   assets/img/
     backgrounds/             用户上传的全局背景
@@ -179,7 +174,7 @@ THEIA-release/
     chat-archive/             append-only gzip JSONL 归档段
     chat-archive.json.gz      旧版原始聊天归档，只作为迁移/回滚源
     chat-archive.meta.json    归档 schema、水位、段数和消息计数
-    mnemo-inbox/              MNEMO 写入、THEIA 读取的不可变批次
+    mnemo-inbox/              MNEMO 写入、HYPERION 读取的不可变批次
     mnemo-export/             可读会话副本，按备注或昵称命名
     settings.ini             名称、外观、提示词、模型地址和 credentialRef
     credentials.json         桌面版 safeStorage 加密密钥容器
@@ -197,7 +192,7 @@ THEIA-release/
 
 ### 存储压缩与迁移
 
-原始聊天归档现在以 `chat-archive/`（开发目录为 `.theia-intel-store/`）中的 gzip JSONL segment 保存，读取时仍兼容旧 gzip/JSON。首次迁移建立 snapshot segment，并保留旧文件作为回滚源；小规模目录更新追加 delta，不再重写完整归档。达到 24 个 segment 后自动压实为新 snapshot。
+原始聊天归档现在以 `chat-archive/`（开发目录为 `.hyperion-intel-store/`）中的 gzip JSONL segment 保存，读取时仍兼容旧 gzip/JSON。首次迁移建立 snapshot segment，并保留旧文件作为回滚源；小规模目录更新追加 delta，不再重写完整归档。达到 24 个 segment 后自动压实为新 snapshot。
 
 已完成的任务日志会压缩为 `*.jsonl.gz`；服务启动时会继续整理超过 10 分钟的旧日志。调试摘要日志限制为约 8 MB，并保留最多 3 个轮转文件，避免长期运行无限增长。
 
@@ -212,7 +207,7 @@ THEIA-release/
 | `npm test` | 运行 importer、分段、候选、存储、迁移、恢复、前端工具和本地假服务回归；不调用真实模型 |
 | `npm run test:e2e` | 运行任务图、拖拽、地图设置和存储健康视觉回归 |
 | `npm run test:desktop-smoke` | 用隔离 runtime 验证 Electron 启动和 safeStorage 凭据迁移 |
-| `npm run test:unpacked-smoke` | 验证已生成的 `win-unpacked/THEIA.exe` 可以独立启动 |
+| `npm run test:unpacked-smoke` | 验证已生成的 `win-unpacked/HYPERION.exe` 可以独立启动 |
 | `npm run build` | TypeScript 项目构建检查并生成 `dist/` |
 | `npm run lint` | 执行 ESLint |
 | `npm run preview` | 预览 Vite 构建产物；涉及 API 的功能仍需本地服务 |
@@ -223,8 +218,8 @@ THEIA-release/
 发布工具：
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.6.0\THEIA-release-0.6.0
-npm run dist:exe -- ..\staging\v0.6.0\THEIA-0.6.0-portable
+node release-tools/package-release.mjs ..\staging\v0.6.0\HYPERION-release-0.6.0
+npm run dist:exe -- ..\staging\v0.6.0\HYPERION-0.6.0-portable
 npm run release:index
 ```
 
@@ -244,11 +239,11 @@ npm run release:index
 
 ## 重要边界
 
-- 任务和人物结论来自概率模型，必须由用户审核；THEIA 不能保证没有遗漏或误判。
+- 任务和人物结论来自概率模型，必须由用户审核；HYPERION 不能保证没有遗漏或误判。
 - 发言方向无法从导出字段可靠确定时，应用会标记为未知；不要靠昵称猜测“你”和“对方”。
 - 地图、天气、在线语录和头像地址依赖第三方公共服务，可能受限流、网络或地区影响。
-- 自动提炼的最短间隔是 24 小时，且当前需要应用页面保持打开；它不是系统后台服务。
+- 自动增量提炼需要应用保持打开。可选择按时间、按新增消息数或两者任一条件触发；首次全库提炼后，后续只提交有变化的会话和必要上下文。
 - 当前没有加密数据库。保护 Windows 账户、磁盘和备份介质是用户责任。
 - 当前通过版本化 schema、迁移前备份和离线回滚脚本兼容旧状态与归档；跨大版本升级前仍须备份整个运行时目录。
 
-MNEMO 只处理用户已授权、在本机完成一次密钥捕获的账号数据；它不绕过登录、不采集其他账号、不发送密钥，也不提供远程或未授权抓取能力。
+MNEMO 只处理当前 Windows 用户已登录的本机微信账号数据；它不绕过登录、不采集其他账号、不发送密钥，也不提供远程抓取能力。

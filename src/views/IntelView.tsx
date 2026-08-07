@@ -1,15 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import { Check, ChevronDown, Trash2 } from 'lucide-react'
-import type { AiExtractionCheckpoint, AiFeedbackReason, AiSettings, AiTaskCandidate, ArchiveAnalysisSummary, ArchiveSummary, DailyCheckIn, IntelItem, Person, SelfAnalysis } from '../types'
-import { parseIntelFile } from '../lib/importer'
-import { chooseExportDirectory, DIRECTORY_IMPORT_SIGNATURE_VERSION, ensureDirectoryPermission, loadDirectoryHandle, saveDirectoryHandle, scanExportDirectory, supportsDirectorySync, type LocalDirectoryHandle } from '../lib/directorySync'
-import { planDirectoryImport } from '../lib/directoryManifest'
+import type { AiExtractionCheckpoint, AiFeedbackReason, AiSettings, AiTaskCandidate, ArchiveAnalysisSummary, ArchiveSummary, ContextEvent, IntelItem, Person, SelfAnalysis } from '../types'
 import { AI_STATUS_CHANGED_EVENT, getAiStatus, type AiDebugEntry, type AiProgress, type AiStatus } from '../lib/aiClient'
+import { localProxyUrl } from '../lib/apiUrl'
 import { formatQuestTime } from '../lib/questTime'
 import { normalizeAiConcurrency } from '../lib/aiConcurrency'
 import { CandidateQueue } from './intel/CandidateQueue'
 import { ConversationBrowser } from './intel/ConversationBrowser'
-import { ArchivePanel, type AutomationState } from './intel/ArchivePanel'
 import { AnalysisPanel } from './intel/AnalysisPanel'
 import { useIntelAnalysisSelection, type AnalysisScope, type AnalysisTargets, type TimelineFilterMode } from '../hooks/useIntelAnalysisSelection'
 import { useAiWorkflow, type AnalysisWorkState } from '../hooks/useAiWorkflow'
@@ -19,13 +16,11 @@ import { loadIntelSnapshot, loadSharedIntelSnapshot, type ArchiveConversationSum
 interface IntelViewProps {
   active: boolean
   items: IntelItem[]
-  intelHydrated: boolean
   archiveLoadError?: string
   archive: ArchiveSummary
   candidates: AiTaskCandidate[]
-  dailyCheckins: DailyCheckIn[]
+  contextEvents: ContextEvent[]
   aiSettings: AiSettings
-  onImport: (items: IntelItem[], options?: { replace?: boolean; replaceFiles?: string[]; fileCount?: number; sourceFingerprint?: string }) => { added: number; updated: number; duplicates: number; archiveMessageCount: number; conversationCount: number }
   onAiAnalysis: (candidates: AiTaskCandidate[], analyzedIds: string[], settings: AiSettings, summary: Omit<ArchiveAnalysisSummary, 'analyzedAt'>, completedSuccessfully: boolean, watermarkEligible?: boolean) => void
   onDirectPeopleDetected: (people: Person[]) => void
   onPeopleAnalysis: (items: IntelItem[], settings: AiSettings, onProgress?: (progress: AiProgress) => void) => Promise<{ started: boolean; reason?: string; failedConversationIds?: string[]; analyzedIds?: string[] }>
@@ -40,10 +35,7 @@ interface IntelViewProps {
   conversationRequest?: { id: string; sequence: number }
 }
 
-const DIRECTORY_SNAPSHOT_KEY = 'theia:directory-snapshot:v1'
-const DIRECTORY_MANIFEST_KEY = 'theia:directory-manifest:v1'
-const DIRECTORY_SYNC_STATE_KEY = 'theia:directory-sync-state:v2'
-const AI_DEBUG_LOG_KEY = 'theia:ai-debug-log:v1'
+const AI_DEBUG_LOG_KEY = 'hyperion:ai-debug-log:v1'
 const MAX_DEBUG_LOG_ENTRIES = 800
 
 function loadAiDebugLog() {
@@ -98,58 +90,8 @@ function formatCount(value: number) {
   return new Intl.NumberFormat('zh-CN').format(value)
 }
 
-function loadDirectorySyncState() {
-  try {
-    const stored = localStorage.getItem(DIRECTORY_SYNC_STATE_KEY)
-    if (stored) {
-      const parsed = JSON.parse(stored) as { fingerprint?: unknown; manifest?: unknown }
-      if (parsed?.manifest && typeof parsed.manifest === 'object' && !Array.isArray(parsed.manifest)) {
-        return {
-          fingerprint: typeof parsed.fingerprint === 'string' ? parsed.fingerprint : '',
-          manifest: new Map(Object.entries(parsed.manifest as Record<string, unknown>)
-            .filter((entry): entry is [string, string] => typeof entry[1] === 'string')),
-          legacy: false,
-        }
-      }
-    }
-  } catch { /* Fall through to the legacy pair. */ }
-  try {
-    const parsed = JSON.parse(localStorage.getItem(DIRECTORY_MANIFEST_KEY) ?? '{}') as unknown
-    const manifest = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? new Map(Object.entries(parsed as Record<string, unknown>)
-        .filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
-      : new Map<string, string>()
-    return { fingerprint: localStorage.getItem(DIRECTORY_SNAPSHOT_KEY) ?? '', manifest, legacy: true }
-  } catch { return { fingerprint: '', manifest: new Map<string, string>(), legacy: true } }
-}
-
-async function directoryFingerprint(value: string) {
-  if (globalThis.crypto?.subtle) {
-    const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
-    return `sha256:${[...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`
-  }
-  let hash = 2166136261
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index)
-    hash = Math.imul(hash, 16777619)
-  }
-  return `fnv1a:${(hash >>> 0).toString(16)}:${value.length}`
-}
-
-export function IntelView({ active, items, intelHydrated, archiveLoadError, archive, candidates, dailyCheckins, aiSettings, onImport, onAiAnalysis, onDirectPeopleDetected, onPeopleAnalysis, onSelfAnalysis, onAnalysisWatermark, onStopPeopleAnalysis, onAnalysisCheckpoint, onCreateAiQuests: createAiQuests, onDismissAiCandidates, onAnalysisWorkChange, onArchiveLoaded, conversationRequest }: IntelViewProps) {
-  const inputRef = useRef<HTMLInputElement>(null)
+export function IntelView({ active, items, archiveLoadError, archive, candidates, contextEvents, aiSettings, onAiAnalysis, onDirectPeopleDetected, onPeopleAnalysis, onSelfAnalysis, onAnalysisWatermark, onStopPeopleAnalysis, onAnalysisCheckpoint, onCreateAiQuests: createAiQuests, onDismissAiCandidates, onAnalysisWorkChange, onArchiveLoaded, conversationRequest }: IntelViewProps) {
   const attachmentRef = useRef<HTMLInputElement>(null)
-  const handleRef = useRef<LocalDirectoryHandle | null>(null)
-  const busyRef = useRef(false)
-  const onImportRef = useRef(onImport)
-  const itemsRef = useRef(items)
-  const archiveRef = useRef(archive)
-  const [message, setMessage] = useState('记录默认只在本机解析；点击模型分析后，选中的记录才会发送到本机代理。')
-  const [busy, setBusy] = useState(false)
-  const [automationState, setAutomationState] = useState<AutomationState>('restoring')
-  const [folderName, setFolderName] = useState('')
-  const [lastScan, setLastScan] = useState('尚未扫描')
-  const [scanStats, setScanStats] = useState({ files: 0, changed: 0, records: 0, rebuilt: false })
   const [scope, setScope] = useState<AnalysisScope>('all')
   const [attachmentFiles, setAttachmentFiles] = useState<File[]>([])
   const [aiStatus, setAiStatus] = useState<AiStatus | null>(null)
@@ -162,8 +104,9 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
   const [timelineMode, setTimelineMode] = useState<TimelineFilterMode>('last-chat')
   const [analysisTargets, setAnalysisTargets] = useState<AnalysisTargets>({ tasks: true, people: true, self: true })
   const [analysisConversationId, setAnalysisConversationId] = useState('')
-  const [openSections, setOpenSections] = useState({ intake: true, analysis: true, debug: true, created: false, candidates: true, conversations: true })
+  const [openSections, setOpenSections] = useState({ analysis: true, debug: true, created: false, candidates: true, conversations: false })
   const [selectedCandidates, setSelectedCandidates] = useState<Set<string>>(new Set())
+  const [mnemoIssue, setMnemoIssue] = useState('')
   const pendingCandidates = useMemo(() => candidates.filter((candidate) => candidate.status === 'pending'), [candidates])
   // Generated candidates are removed once a quest is created; keep no
   // temporary archive section in the interface for legacy snapshots.
@@ -173,13 +116,16 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
     return new Set([...selectedCandidates].filter((id) => available.has(id)))
   }, [pendingCandidates, selectedCandidates])
   const conversationIndexEnabled = active || analysisRetained || aiSettings.autoEnabled || Boolean(aiSettings.interruptedRun) || Boolean(conversationRequest)
+  // Keep archive list work out of the background. The browser fetches its
+  // compact directory only after the user opens this specific section.
+  const archiveBrowserEnabled = (active && openSections.conversations) || Boolean(conversationRequest)
   // Keep directory discovery mounted, but avoid indexing hundreds of
   // thousands of records while the archive screen is hidden and idle.
   const workflowItems = deferredAnalysisItems ?? items
   const indexedItems = conversationIndexEnabled ? workflowItems : null
   const intelById = useMemo(() => indexedItems ? new Map(indexedItems.map((item) => [item.id, item])) : new Map<string, IntelItem>(), [indexedItems])
-  const { conversations, conversationFingerprints, conversationKinds, filteredConversations, analysisConversation, analysisMessages, analysisConversationCount, automaticWorkPending } = useIntelAnalysisSelection({ indexedItems, aiSettings, scope, timelineMode, timelineStart, timelineEnd, analysisConversationId, analysisTargets })
-  const archiveConversationIndex = useArchiveConversationIndex(conversationIndexEnabled, `${archive.sourceFingerprint ?? ''}:${archive.lastImport?.importedAt ?? ''}:${archive.messageCount}`)
+  const { conversations, conversationFingerprints, conversationKinds, filteredConversations, analysisConversation, analysisMessages, analysisConversationCount, automaticWorkPending, automaticPendingRecordCount } = useIntelAnalysisSelection({ indexedItems, aiSettings, scope, timelineMode, timelineStart, timelineEnd, analysisConversationId, analysisTargets })
+  const archiveConversationIndex = useArchiveConversationIndex(archiveBrowserEnabled, `${archive.sourceFingerprint ?? ''}:${archive.lastImport?.importedAt ?? ''}:${archive.messageCount}`)
   const browserConversationFallback = useMemo<ArchiveConversationSummary[]>(() => conversations.map((conversation) => {
     let latestPreview = conversation.records.at(-1)
     for (let index = conversation.records.length - 1; index >= 0; index -= 1) {
@@ -221,9 +167,6 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
   // by the conversation segment planner, not by silently lowering channel
   // concurrency at the UI layer.
   const effectiveConcurrency = normalizeAiConcurrency(Math.max(Number(aiSettings.concurrency) || 0, configuredProviderCapacity))
-  useEffect(() => { onImportRef.current = onImport }, [onImport])
-  useEffect(() => { itemsRef.current = workflowItems }, [workflowItems])
-  useEffect(() => { archiveRef.current = archive }, [archive])
   const appendDebugLog = useCallback((entry: AiDebugEntry) => {
     setDebugLog((current) => {
       const next = [entry, ...current].slice(0, MAX_DEBUG_LOG_ENTRIES)
@@ -237,8 +180,8 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
       if (!entry || typeof entry.event !== 'string' || typeof entry.at !== 'string') return
       appendDebugLog(entry)
     }
-    window.addEventListener('theia:ai-debug', relay)
-    return () => window.removeEventListener('theia:ai-debug', relay)
+    window.addEventListener('hyperion:ai-debug', relay)
+    return () => window.removeEventListener('hyperion:ai-debug', relay)
   }, [appendDebugLog])
   const clearDebugLog = () => {
     setDebugLog([])
@@ -274,9 +217,10 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
     conversationFingerprints,
     conversationKinds,
     automaticWorkPending,
+    automaticPendingRecordCount,
     effectiveConcurrency,
     attachmentFiles,
-    dailyCheckins,
+    contextEvents,
     appendDebugLog,
     onAiAnalysis,
     onDirectPeopleDetected,
@@ -304,7 +248,10 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
     return loaded
   }, [deferredAnalysisItems, onArchiveLoaded])
   const runAiAnalysis = useCallback(async () => {
-    if (!workflowItems.length && archive.messageCount > 0) {
+    // A large archive can stay body-deferred at startup. Local producers may
+    // append one journal row meanwhile; treating that single row as a complete
+    // archive would make self analysis miss the rest of the user's history.
+    if (archive.messageCount > workflowItems.length) {
       pendingDeferredRunRef.current = true
       setAiMessage('正在按需读取归档，读取完成后会自动开始提炼。')
       try { await loadDeferredArchive() } catch (error) {
@@ -327,150 +274,29 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
     return () => window.removeEventListener(AI_STATUS_CHANGED_EVENT, updateStatus)
   }, [setAiMessage])
 
-  const syncDirectory = useCallback(async (handle: LocalDirectoryHandle, force = false) => {
-    if (busyRef.current) return
-    busyRef.current = true
-    setBusy(true)
-    try {
-      const scan = await scanExportDirectory(handle)
-      const files = scan.files
-      if (!scan.complete) {
-        const reasons = [
-          scan.truncated ? '文件数量超过 20,000 个' : '',
-          scan.skippedOversizedFiles ? `${scan.skippedOversizedFiles} 个文件超过 512 MB` : '',
-          scan.depthLimitReached ? '目录层级超过 24 层' : '',
-        ].filter(Boolean)
-        throw new Error(`目录扫描不完整（${reasons.join('；')}）。为避免误删记录，本次未修改现有归档。`)
-      }
-      const importSignature = (entry: typeof files[number]) => entry.file.name.toLowerCase().endsWith('.json')
-        ? `${entry.signature}:${DIRECTORY_IMPORT_SIGNATURE_VERSION}`
-        : entry.signature
-      const currentFingerprint = await directoryFingerprint(JSON.stringify({
-        name: handle.name,
-        files: files.map((entry) => [entry.path, importSignature(entry)]),
-      }))
-      const directoryState = loadDirectorySyncState()
-      const durableFingerprint = archiveRef.current.sourceFingerprint ?? ''
-      const manifestMatchesArchive = !durableFingerprint || directoryState.fingerprint === durableFingerprint
-      const previousFingerprint = manifestMatchesArchive ? directoryState.fingerprint : durableFingerprint
-      const previousManifest = manifestMatchesArchive ? directoryState.manifest : new Map<string, string>()
-      const manifestFiles = files.map((entry) => ({ path: entry.path, signature: importSignature(entry) }))
-      const currentManifest = new Map(manifestFiles.map((entry) => [entry.path, entry.signature]))
-      const completeSourceProvenance = itemsRef.current.length > 0 && itemsRef.current.every((item) => Boolean(item.sourceFile))
-      const plan = planDirectoryImport({
-        files: manifestFiles,
-        previousManifest,
-        previousFingerprint,
-        currentFingerprint,
-        archiveItemCount: itemsRef.current.length,
-        completeSourceProvenance,
-        force,
-      })
-      const { directoryChanged, incrementalUpdate, rebuildSnapshot, removedFiles } = plan
-      const changedPaths = new Set(plan.changedFiles.map((entry) => entry.path))
-      const changedFiles = files.filter((entry) => changedPaths.has(entry.path))
-      const parsePaths = new Set(plan.filesToParse.map((entry) => entry.path))
-      const filesToParse = files.filter((entry) => parsePaths.has(entry.path))
-      const importedItems: IntelItem[] = []
-      for (const [index, entry] of filesToParse.entries()) {
-        const parsed = await parseIntelFile(entry.file, { path: entry.path })
-        importedItems.push(...parsed)
-        // A large export may contain thousands of files. Yield regularly so the
-        // desktop UI can keep painting and the user can still change sections.
-        if (index > 0 && index % 8 === 0) await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
-      }
-      const merged = rebuildSnapshot
-        ? onImportRef.current(importedItems, { replace: true, fileCount: files.length, sourceFingerprint: currentFingerprint })
-        : incrementalUpdate
-          ? onImportRef.current(importedItems, { replaceFiles: [...new Set([...changedFiles.map((entry) => entry.path), ...removedFiles])], fileCount: files.length, sourceFingerprint: currentFingerprint })
-          : undefined
-      // Advance the manifest only after the in-memory archive accepted the
-      // replacement. A parse/import failure must be retried on the next scan.
-      if (rebuildSnapshot || incrementalUpdate || directoryChanged || directoryState.legacy) {
-        // Fingerprint and manifest describe one commit and must advance in a
-        // single localStorage write. A quota failure leaves the old commit
-        // intact, so the next scan safely retries instead of skipping files.
-        try {
-          localStorage.setItem(DIRECTORY_SYNC_STATE_KEY, JSON.stringify({
-            fingerprint: currentFingerprint,
-            manifest: Object.fromEntries(currentManifest),
-          }))
-        } catch { /* local cache is optional; the next scan retries safely */ }
-      }
-      const now = new Date().toLocaleTimeString('zh-CN')
-      const processedFileCount = filesToParse.length
-      setLastScan(`${now} · 扫描 ${files.length} 个文件 · 处理 ${processedFileCount} 个`)
-      setScanStats({ files: files.length, changed: processedFileCount + removedFiles.length, records: importedItems.length, rebuilt: rebuildSnapshot })
-      setMessage(merged
-        ? rebuildSnapshot
-          ? `已按目录重建 ${files.length} 个文件：当前 ${formatCount(merged.archiveMessageCount)} 条消息、${formatCount(merged.conversationCount)} 个会话；本次解析 ${formatCount(importedItems.length)} 条。`
-          : `已增量同步 ${changedFiles.length} 个新增或变更文件、${removedFiles.length} 个已删除文件：当前 ${formatCount(merged.archiveMessageCount)} 条消息；新增 ${formatCount(merged.added)} 条，更新 ${formatCount(merged.updated)} 条。`
-        : '目录已是最新状态。')
-      setAutomationState('watching')
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : '目录扫描失败，请重新授权或确认文件没有被占用。')
-      setAutomationState('error')
-    } finally {
-      busyRef.current = false
-      setBusy(false)
-    }
-  }, [])
-
   useEffect(() => {
     let cancelled = false
-    const restore = async () => {
-      if (!intelHydrated) return
-      if (!supportsDirectorySync()) { if (!cancelled) setAutomationState('unsupported'); return }
+    const refresh = async () => {
       try {
-        const saved = await loadDirectoryHandle()
-        if (!saved) { if (!cancelled) setAutomationState('idle'); return }
-        handleRef.current = saved
-        if (!cancelled) setFolderName(saved.name)
-        const allowed = await ensureDirectoryPermission(saved)
-        if (!cancelled) setAutomationState(allowed ? 'watching' : 'needs-permission')
-        if (allowed && !cancelled) await syncDirectory(saved)
-      } catch { if (!cancelled) setAutomationState('idle') }
+        const response = await fetch(localProxyUrl('/api/mnemo/status'), { cache: 'no-store' })
+        if (!response.ok) return
+        const status = await response.json() as {
+          agent?: { lastError?: unknown }
+          directories?: Array<{ lastError?: unknown }>
+        }
+        const agentIssue = typeof status.agent?.lastError === 'string' ? status.agent.lastError : ''
+        const inboxIssue = status.directories
+          ?.map((directory) => typeof directory.lastError === 'string' ? directory.lastError : '')
+          .find(Boolean) ?? ''
+        if (!cancelled) setMnemoIssue(agentIssue || inboxIssue)
+      } catch {
+        // A transient local-proxy failure is not a data anomaly.
+      }
     }
-    void restore()
-    return () => { cancelled = true }
-  }, [intelHydrated, syncDirectory])
-
-  const connectDirectory = async () => {
-    if (busyRef.current) return
-    busyRef.current = true
-    setBusy(true)
-    try {
-      let handle = handleRef.current
-      if (handle && !(await ensureDirectoryPermission(handle, true))) handle = null
-      if (!handle) handle = await chooseExportDirectory()
-      await saveDirectoryHandle(handle)
-      handleRef.current = handle
-      setFolderName(handle.name)
-      setAutomationState('watching')
-      busyRef.current = false
-      setBusy(false)
-      await syncDirectory(handle)
-    } catch (error) {
-      if ((error as DOMException).name !== 'AbortError') { setMessage('目录连接失败，请检查浏览器权限后重试。'); setAutomationState('error') }
-      busyRef.current = false
-      setBusy(false)
-    }
-  }
-
-  const importFiles = async (event: ChangeEvent<HTMLInputElement>) => {
-    const files = [...(event.target.files ?? [])]
-    if (!files.length || busyRef.current) return
-    busyRef.current = true
-    setBusy(true)
-    try {
-      const parsed = (await Promise.all(files.map((file) => parseIntelFile(file)))).flat()
-      const merged = parsed.length ? onImport(parsed) : undefined
-      setMessage(merged
-        ? `已从 ${files.length} 个文件解析 ${formatCount(parsed.length)} 条消息：新增 ${formatCount(merged.added)} 条，更新 ${formatCount(merged.updated)} 条，已存在 ${formatCount(merged.duplicates)} 条。`
-        : '没有发现足够完整的文本行。')
-    } catch { setMessage('文件无法解析，请确认格式和编码后重试。') }
-    finally { busyRef.current = false; setBusy(false); event.target.value = '' }
-  }
+    void refresh()
+    const timer = window.setInterval(() => { void refresh() }, 15_000)
+    return () => { cancelled = true; window.clearInterval(timer) }
+  }, [])
 
   const addAttachments = (event: ChangeEvent<HTMLInputElement>) => {
     const files = [...(event.target.files ?? [])].filter((file) => file.size <= 8 * 1024 * 1024)
@@ -508,28 +334,9 @@ export function IntelView({ active, items, intelHydrated, archiveLoadError, arch
     setAnalysisConversationId(id)
     setOpenSections((current) => ({ ...current, analysis: true }))
   }, [])
-  const automationLabel = automationState === 'watching' ? `已连接 ${folderName}` : automationState === 'needs-permission' ? `等待重新授权 ${folderName}` : automationState === 'unsupported' ? '当前浏览器不支持目录访问' : '尚未连接导出目录'
-
   return (
     <div className="intel-view page-width">
-      <ArchivePanel
-        open={openSections.intake}
-        automationState={automationState}
-        automationLabel={automationLabel}
-        folderName={folderName}
-        message={message}
-        lastScan={lastScan}
-        busy={busy}
-        archive={archive}
-        archiveLoadError={archiveLoadError}
-        scanStats={scanStats}
-        inputRef={inputRef}
-        onToggleOpen={() => setOpenSections((current) => ({ ...current, intake: !current.intake }))}
-        onConnect={() => void connectDirectory()}
-        onScan={() => { if (handleRef.current) void syncDirectory(handleRef.current) }}
-        onRebuild={() => { if (handleRef.current) void syncDirectory(handleRef.current, true) }}
-        onImportFiles={importFiles}
-      />
+      {(archiveLoadError || mnemoIssue) && <p className="archive-load-error" role="alert">{archiveLoadError || mnemoIssue}</p>}
 
       <AnalysisPanel
         open={openSections.analysis}

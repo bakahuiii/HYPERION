@@ -183,6 +183,8 @@ export const seedData: AppData = {
     instructions: '只把明确可执行、对现实生活有帮助的事项整理成任务；不要臆测隐私或制造压力。',
     autoEnabled: false,
     intervalHours: 24,
+    autoTriggerMode: 'either',
+    incrementalMessageCount: 50,
     recencyPolicy: 'balanced',
     concurrency: 4,
     feedback: [],

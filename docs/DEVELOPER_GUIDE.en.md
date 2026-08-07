@@ -1,12 +1,12 @@
-# THEIA Developer Guide
+# HYPERION Developer Guide
 
 [简体中文](DEVELOPER_GUIDE.md) | [English](DEVELOPER_GUIDE.en.md)
 
-This guide is for engineers who maintain, review, extend, or package THEIA. It describes source version `0.6.0` and treats `package-lock.json`, `server/index.mjs`, and the current implementation as authoritative. Planned capabilities are not described as complete. For field-level local HTTP, upstream model JSON, session batching, MNEMO, and log formats, use [API_PROTOCOL.md](API_PROTOCOL.md) and [MNEMO.md](MNEMO.md) alongside this guide.
+This guide is for engineers who maintain, review, extend, or package HYPERION. It describes source version `0.6.0` and treats `package-lock.json`, `server/index.mjs`, and the current implementation as authoritative. Planned capabilities are not described as complete. For field-level local HTTP, upstream model JSON, session batching, MNEMO, and log formats, use [API_PROTOCOL.md](API_PROTOCOL.md) and [MNEMO.md](MNEMO.md) alongside this guide.
 
 ## 1. System and Engineering Boundary
 
-THEIA is currently a single-user, local-first personal task-atlas application. The user deliberately supplies exported files. The browser parses and selects locally. The loopback Node.js service persists state, proxies controlled media requests, and forwards selected content to user-configured model providers. Engineering must preserve time, provenance, speaker direction, and revision. Inference must not masquerade as fact. Person descriptions must not turn isolated temporary states into stable labels. Guidance must not become prediction, scoring, manipulation, or moral judgment.
+HYPERION is currently a single-user, local-first personal task-atlas application. The user deliberately supplies exported files. The browser parses and selects locally. The loopback Node.js service persists state, proxies controlled media requests, and forwards selected content to user-configured model providers. Engineering must preserve time, provenance, speaker direction, and revision. Inference must not masquerade as fact. Person descriptions must not turn isolated temporary states into stable labels. Guidance must not become prediction, scoring, manipulation, or moral judgment.
 
 The project does not implement:
 
@@ -17,7 +17,7 @@ The project does not implement:
 - treatment of model output as an unquestionable fact database;
 - cloud accounts, multi-user collaboration, or remote synchronization.
 
-MNEMO is the only narrow exception: after the user completes a one-time local key capture for their own account, the separate MNEMO process may make a read-only decrypted snapshot for that account. The key never enters THEIA state, archives, logs, or model requests. THEIA owns only the agent lifecycle, outbox, readable exports, and avatar cache.
+MNEMO is the only narrow exception: when the current Windows user has a local WeChat desktop session running, the separate MNEMO process may make a read-only decrypted snapshot for that account. It does not require a GUI, folder grant, or manual key-capture operation. Key material never enters HYPERION state, archives, logs, or model requests. HYPERION owns only the agent lifecycle, outbox, readable exports, and avatar cache.
 
 Source, portable, and electron-builder NSIS packaging are supported. Crash markers, schema migration backups, rollback scripts, and GitHub update checks exist locally; remote crash reporting and telemetry do not. Conversation bodies are not encrypted at rest. Packaged Electron protects provider keys using operating-system `safeStorage`; plain Node development retains a documented plaintext compatibility fallback.
 
@@ -80,7 +80,7 @@ The practical minimum Node.js version is `22.12.0`. Node.js 24 LTS is recommende
 
 `App.tsx` still owns top-level domain state and atlas orchestration. Shared state synchronization belongs to `useSharedSync.ts`, settings to `useSettingsSync.ts`, and long-running task/person orchestration to `useAiWorkflow.ts`. Do not reintroduce multi-minute callbacks that read stale render closures; use `dataRef.current` or functional state updates.
 
-`IntelView.tsx` composes `ArchivePanel`, `AnalysisPanel`, `CandidateQueue`, and `ConversationBrowser`. Selection and time-window logic belong to `useIntelAnalysisSelection.ts`.
+`IntelView.tsx` composes `AnalysisPanel`, `CandidateQueue`, and `ConversationBrowser`. It polls MNEMO diagnostics only to surface real data failures; healthy or waiting intake remains silent. Selection and time-window logic belong to `useIntelAnalysisSelection.ts`.
 
 ### 3.1 Archive storage boundary
 
@@ -89,7 +89,7 @@ The practical minimum Node.js version is `22.12.0`. Node.js 24 LTS is recommende
 The first line of a segment is metadata:
 
 ```json
-{"schema":"theia-intel-archive/v1","schemaVersion":1,"kind":"delta","updatedAt":"2026-08-04T00:00:00.001Z","sourceFingerprint":"sha256:..."}
+{"schema":"hyperion-intel-archive/v1","schemaVersion":1,"kind":"delta","updatedAt":"2026-08-04T00:00:00.001Z","sourceFingerprint":"sha256:..."}
 ```
 
 Following lines are one of:
@@ -124,7 +124,7 @@ Node integration is disabled. Context isolation and Chromium sandboxing are enab
 
 ### 4.3 GPU policy
 
-Default Chromium flags enable GPU rasterization, zero copy, and Canvas out-of-process rasterization. `THEIA_SOFTWARE_RENDERING=1` disables hardware acceleration and enables the compatibility flags. Do not disable GPU globally to work around one driver. Atlas drag writes are batched through `requestAnimationFrame`; Leaflet uses canvas preference.
+Default Chromium flags enable GPU rasterization, zero copy, and Canvas out-of-process rasterization. `HYPERION_SOFTWARE_RENDERING=1` disables hardware acceleration and enables the compatibility flags. Do not disable GPU globally to work around one driver. Atlas drag writes are batched through `requestAnimationFrame`; Leaflet uses canvas preference.
 
 ## 5. Domain Model
 
@@ -154,7 +154,7 @@ A user- or model-created point or approximate area with coordinates, radius/prec
 
 Lightweight application state includes quests, people, places, schedules, candidates, UI preferences, and atlas layout. The large raw archive is separate. Provider secrets are separate again.
 
-Development layout uses repository-root `.theia-*` compatibility paths. Packaged layout uses:
+Development layout uses repository-root `.hyperion-*` compatibility paths. Packaged layout uses:
 
 ```text
 runtime/
@@ -177,7 +177,7 @@ Do not put raw messages back into lightweight shared state. Do not rewrite the c
 
 ### 6.1 Large-Archive Baseline (In Development)
 
-The append-only body remains `theia-intel-archive/v1`: an initial snapshot is followed by stable-ID upsert/delete deltas. Compaction writes a new snapshot first, records metadata, removes old segments only after that snapshot is durable, then writes final metadata. At every point there is a replayable current-state path.
+The append-only body remains `hyperion-intel-archive/v1`: an initial snapshot is followed by stable-ID upsert/delete deltas. Compaction writes a new snapshot first, records metadata, removes old segments only after that snapshot is durable, then writes final metadata. At every point there is a replayable current-state path.
 
 `chat-archive.meta.json` now carries `metadataVersion: 2`, with SHA-256, compressed byte length, operation count, and health data for every live segment. Metadata is a rebuildable index cache, not the source of truth: missing metadata is rebuilt from segments as `recovered-unindexed`; a digest mismatch stops reads; a delta with no actual change writes no empty segment. A running service compares the segment-name inventory and reuses its loaded map when it has not changed, rather than decompressing all segments for every small sync.
 
@@ -200,7 +200,7 @@ These are implementation boundaries, not promises of unlimited scale:
 | --- | --- | --- |
 | Startup | Archives above **25,000 records** are not copied into React state when the local archive index is available. | Below that threshold, legacy compatibility hydration may still occur. Above it, investigate any unexpected full-state load. |
 | Conversation browsing | The list reads compact server-side summaries; opening a conversation loads **250 records** per page and virtualizes the loaded rows. | The list can remain responsive with many conversations, but an individual conversation is still read into the browser page as the user continues loading. |
-| Import parsing | Files larger than **1 MiB** use the parsing Worker. | A malformed or exceptionally deep export can still exhaust browser memory; import in folders and retain the source export. |
+| MNEMO intake | HYPERION reads only immutable `mnemo-delta/v1` batches from its owned inbox. | A stable malformed batch is rejected and reported; external directories and JSON/CSV/TXT intake are not scanned. |
 | Archive storage | Disk writes are append-only gzip JSONL deltas, with SHA-256 metadata and compaction. | Reload currently reconstructs an in-memory `Map`; archive size is therefore still bounded by available Node/Electron memory. |
 | Extraction | The user-started extraction bridge currently obtains the full selected archive before creating complete chronological plans. | This is not million-record-safe. Treat **100,000+ records** as a high-scale mode requiring a synthetic benchmark and memory check; **1,000,000 records** is an unverified target, not a supported claim. |
 | Model requests | Task baseline is 48 core records / ~4,000 compact characters; people baseline is 320 / ~24,000, with bounded overlap. | A custom ensemble profile may be larger only after testing that specific provider. Too-large prompts can still produce relay timeouts or 502 responses. |
@@ -209,21 +209,15 @@ Before changing any boundary, run the synthetic archive benchmark, record cold-l
 
 Reference only: the synthetic 100,000-record archive benchmark recorded on 2026-08-06 with Node `v24.13.0` on Windows x64 used 5,000-record batches, wrote in 646 ms, cold-read plus verified in 646 ms, used 174.7 MiB heap / 345.2 MiB RSS, and returned a 160-record first conversation page. This is a regression reference for one machine, not a supported-scale guarantee or a substitute for extraction-memory measurement.
 
-## 7. Import Pipeline
+## 7. MNEMO Intake Pipeline
 
-Directory discovery is recursive and accepts supported JSON, CSV, and TXT. One folder is treated as one conversation when the exporter provides that structure. Stable IDs combine source identity and record identity so rescans update or delete authoritative records instead of accumulating duplicates.
+`server/mnemoAgent.mjs` starts `python/mnemo_agent.py` as a child process and explicitly provides HYPERION-owned inbox, readable-export, and avatar-cache directories. On each source fingerprint change, the agent creates a read-only snapshot, maps `contact.db` `remark -> nick_name`, reads local image blobs from `head_image.db`, and writes immutable `MNEMO-v1-*/records.json` documents. It must not write the append-only archive or read/write HYPERION credentials.
 
-### 7.1 MNEMO Sidecar
+`server/mnemoInbox.mjs` accepts only `mnemo-delta/v1`, waits for a stable complete file, remembers the batch SHA-256, normalizes bounded fields, and sends records to `writeSharedIntelDelta`. Stable message IDs must not include display names. Readable exports use remark, nickname, then a collision-only hash suffix. MNEMO avatars must be binary-signature checked, content-addressed in HYPERION storage, and represented in archive records only as `/api/media/avatar/local?id=<hash>`.
 
-`server/mnemoAgent.mjs` starts `python/mnemo_agent.py` as a child process and explicitly provides THEIA-owned inbox, readable-export, and avatar-cache directories. On each source fingerprint change, the agent creates a read-only snapshot, maps `contact.db` `remark -> nick_name`, reads local image blobs from `head_image.db`, and writes immutable `MNEMO-v1-*/records.json` documents. It must not write the append-only archive or read/write THEIA credentials.
+External JSON, CSV, TXT, and directory intake are intentionally disabled. MNEMO is the only chat source. A batch is accepted only after it is complete and stable, then its normalized fields preserve the source message time and explicit speaker direction.
 
-`server/mnemoInbox.mjs` accepts only `mnemo-delta/v1`, waits for a stable complete file, remembers the batch SHA-256, normalizes bounded fields, and sends records to `writeSharedIntelDelta`. Stable message IDs must not include display names. Readable exports use remark, nickname, then a collision-only hash suffix. MNEMO avatars must be binary-signature checked, content-addressed in THEIA storage, and represented in archive records only as `/api/media/avatar/local?id=<hash>`.
-
-Files larger than 1 MiB use `workers/intelParser.worker.ts`; smaller files call the same parser directly. Worker and direct paths must produce identical IDs, times, speaker roles, conversation keys, and avatar fields.
-
-JSON import traverses known arrays and exporter-specific containers. CSV uses structured parsing. TXT supports timestamped conversation lines. Avoid ad hoc comma splitting or timestamp guessing.
-
-Time must come from the record. A value such as `07-29 01:48:30` has no reliable year and must not silently inherit the file modification year. Speaker direction must come from an explicit field or a validated exporter contract; display-name guessing is forbidden.
+Manual extraction defaults to `scope=all`, which selects every database record. Automatic extraction must use conversation watermarks: `autoTriggerMode` is `time`, `message-count`, or `either`; `intervalHours` is constrained to 1–720 and `incrementalMessageCount` to 1–10,000. A run starts only when unprocessed increments exist and its configured condition is satisfied. It sends only new records plus bounded preceding context; the first full-library baseline remains a user-confirmed manual run.
 
 ## 8. Conversation Planning and Oversized Context
 
@@ -399,7 +393,7 @@ Never print raw merge responses unconditionally to production console. All full-
 
 Packaged Electron attempts to migrate plaintext provider keys into `safeStorage` and writes ciphertext to `credentials.json`. The INI retains a `credentialRef`. A user can always choose and save a detected model; saving applies to the next request, not a stale in-flight request.
 
-Provider variables inherited from a parent IDE, Codex, or terminal process are ignored by default. `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_API_MODE`, and `OPENAI_MAX_CONCURRENCY` are read only when `THEIA_USE_ENV_PROVIDER=1` is explicitly set. A protected secondary channel must always hydrate from its own `credentialRef`; it must never inherit the process-wide key.
+Provider variables inherited from a parent IDE, Codex, or terminal process are ignored by default. `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_API_MODE`, and `OPENAI_MAX_CONCURRENCY` are read only when `HYPERION_USE_ENV_PROVIDER=1` is explicitly set. A protected secondary channel must always hydrate from its own `credentialRef`; it must never inherit the process-wide key.
 
 Provider editing must remain available even when runtime-status refresh is slow or fails. Status visualization is diagnostic and must not block configuration forms.
 
@@ -441,7 +435,7 @@ node --check electron/main.mjs
 git diff --check
 ```
 
-Integration tests use disposable `THEIA_RUNTIME_ROOT` directories and fake loopback providers. They must not read the developer's real conversations, INI, or API keys. Playwright snapshot updates require human visual review; updating a baseline is not itself a passing test.
+Integration tests use disposable `HYPERION_RUNTIME_ROOT` directories and fake loopback providers. They must not read the developer's real conversations, INI, or API keys. Playwright snapshot updates require human visual review; updating a baseline is not itself a passing test.
 
 Additional desired coverage includes person claim validation and same-name conversation isolation, provider URL/mode compatibility, and geocoder bounds/precision/radius normalization.
 
@@ -460,8 +454,8 @@ Additional desired coverage includes person claim validation and same-name conve
 ### 18.2 Source and portable packages
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.6.0\THEIA-release-0.6.0
-npm run dist:exe -- ..\staging\v0.6.0\THEIA-0.6.0-portable
+node release-tools/package-release.mjs ..\staging\v0.6.0\HYPERION-release-0.6.0
+npm run dist:exe -- ..\staging\v0.6.0\HYPERION-0.6.0-portable
 ```
 
 The source packager refuses an existing destination and excludes conversations, tasks, people, places, candidates, keys, provider settings, browser/Electron profiles, logs, downloaded avatars, custom backgrounds, dependencies, builds, caches, and Git metadata. It includes source, lockfiles, canonical documentation, neutral assets, fictional examples, and a manifest.
@@ -500,7 +494,7 @@ Avoid `JSON.parse(JSON.stringify(...))` for domain cloning. It silently loses da
 
 ## 20. Self-Authored Longitudinal Inputs
 
-THEIA's archive is not limited to imported conversations. A user-authored entry is first-class local data, intended to make later longitudinal self-research possible without turning the product into passive surveillance.
+HYPERION's archive is not limited to imported conversations. A user-authored entry is first-class local data, intended to make later longitudinal self-research possible without turning the product into passive surveillance.
 
 There are three deliberately separate inputs:
 
@@ -541,7 +535,7 @@ verified self-authored messages + journal + daily check-ins + imported AI user m
 
 An observation may cover a cited event, action, expressed emotion or thought, decision, relationship interaction, routine, stressor, coping attempt, change, or uncertainty. It is not a diagnosis, personality score, treatment recommendation, risk label, hidden-motive inference, or a conversion of one statement into a durable trait. A merge may include an explanatory professional context only when its observation IDs support it; the UI labels it explicitly as non-diagnostic. The 120-observation boundary is a per-request envelope, not a discard limit: dense periods are split chronologically and every verified observation is assigned to a group.
 
-Directory replacement imports must use `retainManualIntelRecords(imported, current)`. An external directory is authoritative for its own exported files only; it must never delete or overwrite `self-journal` rows, including on an accidental ID collision. `dailyCheckins` belongs to lightweight shared state and is merged per stable ID; raw `intel` remains in the append-only archive store.
+MNEMO is authoritative only for its own stable record IDs. Its reconciliation deltas must never overwrite `self-journal` rows or lightweight state such as `dailyCheckins`; raw chat records remain in the append-only archive store.
 
 ## 21. Known Risks and Priorities
 
@@ -558,4 +552,4 @@ Remaining priorities include:
 - enable real multi-model fan-out only after budget, per-pass logs, evidence provenance, and human review UI are in place;
 - evolve the data model from current-task snapshots toward revision-aware longitudinal observations, inferences, reflections, and life-stage transitions.
 
-THEIA remains a single-user local application. It does not promise unbounded scale, every export format, public-service availability, or identical behavior from every OpenAI-compatible relay. New protocol work must preserve the established stable provider baseline while moving the system toward its longitudinal self-research purpose.
+HYPERION remains a single-user local application. It does not promise unbounded scale, every export format, public-service availability, or identical behavior from every OpenAI-compatible relay. New protocol work must preserve the established stable provider baseline while moving the system toward its longitudinal self-research purpose.

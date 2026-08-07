@@ -42,6 +42,11 @@ const fallbackQuotes = [
   { text: '把今天能做的事，留在今天完成。', from: '离线句库' },
   { text: '真正重要的事，值得慢慢弄清。', from: '离线句库' },
 ]
+
+function hyperionEnvironment(name) {
+  return process.env[`HYPERION_${name}`] ?? process.env[`THEIA_${name}`]
+}
+
 const {
   sharedStatePath,
   sharedIntelPath,
@@ -131,7 +136,7 @@ const aiSessions = new Map()
 const aiSessionTtlMs = 30 * 60 * 1000
 const aiSessionMaxEnqueue = 40
 const aiSessionResultPageSize = 120
-const recoveryMonitorKey = Symbol.for('theia.runtimeRecoveryMonitor')
+const recoveryMonitorKey = Symbol.for('hyperion.runtimeRecoveryMonitor')
 
 function installRuntimeFailureMonitor() {
   if (globalThis[recoveryMonitorKey]) return
@@ -224,7 +229,7 @@ async function storageOverview() {
         rollbackBackups: migrationBackups,
       },
       archive: {
-        schema: archiveMeta?.schema ?? 'theia-intel-archive/v1',
+        schema: archiveMeta?.schema ?? 'hyperion-intel-archive/v1',
         schemaVersion: Number(archiveMeta?.schemaVersion) || 1,
         storageEngine: archiveMeta?.storageEngine ?? 'append-only-jsonl-gzip',
         recordCount: Number(archiveMeta?.recordCount) || 0,
@@ -263,7 +268,7 @@ function logAiDebug(event, details = {}) {
   // This log intentionally excludes raw records, attachment bodies, API keys,
   // and request headers. It is for diagnosing the local pipeline only.
   const line = `${JSON.stringify(entry)}\n`
-  console.info(`[THEIA AI] ${line.trim()}`)
+  console.info(`[HYPERION AI] ${line.trim()}`)
   const write = aiDebugWriteQueue.then(async () => {
     await mkdir(dirname(aiDebugLogPath), { recursive: true, mode: 0o700 })
     await rotateAiDebugLog(Buffer.byteLength(line, 'utf8'))
@@ -300,11 +305,11 @@ async function startTaskLog(kind, payload) {
     await mkdir(taskLogDirectoryPath, { recursive: true, mode: 0o700 })
     const path = resolve(taskLogDirectoryPath, taskLogIdentity(kind, payload))
     const startedAt = new Date().toISOString()
-    await writeFile(path, `${JSON.stringify({ schema: 'theia-task-log/v1', startedAt, kind, request: taskLogPayload(payload) })}\n`, { encoding: 'utf8', mode: 0o600 })
+    await writeFile(path, `${JSON.stringify({ schema: 'hyperion-task-log/v1', startedAt, kind, request: taskLogPayload(payload) })}\n`, { encoding: 'utf8', mode: 0o600 })
     activeTaskLogs.add(path)
     return { path, startedAt }
   } catch (error) {
-    console.warn(`[THEIA AI] Unable to start task log: ${error instanceof Error ? error.message : String(error)}`)
+    console.warn(`[HYPERION AI] Unable to start task log: ${error instanceof Error ? error.message : String(error)}`)
     return null
   }
 }
@@ -318,7 +323,7 @@ async function compressTaskLog(path) {
     await writeFileAtomically(compressedPath, compressed, { mode: 0o600 })
     await unlink(path)
   } catch (error) {
-    if (error?.code !== 'ENOENT') console.warn(`[THEIA AI] Unable to compact task log: ${error instanceof Error ? error.message : String(error)}`)
+    if (error?.code !== 'ENOENT') console.warn(`[HYPERION AI] Unable to compact task log: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
@@ -337,7 +342,7 @@ async function compactExistingTaskLogs() {
       await compressTaskLog(path)
     }
   } catch (error) {
-    if (error?.code !== 'ENOENT') console.warn(`[THEIA AI] Unable to compact task logs: ${error instanceof Error ? error.message : String(error)}`)
+    if (error?.code !== 'ENOENT') console.warn(`[HYPERION AI] Unable to compact task logs: ${error instanceof Error ? error.message : String(error)}`)
   }
   scheduleTaskLogMaintenance()
 }
@@ -364,7 +369,7 @@ async function finishTaskLog(log, event, details) {
     scheduleTaskLogMaintenance()
   } catch (error) {
     activeTaskLogs.delete(log.path)
-    console.warn(`[THEIA AI] Unable to finish task log: ${error instanceof Error ? error.message : String(error)}`)
+    console.warn(`[HYPERION AI] Unable to finish task log: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
@@ -457,7 +462,7 @@ function migrateLegacySharedIntel() {
   // JSON snapshot that migration read a moment earlier.
   const migration = sharedIntelWriteQueue.then(async () => {
     const migrated = await withFileLock(`${sharedIntelStoreDirectoryPath}.lock`, () => sharedIntelStore.migrate())
-    if (migrated) console.log('[THEIA] migrated the legacy gzip chat archive to append-only segment storage; the legacy file remains available for rollback')
+    if (migrated) console.log('[HYPERION] migrated the legacy gzip chat archive to append-only segment storage; the legacy file remains available for rollback')
     return migrated
   })
   sharedIntelWriteQueue = migration.catch(() => undefined)
@@ -529,8 +534,8 @@ function mutateSharedState(mutator) {
   const write = sharedStateWriteQueue.then(() => withFileLock(`${sharedStatePath}.lock`, async () => {
     const current = await loadSharedState()
     if (!current?.data || typeof current.data !== 'object') {
-      const error = new Error('THEIA 尚未初始化共享数据；请先启动一次桌面版或浏览器版。')
-      error.status = 409
+      const error = new Error('HYPERION 尚未初始化共享数据；请先启动一次桌面版或浏览器版。')
+      Object.assign(error, { status: 409, code: 'HYPERION_STATE_UNINITIALIZED' })
       throw error
     }
     const next = await mutator(current.data, current)
@@ -542,17 +547,18 @@ function mutateSharedState(mutator) {
 }
 
 function configuredSeleneInboxDirectories() {
-  const configured = typeof process.env.THEIA_SELENE_INBOX === 'string'
-    ? process.env.THEIA_SELENE_INBOX.split(';').map((value) => value.trim()).filter(Boolean)
+  const configuredInbox = hyperionEnvironment('SELENE_INBOX')
+  const configured = typeof configuredInbox === 'string'
+    ? configuredInbox.split(';').map((value) => value.trim()).filter(Boolean)
     : []
-  // Development installs live under <work>/THEIA/source.  SELENE's synced
+  // Development installs live under <work>/HYPERION/source.  SELENE's synced
   // inbox and its desktop writer are sibling projects, so recognize them
   // without requiring an environment variable. Packaged installs remain
-  // explicit through THEIA_SELENE_INBOX.
+  // explicit through HYPERION_SELENE_INBOX.
   const workRoot = resolve(runtimePaths.workspace, '..', '..')
   // A custom runtime root is used by release installs and isolated test runs;
   // it should not unexpectedly crawl an unrelated development workspace.
-  const discoveredDefaults = process.env.THEIA_RUNTIME_ROOT ? [] : [
+  const discoveredDefaults = process.env.HYPERION_RUNTIME_ROOT ? [] : [
     resolve(workRoot, 'SELENE-Inbox'),
     resolve(workRoot, '.tmp', 'selene.win.tmp'),
     resolve(workRoot, 'SELENE', 'exports'),
@@ -562,7 +568,7 @@ function configuredSeleneInboxDirectories() {
 }
 
 async function desktopSeleneConfiguredDirectories() {
-  if (process.env.THEIA_RUNTIME_ROOT && process.env.THEIA_SELENE_AUTO_DISCOVERY !== '1') return []
+  if (process.env.HYPERION_RUNTIME_ROOT && process.env.HYPERION_SELENE_AUTO_DISCOVERY !== '1') return []
   const localAppData = typeof process.env.LOCALAPPDATA === 'string' ? process.env.LOCALAPPDATA.trim() : ''
   if (!localAppData) return []
   try {
@@ -570,7 +576,7 @@ async function desktopSeleneConfiguredDirectories() {
     const directory = typeof settings?.ExportDirectory === 'string' ? settings.ExportDirectory.trim() : ''
     return directory ? [resolve(directory)] : []
   } catch (error) {
-    console.warn(`[THEIA] cannot read SELENE desktop export setting: ${error instanceof Error ? error.message : String(error)}`)
+    console.warn(`[HYPERION] cannot read SELENE desktop export setting: ${error instanceof Error ? error.message : String(error)}`)
     return []
   }
 }
@@ -582,7 +588,7 @@ async function availableSeleneInboxDirectories() {
     try {
       if ((await stat(directory)).isDirectory()) available.push(directory)
     } catch (error) {
-      if (error?.code !== 'ENOENT') console.warn(`[THEIA] cannot inspect SELENE directory ${directory}: ${error instanceof Error ? error.message : String(error)}`)
+      if (error?.code !== 'ENOENT') console.warn(`[HYPERION] cannot inspect SELENE directory ${directory}: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
   return available
@@ -615,10 +621,10 @@ async function startSeleneInboxSync() {
     const watcher = createSeleneInboxWatcher({
       directory,
       statePath: seleneWatcherStatePath(directory),
-      intervalMs: process.env.THEIA_SELENE_SYNC_INTERVAL_MS,
-      settleMs: process.env.THEIA_SELENE_SYNC_SETTLE_MS,
+      intervalMs: hyperionEnvironment('SELENE_SYNC_INTERVAL_MS'),
+      settleMs: hyperionEnvironment('SELENE_SYNC_SETTLE_MS'),
       onImport: importSeleneInboxEvents,
-      logger: (level, message) => console[level === 'warn' ? 'warn' : 'log'](`[THEIA] ${message}`),
+      logger: (level, message) => console[level === 'warn' ? 'warn' : 'log'](`[HYPERION] ${message}`),
     })
     seleneInboxWatchers.set(directory, watcher)
     await watcher.start()
@@ -627,10 +633,10 @@ async function startSeleneInboxSync() {
 }
 
 function configuredMnemoInboxDirectories() {
-  const configured = typeof process.env.THEIA_MNEMO_INBOX === 'string'
-    ? process.env.THEIA_MNEMO_INBOX.split(';').map((value) => value.trim()).filter(Boolean)
-    : []
-  return [...new Set([mnemoInboxDirectoryPath, ...configured].map((value) => resolve(value)))]
+  // MNEMO is a HYPERION-owned sidecar. Do not accept arbitrary external JSON
+  // inboxes while manual import is disabled; its private outbox is the only
+  // supported chat intake path.
+  return [resolve(mnemoInboxDirectoryPath)]
 }
 
 async function availableMnemoInboxDirectories() {
@@ -639,7 +645,7 @@ async function availableMnemoInboxDirectories() {
     try {
       if ((await stat(directory)).isDirectory()) available.push(directory)
     } catch (error) {
-      if (error?.code !== 'ENOENT') console.warn(`[THEIA] cannot inspect MNEMO directory ${directory}: ${error instanceof Error ? error.message : String(error)}`)
+      if (error?.code !== 'ENOENT') console.warn(`[HYPERION] cannot inspect MNEMO directory ${directory}: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
   return available
@@ -650,10 +656,13 @@ function mnemoWatcherStatePath(directory) {
   return `${mnemoInboxStatePath}.${suffix}.json`
 }
 
-async function importMnemoInboxRecords(records) {
+async function importMnemoInboxRecords(records, metadata = {}) {
+  const deleteIds = Array.isArray(metadata?.deleteIds)
+    ? metadata.deleteIds.filter((id) => typeof id === 'string' && id.startsWith('mnemo:'))
+    : []
   const write = sharedIntelWriteQueue.then(async () => {
-    const saved = await writeSharedIntelDelta({ upserts: records, deleteIds: [] })
-    return { importedRecords: records.length, archiveRecordCount: Number(saved?.recordCount) || 0 }
+    const saved = await writeSharedIntelDelta({ upserts: records, deleteIds })
+    return { importedRecords: records.length, deletedRecords: deleteIds.length, archiveRecordCount: Number(saved?.recordCount) || 0 }
   })
   sharedIntelWriteQueue = write.catch(() => undefined)
   return write
@@ -666,10 +675,10 @@ async function startMnemoInboxSync() {
     const watcher = createMnemoInboxWatcher({
       directory,
       statePath: mnemoWatcherStatePath(directory),
-      intervalMs: process.env.THEIA_MNEMO_INBOX_INTERVAL_MS,
-      settleMs: process.env.THEIA_MNEMO_INBOX_SETTLE_MS,
+      intervalMs: process.env.HYPERION_MNEMO_INBOX_INTERVAL_MS,
+      settleMs: process.env.HYPERION_MNEMO_INBOX_SETTLE_MS,
       onImport: importMnemoInboxRecords,
-      logger: (level, message) => console[level === 'warn' ? 'warn' : 'log'](`[THEIA] ${message}`),
+      logger: (level, message) => console[level === 'warn' ? 'warn' : 'log'](`[HYPERION] ${message}`),
     })
     mnemoInboxWatchers.set(directory, watcher)
     await watcher.start()
@@ -701,7 +710,7 @@ function botJournalRecord(data, content) {
     summary: body.slice(0, 1_200),
     content: body,
     source: '手动记录',
-    sourceFile: 'theia://self-journal',
+    sourceFile: 'hyperion://self-journal',
     conversationId: 'self-journal',
     conversationName: '我',
     conversationKind: 'direct',
@@ -765,7 +774,7 @@ function botCheckInRecord(data, checkIn) {
     summary: content,
     content,
     source: '手动记录',
-    sourceFile: 'theia://self-journal',
+    sourceFile: 'hyperion://self-journal',
     conversationId: 'self-journal',
     conversationName: '我',
     conversationKind: 'direct',
@@ -1143,10 +1152,10 @@ async function randomQuote() {
 
 function allowedOrigin(origin) {
   if (!origin) return true
-  if (origin === 'null') return process.env.THEIA_ALLOW_FILE_ORIGIN === '1'
+  if (origin === 'null') return process.env.HYPERION_ALLOW_FILE_ORIGIN === '1'
   try {
     const parsed = new URL(origin)
-    if (parsed.protocol === 'theia:' && parsed.hostname === 'app') return process.env.THEIA_ALLOW_FILE_ORIGIN === '1'
+    if (parsed.protocol === 'hyperion:' && parsed.hostname === 'app') return process.env.HYPERION_ALLOW_FILE_ORIGIN === '1'
     return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')
   } catch { return false }
 }
@@ -2999,7 +3008,7 @@ function validateSelfObservationPayload(payload) {
   if (!payload.records.every((record) => record?.speakerRole === 'self')) {
     throw new Error('Self analysis accepts only locally verified self-authored records')
   }
-  const allowedKinds = new Set(['calendar', 'location', 'screen-time', 'activity', 'health', 'payment', 'device', 'custom'])
+  const allowedKinds = new Set(['calendar', 'location', 'movement', 'screen-time', 'activity', 'health', 'payment', 'device', 'custom'])
   const allowedSources = new Set(['selene'])
   const contextEvents = Array.isArray(payload.contextEvents)
     ? payload.contextEvents.filter((item) => item && typeof item === 'object' && allowedSources.has(item.source)).map((item) => {
@@ -3574,7 +3583,7 @@ async function fetchCachedAvatar(initialUrl) {
   } catch (error) {
     // The avatar remains usable for this request even when a local cache write
     // is unavailable (for example, an antivirus temporarily locks the file).
-    console.warn(`[THEIA AI] Unable to cache avatar: ${error instanceof Error ? error.message : String(error)}`)
+    console.warn(`[HYPERION AI] Unable to cache avatar: ${error instanceof Error ? error.message : String(error)}`)
   }
   return image
 }
@@ -3584,7 +3593,7 @@ async function fetchApprovedImage(initialUrl, { maxBytes, allowedHost }) {
   for (let redirects = 0; redirects <= 3; redirects += 1) {
     if (!['https:', 'http:'].includes(url.protocol) || !allowedHost(url.hostname)) throw new Error('图片重定向到了未允许的域名')
     const upstream = await fetch(url, {
-      headers: { accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.5', 'user-agent': 'THEIA-personal-atlas/0.1 (local asset proxy)' },
+      headers: { accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.5', 'user-agent': 'HYPERION-personal-atlas/0.1 (local asset proxy)' },
       redirect: 'manual',
       signal: AbortSignal.timeout(12_000),
     })
@@ -3642,7 +3651,7 @@ async function fetchMapTile(providerId, z, x, y, cacheMaxMb) {
     const content = await readFile(cachePath)
     if (content.length > 0 && content.length <= maxTileBytes) return { mimeType: 'image/png', content, cache: 'hit' }
   } catch (error) {
-    if (error?.code !== 'ENOENT') console.warn(`[THEIA] map tile cache read failed: ${error instanceof Error ? error.message : String(error)}`)
+    if (error?.code !== 'ENOENT') console.warn(`[HYPERION] map tile cache read failed: ${error instanceof Error ? error.message : String(error)}`)
   }
   let failure
   for (const url of mapTileUrls(selected, z, x, y)) {
@@ -3658,7 +3667,7 @@ async function fetchMapTile(providerId, z, x, y, cacheMaxMb) {
         const maintenance = mapTileMaintenanceQueue.then(() => pruneLogDirectory(mapTileCacheDirectoryPath, { maxFiles: 100_000, maxBytes, exclude: new Set([cachePath]) }))
         mapTileMaintenanceQueue = maintenance.catch(() => undefined)
       } catch (cacheError) {
-        console.warn(`[THEIA] map tile cache write failed: ${cacheError instanceof Error ? cacheError.message : String(cacheError)}`)
+        console.warn(`[HYPERION] map tile cache write failed: ${cacheError instanceof Error ? cacheError.message : String(cacheError)}`)
       }
       return { ...image, cache: 'miss' }
     } catch (error) {
@@ -3690,7 +3699,7 @@ export const server = http.createServer(async (request, response) => {
       const [z, x, y] = tileMatch.slice(1).map(Number)
       const parameters = new URL(request.url || '/', 'http://127.0.0.1').searchParams
       const image = await fetchMapTile(parameters.get('provider') || 'osm-de', z, x, y, parameters.get('cacheMaxMb'))
-      response.setHeader('x-theia-map-cache', image.cache)
+      response.setHeader('x-hyperion-map-cache', image.cache)
       sendImage(response, image.mimeType, image.content, 60 * 60 * 24 * 7)
     } catch (error) {
       sendRequestError(response, error, '地图底图加载失败')
@@ -3729,7 +3738,7 @@ export const server = http.createServer(async (request, response) => {
           { id: 'photon', name: 'Photon', detail: 'Komoot 提供的开源地理编码服务。', policyUrl: 'https://photon.komoot.io/' },
         ],
         attribution: '© OpenStreetMap contributors',
-        usageNotice: '仅用于交互式个人地图。禁止批量预取或离线抓取；THEIA 会使用有界本地缓存并保留地图署名。',
+        usageNotice: '仅用于交互式个人地图。禁止批量预取或离线抓取；HYPERION 会使用有界本地缓存并保留地图署名。',
       })
     } catch (error) {
       sendRequestError(response, error, '地图服务设置读取失败')
@@ -3752,7 +3761,7 @@ export const server = http.createServer(async (request, response) => {
       const searchProvider = mapRequestUrl.searchParams.get('provider') || 'balanced'
       if (query.length < 2) throw new Error('搜索地点至少需要两个字符')
       const normalizedQuery = query.slice(0, 180)
-      const headers = { accept: 'application/json', 'user-agent': 'THEIA-personal-map/0.1 (local user search)' }
+      const headers = { accept: 'application/json', 'user-agent': 'HYPERION-personal-map/0.1 (local user search)' }
       const requestSignal = requestAbortSignal(request, response)
       const providerController = new AbortController()
       const providerSignal = () => AbortSignal.any([requestSignal, providerController.signal, AbortSignal.timeout(7_000)])
@@ -4015,7 +4024,7 @@ export const server = http.createServer(async (request, response) => {
     try {
       sendJson(response, 200, await botOverview())
     } catch (error) {
-      sendRequestError(response, error, '无法读取 THEIA 摘要')
+      sendRequestError(response, error, '无法读取 HYPERION 摘要')
     }
     return
   }
@@ -4136,7 +4145,7 @@ export const server = http.createServer(async (request, response) => {
       const payload = await readBody(request)
       const snapshot = await loadSharedState()
       if (!snapshot?.data) {
-        const error = new Error('THEIA 尚未初始化共享数据；请先启动一次桌面版或浏览器版。')
+        const error = new Error('HYPERION 尚未初始化共享数据；请先启动一次桌面版或浏览器版。')
         error.status = 409
         throw error
       }
@@ -4710,7 +4719,7 @@ export function startAiProxy() {
       installRuntimeFailureMonitor()
       void startRecoverySession(serviceSessionPath, crashLogPath, { port: listeningPort })
         .then((status) => { recoveryStatus = status })
-        .catch((error) => console.warn(`[THEIA] recovery marker unavailable: ${error instanceof Error ? error.message : String(error)}`))
+        .catch((error) => console.warn(`[HYPERION] recovery marker unavailable: ${error instanceof Error ? error.message : String(error)}`))
       server.once('close', () => {
         for (const watcher of seleneInboxWatchers.values()) watcher.stop()
         seleneInboxWatchers.clear()
@@ -4722,21 +4731,21 @@ export function startAiProxy() {
       void withFileLock(`${sharedStatePath}.lock`, () => migrateSharedStateFile(sharedStatePath, migrationDirectoryPath))
         .then((result) => {
           sharedStateMigrationStatus = { state: 'ready', ...result }
-          if (result.migrated) console.log(`[THEIA] shared state schema migrated to v${result.toVersion}; rollback backup: ${result.backupPath}`)
+          if (result.migrated) console.log(`[HYPERION] shared state schema migrated to v${result.toVersion}; rollback backup: ${result.backupPath}`)
         })
         .catch((error) => {
           sharedStateMigrationStatus = { state: 'failed', migrated: false, error: error instanceof Error ? error.message : String(error) }
-          console.warn(`[THEIA] shared state migration skipped: ${sharedStateMigrationStatus.error}`)
+          console.warn(`[HYPERION] shared state migration skipped: ${sharedStateMigrationStatus.error}`)
         })
       void migrateLegacySharedIntel()
         .then((migrated) => { archiveMigrationStatus = { state: 'ready', migrated } })
         .catch((error) => {
           archiveMigrationStatus = { state: 'failed', migrated: false, error: error instanceof Error ? error.message : String(error) }
-          console.warn(`[THEIA] archive migration skipped: ${archiveMigrationStatus.error}`)
+          console.warn(`[HYPERION] archive migration skipped: ${archiveMigrationStatus.error}`)
         })
       void compactExistingTaskLogs()
-      void startSeleneInboxSync().catch((error) => console.warn(`[THEIA] SELENE inbox disabled: ${error instanceof Error ? error.message : String(error)}`))
-      void startMnemoIntegration().catch((error) => console.warn(`[THEIA] MNEMO integration disabled: ${error instanceof Error ? error.message : String(error)}`))
+      void startSeleneInboxSync().catch((error) => console.warn(`[HYPERION] SELENE inbox disabled: ${error instanceof Error ? error.message : String(error)}`))
+      void startMnemoIntegration().catch((error) => console.warn(`[HYPERION] MNEMO integration disabled: ${error instanceof Error ? error.message : String(error)}`))
       resolve(server)
     })
   })

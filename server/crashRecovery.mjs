@@ -34,7 +34,7 @@ export async function startRecoverySession(markerPath, logPath, context = {}) {
     if (error?.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error
   }
   if (previous) await appendRecoveryEvent(logPath, { event: 'unclean_shutdown_detected', previous })
-  const session = { schema: 'theia-runtime-session/v1', pid: process.pid, startedAt: new Date().toISOString(), ...context }
+  const session = { schema: 'hyperion-runtime-session/v1', pid: process.pid, startedAt: new Date().toISOString(), ...context }
   await writeFileAtomically(markerPath, JSON.stringify(session), { encoding: 'utf8', mode: 0o600 })
   return { uncleanShutdownDetected: Boolean(previous), previous, session }
 }

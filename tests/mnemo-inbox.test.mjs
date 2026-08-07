@@ -26,7 +26,7 @@ function record() {
   }
 }
 
-test('normalizes MNEMO batches to the THEIA archive record shape', () => {
+test('normalizes MNEMO batches to the HYPERION archive record shape', () => {
   const normalized = normalizeMnemoDocument(document(), { sourceFile: 'MNEMO-v1-1/records.json' })
   assert.equal(normalized?.accountId, 'wxid_owner')
   assert.equal(normalized?.records[0].source, '微信导出')
@@ -35,8 +35,15 @@ test('normalizes MNEMO batches to the THEIA archive record shape', () => {
   assert.equal(normalizeMnemoDocument(document([{ ...record(), content: '' }])), null)
 })
 
+test('accepts account-scoped MNEMO reconciliation deletions', () => {
+  const id = 'mnemo:wxid_owner:message_0:Msg_old:1'
+  const normalized = normalizeMnemoDocument({ ...document([]), deleteIds: [id, 'other:record'] })
+  assert.deepEqual(normalized?.deleteIds, [id])
+  assert.deepEqual(normalized?.records, [])
+})
+
 test('imports each immutable MNEMO batch once and retries only unfinished files', async (context) => {
-  const root = await mkdtemp(join(tmpdir(), 'theia-mnemo-inbox-'))
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-mnemo-inbox-'))
   const inbox = join(root, 'inbox')
   const statePath = join(root, 'state', 'mnemo.json')
   const batchDirectory = join(inbox, 'MNEMO-v1-20260807T010000000Z')
@@ -63,6 +70,31 @@ test('imports each immutable MNEMO batch once and retries only unfinished files'
   assert.equal(first.processedFiles, 1)
   assert.equal(imported.length, 1)
   assert.equal(imported[0].records[0].conversationId, 'mnemo:wxid_owner:friend')
+  assert.deepEqual(imported[0].metadata.deleteIds, [])
   await watcher.scan()
   assert.equal(imported.length, 1)
+})
+
+test('reports a stable malformed MNEMO batch as a data anomaly', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-mnemo-invalid-'))
+  const inbox = join(root, 'inbox')
+  const statePath = join(root, 'state', 'mnemo.json')
+  const batchDirectory = join(inbox, 'MNEMO-v1-20260807T010000000Z')
+  await mkdir(batchDirectory, { recursive: true })
+  const batchPath = join(batchDirectory, 'records.json')
+  await writeFile(batchPath, '{invalid', 'utf8')
+  const old = new Date(Date.now() - 3_000)
+  await utimes(batchPath, old, old)
+
+  const watcher = createMnemoInboxWatcher({
+    directory: inbox,
+    statePath,
+    settleMs: 1_000,
+    onImport: async () => ({ importedRecords: 0 }),
+  })
+  context.after(() => { watcher.stop(); return rm(root, { recursive: true, force: true }) })
+
+  const status = await watcher.start()
+  assert.equal(status.pendingFiles, 1)
+  assert.equal(status.lastError, 'MNEMO data batch is not valid JSON.')
 })

@@ -10,8 +10,9 @@ import { APP_STORAGE_SCHEMA, unwrapAppStorage, wrapAppStorage } from './storageS
 import { normalizeDailyCheckIns } from './selfJournal.ts'
 import { normalizeContextEvents } from './contextEvents.ts'
 
-const STORAGE_KEY = 'theia:v1'
-const STORAGE_ROLLBACK_KEY = 'theia:v1:rollback'
+const STORAGE_KEY = 'hyperion:v1'
+const STORAGE_ROLLBACK_KEY = 'hyperion:v1:rollback'
+const LEGACY_STORAGE_KEY = 'theia:v1'
 
 export const defaultPromptInstructions: AiPromptInstructions = {
   task: '优先保留仍需你处理、具体可执行的安排。约见、返校、报名、缴费、回复、预约、截止事项优先；闲聊、历史通知、已过期事项不输出。',
@@ -27,6 +28,8 @@ export const defaultAiSettings: AiSettings = {
   instructions: '只把明确可执行、对现实生活有帮助的事项整理成任务；不要臆测隐私或制造压力。',
   autoEnabled: false,
   intervalHours: 24,
+  autoTriggerMode: 'either',
+  incrementalMessageCount: 50,
   recencyPolicy: 'balanced',
   concurrency: DEFAULT_AI_CONCURRENCY,
   feedback: [],
@@ -89,8 +92,15 @@ function normalizeInterruptedRun(value: unknown): AiExtractionCheckpoint | undef
 
 export function loadData(): AppData {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY)
+    const currentSaved = localStorage.getItem(STORAGE_KEY)
+    const legacySaved = currentSaved ? null : localStorage.getItem(LEGACY_STORAGE_KEY)
+    const saved = currentSaved ?? legacySaved
     if (!saved) return createSeedData()
+    if (legacySaved) {
+      // Keep the old key untouched until a later save succeeds. This makes a
+      // brand migration recoverable even if browser storage is quota-limited.
+      try { localStorage.setItem(STORAGE_KEY, legacySaved) } catch { /* The legacy key remains available. */ }
+    }
     const decoded = JSON.parse(saved) as unknown
     const unwrapped = unwrapAppStorage<Omit<AppData, 'peopleModelVersion'> & { peopleModelVersion?: number }>(decoded)
     if (unwrapped.migratedFrom === 0 && !localStorage.getItem(STORAGE_ROLLBACK_KEY)) {
@@ -146,6 +156,11 @@ export function loadData(): AppData {
     }
     return {
       ...parsed,
+      // Historical builds kept every raw chat row in localStorage. That makes
+      // the initial React state enormous even though IndexedDB/the local
+      // archive store are now authoritative. Preserve the derived archive
+      // summary below, but never revive those message bodies into the UI.
+      intel: [],
       // Old versions derived a person card from every sender/alias while importing.
       // This can be both misleading and prohibitively expensive for large exports.
       people,
@@ -169,7 +184,11 @@ export function loadData(): AppData {
       aiSettings: {
         ...defaultAiSettings,
         ...(parsed.aiSettings ?? {}),
-        intervalHours: Math.max(24, Number(parsed.aiSettings?.intervalHours ?? defaultAiSettings.intervalHours)),
+        intervalHours: Math.min(720, Math.max(1, Number(parsed.aiSettings?.intervalHours ?? defaultAiSettings.intervalHours) || defaultAiSettings.intervalHours)),
+        autoTriggerMode: ['time', 'message-count', 'either'].includes(String(parsed.aiSettings?.autoTriggerMode))
+          ? parsed.aiSettings?.autoTriggerMode as AiSettings['autoTriggerMode']
+          : defaultAiSettings.autoTriggerMode,
+        incrementalMessageCount: Math.min(10_000, Math.max(1, Math.round(Number(parsed.aiSettings?.incrementalMessageCount ?? defaultAiSettings.incrementalMessageCount) || defaultAiSettings.incrementalMessageCount))),
         recencyPolicy: ['strict', 'balanced', 'broad'].includes(parsed.aiSettings?.recencyPolicy) ? parsed.aiSettings.recencyPolicy : 'balanced',
         concurrency: normalizeAiConcurrency(parsed.aiSettings?.concurrency),
         feedback: Array.isArray(parsed.aiSettings?.feedback) ? parsed.aiSettings.feedback.slice(-80) : [],

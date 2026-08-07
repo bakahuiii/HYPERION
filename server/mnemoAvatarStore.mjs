@@ -16,7 +16,7 @@ function imageMimeType(content) {
 
 function localPath(root, name) {
   const path = resolve(root, name)
-  if (!path.startsWith(`${root}${sep}`)) throw new Error('MNEMO avatar path is outside THEIA cache')
+  if (!path.startsWith(`${root}${sep}`)) throw new Error('MNEMO avatar path is outside HYPERION cache')
   return path
 }
 
@@ -26,7 +26,7 @@ async function regularFile(path, maximum) {
   return details
 }
 
-/** Validates and reads a locally captured MNEMO avatar from THEIA-owned storage. */
+/** Validates and reads a locally captured MNEMO avatar from HYPERION-owned storage. */
 export async function readMnemoAvatar(directory, value) {
   const id = typeof value === 'string' && avatarIdPattern.test(value) ? value.toLowerCase() : ''
   if (!id) throw new Error('MNEMO avatar id is invalid')

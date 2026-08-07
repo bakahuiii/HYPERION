@@ -18,7 +18,7 @@ Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 
-public static class TheiaResourceUpdater
+public static class HyperionResourceUpdater
 {
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern IntPtr BeginUpdateResource(string fileName, bool deleteExistingResources);
@@ -91,7 +91,7 @@ try {
   $groupStream.Dispose()
 }
 
-$updateHandle = [TheiaResourceUpdater]::BeginUpdateResource($executablePath, $false)
+$updateHandle = [HyperionResourceUpdater]::BeginUpdateResource($executablePath, $false)
 if ($updateHandle -eq [IntPtr]::Zero) {
   throw "BeginUpdateResource failed with Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
 }
@@ -105,7 +105,7 @@ try {
     }
     $imageBytes = [byte[]]::new([int]$entry.BytesInResource)
     [Array]::Copy($iconBytes, [int]$entry.ImageOffset, $imageBytes, 0, $imageBytes.Length)
-    $updated = [TheiaResourceUpdater]::UpdateResource(
+    $updated = [HyperionResourceUpdater]::UpdateResource(
       $updateHandle,
       [IntPtr]3,
       [IntPtr]$entry.ResourceId,
@@ -118,7 +118,7 @@ try {
     }
   }
 
-  $groupUpdated = [TheiaResourceUpdater]::UpdateResource(
+  $groupUpdated = [HyperionResourceUpdater]::UpdateResource(
     $updateHandle,
     [IntPtr]14,
     [IntPtr]1,
@@ -130,13 +130,13 @@ try {
     throw "Updating RT_GROUP_ICON failed with Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
   }
 
-  if (-not [TheiaResourceUpdater]::EndUpdateResource($updateHandle, $false)) {
+  if (-not [HyperionResourceUpdater]::EndUpdateResource($updateHandle, $false)) {
     throw "EndUpdateResource failed with Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
   }
   $committed = $true
 } finally {
   if (-not $committed) {
-    [void][TheiaResourceUpdater]::EndUpdateResource($updateHandle, $true)
+    [void][HyperionResourceUpdater]::EndUpdateResource($updateHandle, $true)
   }
 }
 

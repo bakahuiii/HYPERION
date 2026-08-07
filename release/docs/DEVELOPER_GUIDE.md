@@ -1,10 +1,10 @@
-# THEIA 开发者文档
+# HYPERION 开发者文档
 
-本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.3.0` 稳定源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 的逐字段定义为准。
+本文面向维护、审查、二次开发和发布 HYPERION 的工程人员。内容对应 `0.3.0` 稳定源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 的逐字段定义为准。
 
 ## 1. 项目定位与工程边界
 
-THEIA 是单用户、本地优先的个人任务图应用。它的信任边界是：用户主动提供导出文件，本地前端负责解析和选择，本地 Node.js 服务负责持久化、受控媒体代理及模型转发，外部模型只接收用户主动提交的范围。
+HYPERION 是单用户、本地优先的个人任务图应用。它的信任边界是：用户主动提供导出文件，本地前端负责解析和选择，本地 Node.js 服务负责持久化、受控媒体代理及模型转发，外部模型只接收用户主动提交的范围。
 
 项目明确不实现：
 
@@ -109,7 +109,7 @@ enable-zero-copy
 enable-features=CanvasOopRasterization
 ```
 
-设置 `THEIA_SOFTWARE_RENDERING=1` 后调用 `app.disableHardwareAcceleration()`，并追加 `disable-gpu`、`disable-gpu-compositing`、`in-process-gpu`。任务图拖拽用 `requestAnimationFrame` 合并 DOM 写入；Leaflet 使用 `preferCanvas: true`。不要为规避个别驱动错误默认关闭所有用户的 GPU。
+设置 `HYPERION_SOFTWARE_RENDERING=1` 后调用 `app.disableHardwareAcceleration()`，并追加 `disable-gpu`、`disable-gpu-compositing`、`in-process-gpu`。任务图拖拽用 `requestAnimationFrame` 合并 DOM 写入；Leaflet 使用 `preferCanvas: true`。不要为规避个别驱动错误默认关闭所有用户的 GPU。
 
 ## 5. 领域模型
 
@@ -147,7 +147,7 @@ enable-features=CanvasOopRasterization
 
 ## 6. 状态所有权与持久化
 
-THEIA 刻意把大对象和频繁编辑对象分开。
+HYPERION 刻意把大对象和频繁编辑对象分开。
 
 ```text
 AppData（React 内存）
@@ -158,9 +158,9 @@ AppData（React 内存）
 
 ### 6.1 浏览器缓存
 
-- localStorage key：`theia-atlas-data-v1`。保存 `AppData` 但强制把 `intel` 写为空数组，避免超大同步阻塞。
-- IndexedDB `theia-data/snapshots/intel`：保存原始 `IntelItem[]`。
-- IndexedDB `theia-automation/handles/export-directory`：保存 File System Access API 目录句柄。
+- localStorage key：`hyperion-atlas-data-v1`。保存 `AppData` 但强制把 `intel` 写为空数组，避免超大同步阻塞。
+- IndexedDB `hyperion-data/snapshots/intel`：保存原始 `IntelItem[]`。
+- IndexedDB `hyperion-automation/handles/export-directory`：保存 File System Access API 目录句柄。
 
 浏览器缓存是性能和恢复辅助，不是跨浏览器共享的唯一真相。
 
@@ -170,16 +170,16 @@ AppData（React 内存）
 
 | 内容 | 路径 |
 | --- | --- |
-| 轻量快照 | `.theia-shared-state.json` |
-| 原始归档 | `.theia-shared-intel.json.gz`（兼容读取旧 JSON） |
-| 通用设置 | `.theia-settings.ini` |
-| 摘要日志 | `.theia-ai-debug.log` |
-| 工作日志 | `.theia-task-logs/` |
-| 头像缓存 | `.theia-avatar-cache/` |
-| 背景 | `.theia-backgrounds/` |
-| Electron profile | `.theia-user-data/` |
+| 轻量快照 | `.hyperion-shared-state.json` |
+| 原始归档 | `.hyperion-shared-intel.json.gz`（兼容读取旧 JSON） |
+| 通用设置 | `.hyperion-settings.ini` |
+| 摘要日志 | `.hyperion-ai-debug.log` |
+| 工作日志 | `.hyperion-task-logs/` |
+| 头像缓存 | `.hyperion-avatar-cache/` |
+| 背景 | `.hyperion-backgrounds/` |
+| Electron profile | `.hyperion-user-data/` |
 
-发布布局由 `THEIA_RELEASE_LAYOUT=1` 和 `THEIA_RUNTIME_ROOT` 激活：
+发布布局由 `HYPERION_RELEASE_LAYOUT=1` 和 `HYPERION_RUNTIME_ROOT` 激活：
 
 | 内容 | 路径 |
 | --- | --- |
@@ -446,7 +446,7 @@ Leaflet 请求本地 `/api/map/tiles/{z}/{x}/{y}.png`。服务端验证 z 0-19 �
 
 `logs/tasks/YYYYMMDD-HHmmss-mmm-kind-label-digest.jsonl.gz` 记录：
 
-1. schema `theia-task-log/v1`、开始时间、kind 和完整本地请求；
+1. schema `hyperion-task-log/v1`、开始时间、kind 和完整本地请求；
 2. 完成、失败或回退事件；
 3. 模型解析结果及错误细节。
 
@@ -472,9 +472,9 @@ OPENAI_BASE_URL
 OPENAI_MODEL
 OPENAI_API_MODE=auto|responses|chat-completions
 AI_PORT=8787
-THEIA_RELEASE_LAYOUT=1
-THEIA_RUNTIME_ROOT=<release-root>
-THEIA_SOFTWARE_RENDERING=1
+HYPERION_RELEASE_LAYOUT=1
+HYPERION_RUNTIME_ROOT=<release-root>
+HYPERION_SOFTWARE_RENDERING=1
 ```
 
 环境配置首次保存后进入 INI。Key 按产品需求以明文保留；文档和发布器必须明确此风险。
@@ -545,7 +545,7 @@ node --check electron/main.mjs
 ### 18.2 打包器
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.3.0\THEIA-release-0.3.0
+node release-tools/package-release.mjs ..\staging\v0.3.0\HYPERION-release-0.3.0
 ```
 
 打包器要求目标在源码目录之外且不存在，避免误覆盖。它复制必要源码、锁文件、发布文档、默认资源和虚构示例，并生成 `RELEASE_MANIFEST.json`。明确排除：

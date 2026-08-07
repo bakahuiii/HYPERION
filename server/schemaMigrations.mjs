@@ -3,7 +3,8 @@ import { basename, resolve, sep } from 'node:path'
 
 import { writeFileAtomically } from './atomicFile.mjs'
 
-export const SHARED_STATE_SCHEMA = 'theia-shared-state/v1'
+export const SHARED_STATE_SCHEMA = 'hyperion-shared-state/v1'
+const LEGACY_SHARED_STATE_SCHEMA = 'theia-shared-state/v1'
 export const SHARED_STATE_SCHEMA_VERSION = 1
 
 function timestamp() {
@@ -11,10 +12,10 @@ function timestamp() {
 }
 function validateSharedState(payload) {
   if (!payload || typeof payload !== 'object' || !payload.data || typeof payload.data !== 'object') throw new Error('共享状态格式无效')
-  const version = payload.schema === SHARED_STATE_SCHEMA ? Number(payload.schemaVersion) : 0
+  const version = payload.schema === SHARED_STATE_SCHEMA || payload.schema === LEGACY_SHARED_STATE_SCHEMA ? Number(payload.schemaVersion) : 0
   if (!Number.isInteger(version) || version < 0) throw new Error('共享状态 schema 版本无效')
   if (version > SHARED_STATE_SCHEMA_VERSION) {
-    throw new Error(`共享状态由更高版本的 THEIA 创建（schema ${version}），当前版本最高支持 ${SHARED_STATE_SCHEMA_VERSION}`)
+    throw new Error(`共享状态由更高版本的 HYPERION 创建（schema ${version}），当前版本最高支持 ${SHARED_STATE_SCHEMA_VERSION}`)
   }
   return version
 }

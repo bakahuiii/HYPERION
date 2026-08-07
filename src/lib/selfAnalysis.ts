@@ -1,4 +1,4 @@
-import type { DailyCheckIn, SelfObservation, SelfObservationKind } from '../types'
+import type { ContextEvent, SelfObservation, SelfObservationKind } from '../types'
 import type { SelfAnalysisInput } from './selfJournal'
 
 // This is intentionally independent from task and people segmentation. Self
@@ -34,7 +34,7 @@ export interface SelfAnalysisSegment {
   coreRecordCount: number
   overlapRecordCount: number
   totalRecords: number
-  checkIns: DailyCheckIn[]
+  contextEvents: ContextEvent[]
 }
 
 export interface SelfAnalysisPlan {
@@ -65,21 +65,18 @@ function time(record: Pick<SelfAnalysisRecord, 'capturedAt'>) {
   return Number.isFinite(value) ? value : Number.NaN
 }
 
-function day(value: string) {
-  return value.slice(0, 10)
-}
-
-function comparableCheckInDate(checkIn: DailyCheckIn) {
-  return `${checkIn.date}T12:00:00.000Z`
-}
-
-function checkInsForRange(checkIns: DailyCheckIn[], records: SelfAnalysisRecord[]) {
+function contextEventsForRange(events: ContextEvent[], records: SelfAnalysisRecord[]) {
   const start = records[0]?.capturedAt
   const end = records.at(-1)?.capturedAt
   if (!start || !end) return []
-  const startDay = day(start)
-  const endDay = day(end)
-  return checkIns.filter((checkIn) => checkIn.date >= startDay && checkIn.date <= endDay)
+  const startAt = Date.parse(start)
+  const endAt = Date.parse(end)
+  if (!Number.isFinite(startAt) || !Number.isFinite(endAt)) return []
+  return events.filter((event) => {
+    const eventStart = Date.parse(event.startAt)
+    const eventEnd = Date.parse(event.endAt ?? event.startAt)
+    return Number.isFinite(eventStart) && Number.isFinite(eventEnd) && eventStart <= endAt && eventEnd >= startAt
+  })
 }
 
 export function buildSelfAnalysisPlan(input: SelfAnalysisInput): SelfAnalysisPlan {
@@ -124,7 +121,7 @@ export function buildSelfAnalysisPlan(input: SelfAnalysisInput): SelfAnalysisPla
       segmentCount: drafts.length,
       ...draft,
       totalRecords: records.length,
-      checkIns: checkInsForRange(input.dailyCheckins, draft.records),
+      contextEvents: contextEventsForRange(input.contextEvents, draft.records),
     })),
     recordCount: records.length,
     totalSegments: drafts.length,
@@ -196,8 +193,4 @@ export function groupSelfObservationsForMerge(observations: SelfObservation[], m
 export function analysisRange(observations: SelfObservation[]) {
   const values = observations.flatMap((observation) => [observation.observedFrom, observation.observedTo]).filter(Boolean).sort()
   return { startAt: values[0] ?? '', endAt: values.at(-1) ?? '' }
-}
-
-export function checkInTimestamp(checkIn: DailyCheckIn) {
-  return comparableCheckInDate(checkIn)
 }

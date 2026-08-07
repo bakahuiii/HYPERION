@@ -10,10 +10,10 @@ import { IntelView } from './views/IntelView'
 import type { AnalysisWorkState } from './hooks/useAiWorkflow'
 import { loadData, resetData, saveData } from './lib/storage'
 import { normalizeAppearance } from './lib/appearance'
-import { loadIntelSnapshot, loadSharedIntelMeta, loadSharedIntelSnapshot, primeSharedIntelSnapshot, saveIntelSnapshot, saveSharedIntelSnapshot } from './lib/intelStore'
+import { loadIntelSnapshot, loadSharedIntelChanges, loadSharedIntelMeta, loadSharedIntelSnapshot, primeSharedIntelSnapshot, saveIntelSnapshot, saveSharedIntelDelta, saveSharedIntelSnapshot } from './lib/intelStore'
 import { shouldLoadSharedIntelSnapshot } from './lib/intelSnapshotSelection'
 import { createSeedData } from './seed'
-import type { AiExtractionCheckpoint, AiFeedbackReason, AiSettings, AiTaskCandidate, AiTaskFeedback, AppData, ArchiveAnalysisSummary, AppearanceSettings, DailyCheckIn, IntelItem, Person, PersonEvidence, Place, Profile, Quest, SelfAnalysis, TaskAtlasCategory, TaskAtlasPosition, ViewId } from './types'
+import type { AiExtractionCheckpoint, AiFeedbackReason, AiSettings, AiTaskCandidate, AiTaskFeedback, AppData, ArchiveAnalysisSummary, AppearanceSettings, IntelItem, Person, PersonEvidence, Place, Profile, Quest, SelfAnalysis, TaskAtlasCategory, TaskAtlasPosition, ViewId } from './types'
 import { loadBackgroundAsset } from './lib/appearanceAssets'
 import { sourceProvider } from './lib/people'
 import { analyzePeople, buildDirectConversationFallbackPeople, candidateRejectionReason, consolidatePerson, generateTaskGuidance, getAiStatus, type AiDebugEntry, type AiProgress } from './lib/aiClient'
@@ -22,7 +22,7 @@ import { useSharedSync } from './hooks/useSharedSync'
 import { hydrateSharedSnapshot } from './lib/sharedStateHydration'
 import type { SharedData } from './lib/sharedStateMerge'
 import { mapSearchPrecision, mapSearchRadius, searchMapPlaces } from './lib/mapSearch'
-import { archiveSummaryWithAnalysis, archiveSummaryWithImport, summarizeArchive } from './lib/archiveSummary'
+import { archiveSummaryWithAnalysis, summarizeArchive } from './lib/archiveSummary'
 import { fetchTaskWeather } from './lib/weather'
 import { avatarImageUrl } from './lib/mediaProxy'
 import { normalizeAiConcurrency } from './lib/aiConcurrency'
@@ -35,7 +35,7 @@ import { aiTaskCandidatesDuplicate, mergeAiTaskCandidates } from './lib/aiCandid
 import { personEvidenceIdentityKey } from './lib/personEvidenceIdentity'
 import { canStartPersonConsolidation } from './lib/peopleConsolidation'
 import { PERSON_PORTRAIT_PIPELINE_VERSION } from './lib/personTemporal'
-import { checkInJournalEntry, isSelfJournalRecord, journalEntry, normalizeDailyCheckIn, normalizeDailyCheckIns, retainManualIntelRecords } from './lib/selfJournal'
+import { isSelfJournalRecord, journalEntry } from './lib/selfJournal'
 
 const TimelineView = lazy(() => import('./views/TimelineView').then((module) => ({ default: module.TimelineView })))
 const MapView = lazy(() => import('./views/MapView').then((module) => ({ default: module.MapView })))
@@ -98,14 +98,6 @@ function cleanDanglingPersonReferences(current: AppData): AppData {
     return { ...quest, characterIds }
   })
   return changed || aiCandidates !== current.aiCandidates ? { ...current, quests, aiCandidates } : current
-}
-
-interface IntelImportResult {
-  added: number
-  updated: number
-  duplicates: number
-  archiveMessageCount: number
-  conversationCount: number
 }
 
 function dismissInvalidAiCandidates(current: AppData, indexedIntel?: ReadonlyMap<string, IntelItem>) {
@@ -484,17 +476,15 @@ function App() {
     prepareIncoming: prepareIncomingShared,
     reconcileConflict: reconcileSharedConflict,
   })
-  const dailyCheckInWriteKey = useMemo(() => data.dailyCheckins
-    .map((item) => `${item.id}:${item.updatedAt}`)
-    .sort()
-    .join('|'), [data.dailyCheckins])
-  const sharedIntelWriteKey = `${data.archive.sourceFingerprint ?? 'adhoc'}\u0000${data.archive.lastImport?.importedAt ?? 'initial'}\u0000${data.intel.length}\u0000${data.intel[0]?.id ?? ''}\u0000${data.intel.at(-1)?.id ?? ''}\u0000${dailyCheckInWriteKey}`
+  // Device context belongs to the lightweight shared state, not the raw chat
+  // archive. Importing it must never rewrite a large archive snapshot.
+  const sharedIntelWriteKey = `${data.archive.sourceFingerprint ?? 'adhoc'}\u0000${data.archive.lastImport?.importedAt ?? 'initial'}\u0000${data.intel.length}\u0000${data.intel[0]?.id ?? ''}\u0000${data.intel.at(-1)?.id ?? ''}`
   const effectiveSelectedPlaceId = data.places.some((place) => place.id === selectedPlaceId)
     ? selectedPlaceId
     : data.places[0]?.id ?? ''
 
   const appendPeopleDebug = (entry: AiDebugEntry) => {
-    window.dispatchEvent(new CustomEvent<AiDebugEntry>('theia:ai-debug', { detail: entry }))
+    window.dispatchEvent(new CustomEvent<AiDebugEntry>('hyperion:ai-debug', { detail: entry }))
   }
 
   const visualMotion = effectiveAppearance.performanceVersion === 1 && effectiveAppearance.motionEnabled
@@ -516,8 +506,8 @@ function App() {
   const selfAnalysisSourceCounts = useMemo(() => ({
     selfMessageCount: data.intel.reduce((count, item) => count + (item.speakerRole === 'self' ? 1 : 0), 0),
     journalEntryCount: data.intel.reduce((count, item) => count + (isSelfJournalRecord(item) && item.messageType !== 'daily-checkin' ? 1 : 0), 0),
-    checkInCount: data.dailyCheckins.length,
-  }), [data.dailyCheckins.length, data.intel])
+    contextEventCount: data.contextEvents.length,
+  }), [data.contextEvents.length, data.intel])
 
   useEffect(() => {
     dataRef.current = data
@@ -666,6 +656,11 @@ function App() {
 
   useEffect(() => {
     if (!intelHydrated) return
+    // On large archives only a small producer delta (for example an Iris
+    // journal entry) may be in React state. Treating it as a full snapshot
+    // would overwrite both IndexedDB and the append-only archive.
+    const hasDeferredArchiveBody = data.archive.messageCount > data.intel.length
+    if (hasDeferredArchiveBody) return
     // An empty array is authoritative only after it came from an existing
     // local/shared snapshot or an explicit directory import. When startup
     // could not reach either store, keep polling instead of overwriting a
@@ -766,7 +761,7 @@ function App() {
         })
     }, 900)
     return () => { if (sharedIntelWriteTimerRef.current) window.clearTimeout(sharedIntelWriteTimerRef.current) }
-  }, [data.archive.lastImport?.importedAt, data.archive.sourceFingerprint, data.intel, intelHydrated, sharedIntelWriteKey])
+  }, [data.archive.lastImport?.importedAt, data.archive.messageCount, data.archive.sourceFingerprint, data.intel, intelHydrated, sharedIntelWriteKey])
 
   useEffect(() => {
     if (!intelHydrated || data.intel.length || hasAuthoritativeIntelSnapshotRef.current) return
@@ -796,6 +791,60 @@ function App() {
     const timer = window.setInterval(restoreSharedArchive, 15_000)
     return () => { active = false; window.clearInterval(timer) }
   }, [data.intel.length, intelHydrated])
+
+  // Iris, SELENE adapters, and other local producers append to the shared
+  // archive without touching the renderer's React state. Poll the archive
+  // watermark and apply only the new delta segments so a journal entry becomes
+  // visible immediately without reloading a large chat export.
+  useEffect(() => {
+    if (!intelHydrated) return
+    let active = true
+    const refreshArchiveDelta = async () => {
+      try {
+        const meta = await loadSharedIntelMeta()
+        const previous = sharedIntelUpdatedAtRef.current
+        if (!meta.updatedAt || !previous) {
+          if (meta.updatedAt) sharedIntelUpdatedAtRef.current = meta.updatedAt
+          return
+        }
+        if (meta.updatedAt <= previous) return
+        const changes = await loadSharedIntelChanges(previous)
+        if (!active) return
+        if (changes.requiresReload) {
+          // A compaction/snapshot boundary is rare. Avoid replacing a large
+          // in-memory archive during normal polling; the next explicit import
+          // or restart will hydrate that authoritative snapshot safely.
+          if (dataRef.current.intel.length === 0) return
+          const snapshot = await loadSharedIntelSnapshot()
+          if (!active) return
+          sharedIntelUpdatedAtRef.current = snapshot.updatedAt ?? changes.updatedAt ?? meta.updatedAt
+          const items = snapshot.items
+          primeSharedIntelSnapshot(items, snapshot.sourceFingerprint)
+          setData((current) => ({
+            ...current,
+            intel: items,
+            archive: { ...summarizeArchive(items, current.archive.fileCount), ...(snapshot.sourceFingerprint ? { sourceFingerprint: snapshot.sourceFingerprint } : {}), lastImport: current.archive.lastImport, lastAnalysis: current.archive.lastAnalysis },
+          }))
+          return
+        }
+        sharedIntelUpdatedAtRef.current = changes.updatedAt ?? meta.updatedAt
+        if (!changes.upserts.length && !changes.deleteIds.length) return
+        setData((current) => {
+          const byId = new Map(current.intel.map((item) => [item.id, item]))
+          for (const id of changes.deleteIds) byId.delete(id)
+          for (const item of changes.upserts) byId.set(item.id, item)
+          const intel = [...byId.values()]
+          primeSharedIntelSnapshot(intel, changes.sourceFingerprint)
+          return { ...current, intel, archive: { ...summarizeArchive(intel, current.archive.fileCount), messageCount: changes.recordCount, ...(changes.sourceFingerprint ? { sourceFingerprint: changes.sourceFingerprint } : {}), lastImport: current.archive.lastImport, lastAnalysis: current.archive.lastAnalysis } }
+        })
+      } catch (error) {
+        if (active) setArchiveLoadError(`鏈満鍘熷褰掓。增量同步失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    void refreshArchiveDelta()
+    const timer = window.setInterval(refreshArchiveDelta, 5_000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [intelHydrated])
 
   useEffect(() => {
     let active = true
@@ -1081,250 +1130,69 @@ function App() {
     }))
   }
 
-  const importIntel = (items: IntelItem[], options: { replace?: boolean; replaceFiles?: string[]; fileCount?: number; sourceFingerprint?: string } = {}): IntelImportResult => {
-    hasAuthoritativeIntelSnapshotRef.current = true
-    let result: IntelImportResult = { added: 0, updated: 0, duplicates: items.length, archiveMessageCount: dataRef.current.intel.length, conversationCount: dataRef.current.archive.conversationCount }
-    setData((current) => {
-      const messageBody = (item: IntelItem) => (item.content || item.summary).replace(/^[^:]{1,64}:\s+/, '').trim()
-      const exactKey = (item: IntelItem) => `${item.source}|${item.conversationId ?? ''}|${item.capturedAt}|${item.speaker ?? ''}|${messageBody(item)}`
-      if (options.replaceFiles) {
-        const replacedFiles = new Set(options.replaceFiles)
-        const previousById = new Map(current.intel.map((item) => [item.id, item]))
-        const seenIds = new Set<string>()
-        const replacements: IntelItem[] = []
-        let added = 0
-        let updated = 0
-        let duplicates = 0
-        for (const item of items) {
-          if (seenIds.has(item.id)) {
-            duplicates += 1
-            continue
-          }
-          seenIds.add(item.id)
-          const previous = previousById.get(item.id)
-          if (!previous) {
-            added += 1
-            replacements.push(item)
-            continue
-          }
-          const changed = previous.content !== item.content
-            || previous.summary !== item.summary
-            || previous.capturedAt !== item.capturedAt
-            || previous.speaker !== item.speaker
-            || previous.messageType !== item.messageType
-            || previous.speakerRole !== item.speakerRole
-          if (changed) updated += 1
-          replacements.push(changed ? item : { ...item, status: previous.status, aiAnalyzedAt: previous.aiAnalyzedAt })
-        }
-        const retained = current.intel.filter((item) => !item.sourceFile || !replacedFiles.has(item.sourceFile))
-        const snapshotItems = [...replacements, ...retained]
-        const baseArchive = summarizeArchive(snapshotItems, options.fileCount)
-        const archive = archiveSummaryWithImport({ ...baseArchive, ...(options.sourceFingerprint ? { sourceFingerprint: options.sourceFingerprint } : {}), lastAnalysis: current.archive.lastAnalysis }, {
-          importedAt: new Date().toISOString(),
-          parsedMessageCount: items.length,
-          addedMessageCount: added,
-          updatedMessageCount: updated,
-          duplicateMessageCount: duplicates,
-          archiveMessageCount: snapshotItems.length,
-          conversationCount: baseArchive.conversationCount,
-        })
-        result = { added, updated, duplicates, archiveMessageCount: snapshotItems.length, conversationCount: baseArchive.conversationCount }
-        const base = {
-          ...current,
-          intel: snapshotItems,
-          archive,
-          people: enrichPeopleEvidence(current.people, snapshotItems),
-        }
-        return dismissInvalidAiCandidates(mergePeople(base, buildDirectConversationFallbackPeople(snapshotItems)))
+
+  const archiveAfterManualIntelChange = (current: AppData, intel: IntelItem[], delta: number) => {
+    if (current.archive.messageCount > current.intel.length) {
+      return {
+        ...current.archive,
+        messageCount: Math.max(0, current.archive.messageCount + delta),
       }
-      if (options.replace) {
-        // A connected directory is authoritative. Keep every parsed row from
-        // the current files, including repeated messages with identical text;
-        // only the same stable file/index ID is considered a duplicate.
-        const previousById = new Map(current.intel.map((item) => [item.id, item]))
-        const seenIds = new Set<string>()
-        const snapshotItems: IntelItem[] = []
-        let added = 0
-        let updated = 0
-        let duplicates = 0
-        for (const item of items) {
-          if (seenIds.has(item.id)) {
-            duplicates += 1
-            continue
-          }
-          seenIds.add(item.id)
-          const previous = previousById.get(item.id)
-          if (!previous) {
-            added += 1
-            snapshotItems.push(item)
-            continue
-          }
-          const changed = previous.content !== item.content
-            || previous.summary !== item.summary
-            || previous.capturedAt !== item.capturedAt
-            || previous.speaker !== item.speaker
-            || previous.messageType !== item.messageType
-            || previous.speakerRole !== item.speakerRole
-          if (changed) updated += 1
-          snapshotItems.push(changed ? item : { ...item, status: previous.status, aiAnalyzedAt: previous.aiAnalyzedAt })
-        }
-        const finalSnapshotItems = retainManualIntelRecords(snapshotItems, current.intel)
-        const baseArchive = summarizeArchive(finalSnapshotItems, options.fileCount)
-        const archive = archiveSummaryWithImport({ ...baseArchive, ...(options.sourceFingerprint ? { sourceFingerprint: options.sourceFingerprint } : {}), lastAnalysis: current.archive.lastAnalysis }, {
-          importedAt: new Date().toISOString(),
-          parsedMessageCount: items.length,
-          addedMessageCount: added,
-          updatedMessageCount: updated,
-          duplicateMessageCount: duplicates,
-          archiveMessageCount: finalSnapshotItems.length,
-          conversationCount: baseArchive.conversationCount,
-        })
-        result = { added, updated, duplicates, archiveMessageCount: finalSnapshotItems.length, conversationCount: baseArchive.conversationCount }
-        const base = {
-          ...current,
-          intel: finalSnapshotItems,
-          archive,
-          people: enrichPeopleEvidence(current.people, finalSnapshotItems),
-        }
-        return dismissInvalidAiCandidates(mergePeople(base, buildDirectConversationFallbackPeople(finalSnapshotItems)))
-      }
-      const legacyKey = (item: IntelItem) => item.capturedAt ? `${item.source}|${item.capturedAt}|${item.speaker ?? ''}|${messageBody(item)}` : ''
-      const existingById = new Map(current.intel.map((item) => [item.id, item]))
-      const existing = new Map(current.intel.map((item) => [exactKey(item), item]))
-      const legacy = new Map<string, IntelItem[]>()
-      current.intel.forEach((item) => {
-        const key = legacyKey(item)
-        if (!key) return
-        const matches = legacy.get(key)
-        if (matches) matches.push(item)
-        else legacy.set(key, [item])
-      })
-      const upgrades = new Map<string, IntelItem>()
-      const consumedLegacyIds = new Set<string>()
-      const additions: IntelItem[] = []
-      let updated = 0
-      let duplicates = 0
-      for (const item of items) {
-        const matched = existingById.get(item.id)
-          ?? existing.get(exactKey(item))
-          // This only upgrades an old record which lacked the folder-derived
-          // conversation ID. Never de-duplicate repeated untimed messages by text.
-          ?? (item.capturedAt ? legacy.get(legacyKey(item))?.find((candidate) => !candidate.conversationId && !consumedLegacyIds.has(candidate.id)) : undefined)
-        if (matched) {
-          const conversationChanged = Boolean(item.conversationId && (matched.conversationId !== item.conversationId || matched.conversationName !== item.conversationName || matched.conversationKind !== item.conversationKind))
-          const speakerChanged = Boolean(item.speaker && item.speaker !== matched.speaker)
-          const avatarChanged = Boolean(item.avatarUrl && item.avatarUrl !== matched.avatarUrl)
-          const contentChanged = Boolean(item.content && item.content !== matched.content)
-          const messageTypeChanged = Boolean(item.messageType && item.messageType !== matched.messageType)
-          const capturedAtChanged = Boolean(item.capturedAt && item.capturedAt !== matched.capturedAt)
-          const directionChanged = Boolean(item.speakerRole && item.speakerRole !== 'unknown' && item.speakerRole !== matched.speakerRole)
-          // Avatar metadata enriches person cards only. It must not reopen
-          // already-reviewed messages or cause task extraction to run again.
-          const analysisInputChanged = speakerChanged || contentChanged || messageTypeChanged || capturedAtChanged || directionChanged
-          const recordMetadataChanged = conversationChanged || avatarChanged
-          if (recordMetadataChanged || analysisInputChanged) {
-            consumedLegacyIds.add(matched.id)
-            updated += 1
-            upgrades.set(matched.id, {
-              ...matched,
-              ...(conversationChanged ? { conversationId: item.conversationId, conversationName: item.conversationName, conversationKind: item.conversationKind } : {}),
-              ...(speakerChanged ? { speaker: item.speaker } : {}),
-              ...(avatarChanged ? { avatarUrl: item.avatarUrl } : {}),
-              ...(contentChanged ? { content: item.content } : {}),
-              ...(messageTypeChanged ? { messageType: item.messageType } : {}),
-              ...(capturedAtChanged ? { capturedAt: item.capturedAt } : {}),
-              ...(directionChanged ? { speakerRole: item.speakerRole } : {}),
-              ...(analysisInputChanged ? { aiAnalyzedAt: undefined, status: 'new' as const } : {}),
-            })
-          } else duplicates += 1
-          continue
-        }
-        existing.set(exactKey(item), item)
-        existingById.set(item.id, item)
-        additions.push(item)
-      }
-      const intel = [...additions, ...current.intel.map((item) => upgrades.get(item.id) ?? item)]
-      const baseArchive = summarizeArchive(intel, current.archive.fileCount)
-      const archive = archiveSummaryWithImport({ ...baseArchive, ...(current.archive.sourceFingerprint ? { sourceFingerprint: current.archive.sourceFingerprint } : {}), lastAnalysis: current.archive.lastAnalysis }, {
-        importedAt: new Date().toISOString(),
-        parsedMessageCount: items.length,
-        addedMessageCount: additions.length,
-        updatedMessageCount: updated,
-        duplicateMessageCount: duplicates,
-        archiveMessageCount: intel.length,
-        conversationCount: baseArchive.conversationCount,
-      })
-      result = { added: additions.length, updated, duplicates, archiveMessageCount: intel.length, conversationCount: baseArchive.conversationCount }
-      const base = {
-        ...current,
-        intel,
-        archive,
-        people: enrichPeopleEvidence(current.people, intel),
-      }
-      // Private-conversation directories create cards locally on import; task
-      // extraction and model availability are not prerequisites for this.
-      return dismissInvalidAiCandidates(mergePeople(base, buildDirectConversationFallbackPeople(intel)))
-    })
-    return result
+    }
+    return {
+      ...summarizeArchive(intel, current.archive.fileCount),
+      ...(current.archive.sourceFingerprint ? { sourceFingerprint: current.archive.sourceFingerprint } : {}),
+      ...(current.archive.lastImport ? { lastImport: current.archive.lastImport } : {}),
+      ...(current.archive.lastAnalysis ? { lastAnalysis: current.archive.lastAnalysis } : {}),
+    }
   }
 
-  const archiveAfterManualIntelChange = (current: AppData, intel: IntelItem[]) => ({
-    ...summarizeArchive(intel, current.archive.fileCount),
-    ...(current.archive.sourceFingerprint ? { sourceFingerprint: current.archive.sourceFingerprint } : {}),
-    ...(current.archive.lastImport ? { lastImport: current.archive.lastImport } : {}),
-    ...(current.archive.lastAnalysis ? { lastAnalysis: current.archive.lastAnalysis } : {}),
-  })
+  const persistManualIntelDelta = (upserts: IntelItem[], deleteIds: string[]) => {
+    const persist = async () => {
+      try {
+        return await saveSharedIntelDelta(upserts, deleteIds, () => sharedIntelUpdatedAtRef.current)
+      } catch (error) {
+        if (Number((error as { status?: number })?.status) !== 409) throw error
+        const meta = await loadSharedIntelMeta()
+        sharedIntelUpdatedAtRef.current = meta.updatedAt
+        return saveSharedIntelDelta(upserts, deleteIds, () => sharedIntelUpdatedAtRef.current)
+      }
+    }
+    void persist().then((saved) => {
+      sharedIntelUpdatedAtRef.current = saved.updatedAt
+      setData((current) => ({
+        ...current,
+        archive: {
+          ...current.archive,
+          messageCount: saved.recordCount,
+          ...(saved.sourceFingerprint ? { sourceFingerprint: saved.sourceFingerprint } : {}),
+        },
+      }))
+      setArchiveLoadError('')
+    }).catch((error) => {
+      setArchiveLoadError(`日记写入本机归档失败：${error instanceof Error ? error.message : String(error)}`)
+    })
+  }
 
   const addJournalEntry = (content: string) => {
+    const item = journalEntry(dataRef.current.profile, content)
+    if (!item) return
     setData((current) => {
-      const item = journalEntry(current.profile, content)
-      if (!item) return current
       const intel = [item, ...current.intel]
-      return { ...current, intel, archive: archiveAfterManualIntelChange(current, intel) }
+      return { ...current, intel, archive: archiveAfterManualIntelChange(current, intel, 1) }
     })
+    persistManualIntelDelta([item], [])
   }
 
   const deleteJournalEntry = (id: string) => {
+    const existing = dataRef.current.intel.find((candidate) => candidate.id === id)
+    if (!existing || !isSelfJournalRecord(existing) || existing.messageType === 'daily-checkin') return
     setData((current) => {
       const item = current.intel.find((candidate) => candidate.id === id)
       if (!item || !isSelfJournalRecord(item) || item.messageType === 'daily-checkin') return current
       const intel = current.intel.filter((candidate) => candidate.id !== id)
-      return { ...current, intel, archive: archiveAfterManualIntelChange(current, intel) }
+      return { ...current, intel, archive: archiveAfterManualIntelChange(current, intel, -1) }
     })
-  }
-
-  const saveDailyCheckIn = (draft: Partial<DailyCheckIn>) => {
-    const now = new Date()
-    setData((current) => {
-      const existing = current.dailyCheckins.find((item) => item.date === draft.date)
-      const checkIn = normalizeDailyCheckIn({
-        ...draft,
-        createdAt: existing?.createdAt ?? now.toISOString(),
-        updatedAt: now.toISOString(),
-      }, now)
-      if (!checkIn) return current
-      const row = checkInJournalEntry(current.profile, checkIn)
-      const intel = [row, ...current.intel.filter((item) => item.id !== checkIn.id)]
-      const dailyCheckins = normalizeDailyCheckIns([
-        ...current.dailyCheckins.filter((item) => item.date !== checkIn.date),
-        checkIn,
-      ])
-      return { ...current, dailyCheckins, intel, archive: archiveAfterManualIntelChange(current, intel) }
-    })
-  }
-
-  const deleteDailyCheckIn = (date: string) => {
-    setData((current) => {
-      const checkIn = current.dailyCheckins.find((item) => item.date === date)
-      if (!checkIn) return current
-      const intel = current.intel.filter((item) => item.id !== checkIn.id)
-      return {
-        ...current,
-        dailyCheckins: current.dailyCheckins.filter((item) => item.id !== checkIn.id),
-        intel,
-        archive: archiveAfterManualIntelChange(current, intel),
-      }
-    })
+    persistManualIntelDelta([], [id])
   }
 
   const updatePlace = (place: Place) => {
@@ -1711,7 +1579,11 @@ function App() {
         aiSettings: {
           ...current.aiSettings,
           ...(completedSuccessfully ? { lastRunAt: analyzedAt } : {}),
-          intervalHours: Math.max(24, current.aiSettings.intervalHours, settings.intervalHours),
+          intervalHours: Math.min(720, Math.max(
+            1,
+            Number(current.aiSettings.intervalHours) || 24,
+            Number(settings.intervalHours) || 24,
+          )),
           ...(Object.keys(taskWatermarks).length ? {
             analysisWatermarks: {
               ...current.aiSettings.analysisWatermarks,
@@ -2033,7 +1905,7 @@ function App() {
             {view === 'timeline' && <TimelineView quests={questsWithEvidence} places={data.places} intel={data.intel} onToggle={toggleQuest} onEdit={(quest) => { setEditingQuest(quest); setQuestModalOpen(true) }} onViewSource={setSourceQuest} onDelete={deleteQuest} />}
             {view === 'map' && <MapView places={data.places} quests={questsWithEvidence} selectedPlaceId={effectiveSelectedPlaceId} onSelect={setSelectedPlaceId} onUpdatePlace={updatePlace} onCreatePlace={createPlace} onDeletePlace={deletePlace} />}
             {view === 'people' && <PeopleView people={data.people} quests={questsWithEvidence} selectedId={selectedPersonId} onSelect={setSelectedPersonId} onGoIntel={() => setView('intel')} onDismiss={dismissPeople} onUpdateProfileNotes={updatePersonProfileNotes} onRetryPortrait={retryPersonPortrait} intelCount={data.intel.length} intel={data.intel} />}
-            {view === 'journal' && <JournalView items={data.intel} checkIns={data.dailyCheckins} selfAnalysis={data.selfAnalysis} sourceCounts={selfAnalysisSourceCounts} onAddEntry={addJournalEntry} onDeleteEntry={deleteJournalEntry} onSaveCheckIn={saveDailyCheckIn} onDeleteCheckIn={deleteDailyCheckIn} />}
+            {view === 'journal' && <JournalView items={data.intel} selfAnalysis={data.selfAnalysis} sourceCounts={selfAnalysisSourceCounts} onAddEntry={addJournalEntry} onDeleteEntry={deleteJournalEntry} />}
             {view === 'settings' && <OptionsView settings={data.aiSettings} onSettingsChange={(aiSettings) => setData((current) => {
               if (current.intel === data.intel && current.aiCandidates === data.aiCandidates) {
                 return dismissInvalidAiCandidates({ ...current, aiSettings }, intelById)
@@ -2047,13 +1919,13 @@ function App() {
             })} onAppearance={() => setAppearanceModalOpen(true)} personCount={data.people.length} questCount={data.quests.length} onClearPeople={clearAllPeople} onClearQuests={clearAllQuests} />}
           </Suspense>
           <div className={`persistent-intel-view ${view === 'intel' ? 'is-active' : ''}`} aria-hidden={view !== 'intel'}>
-            <IntelView active={view === 'intel'} items={data.intel} intelHydrated={intelHydrated} archiveLoadError={archiveLoadError} archive={data.archive} candidates={data.aiCandidates} dailyCheckins={data.dailyCheckins} aiSettings={data.aiSettings} onImport={importIntel} onAiAnalysis={saveAiAnalysis} onDirectPeopleDetected={mergeIncomingPeople} onPeopleAnalysis={runPeopleAnalysis} onSelfAnalysis={saveSelfAnalysis} onAnalysisWatermark={savePeopleAnalysisWatermark} onStopPeopleAnalysis={stopPeopleAnalysis} onAnalysisCheckpoint={saveAnalysisCheckpoint} onCreateAiQuests={createQuestsFromAi} onDismissAiCandidates={dismissAiCandidates} onAnalysisWorkChange={(next) => setAnalysisWork((current) => next === null && current?.stage === 'people' ? current : next)} onArchiveLoaded={(items) => setData((current) => current.intel.length ? current : { ...current, intel: items, archive: { ...summarizeArchive(items, current.archive.fileCount), sourceFingerprint: current.archive.sourceFingerprint, lastImport: current.archive.lastImport, lastAnalysis: current.archive.lastAnalysis } })} />
+            <IntelView active={view === 'intel'} items={data.intel} archiveLoadError={archiveLoadError} archive={data.archive} candidates={data.aiCandidates} contextEvents={data.contextEvents} aiSettings={data.aiSettings} onAiAnalysis={saveAiAnalysis} onDirectPeopleDetected={mergeIncomingPeople} onPeopleAnalysis={runPeopleAnalysis} onSelfAnalysis={saveSelfAnalysis} onAnalysisWatermark={savePeopleAnalysisWatermark} onStopPeopleAnalysis={stopPeopleAnalysis} onAnalysisCheckpoint={saveAnalysisCheckpoint} onCreateAiQuests={createQuestsFromAi} onDismissAiCandidates={dismissAiCandidates} onAnalysisWorkChange={(next) => setAnalysisWork((current) => next === null && current?.stage === 'people' ? current : next)} onArchiveLoaded={(items) => setData((current) => current.intel.length >= current.archive.messageCount ? current : { ...current, intel: items, archive: { ...summarizeArchive(items, current.archive.fileCount), sourceFingerprint: current.archive.sourceFingerprint, lastImport: current.archive.lastImport, lastAnalysis: current.archive.lastAnalysis } })} />
           </div>
         </div>
       </main>
       {(syncErrors.shared || syncErrors.settings) && <div className={`shared-sync-alert ${analysisWork ? 'has-analysis' : ''}`} role="alert">
         <AlertTriangle size={17} />
-        <span>{[syncErrors.shared, syncErrors.settings].filter(Boolean).join(' ')} 本地浏览器缓存仍会保留当前会话内容；请确认 THEIA 本机代理正在运行。</span>
+        <span>{[syncErrors.shared, syncErrors.settings].filter(Boolean).join(' ')} 本地浏览器缓存仍会保留当前会话内容；请确认 HYPERION 本机代理正在运行。</span>
         <button type="button" className="icon-button" title="关闭提示" aria-label="关闭持久化错误提示" onClick={() => setSyncErrors({})}><X size={15} /></button>
       </div>}
       {analysisWork && (view !== 'intel' || analysisWork.stage === 'people' || analysisWork.stage === 'self') && <div className="analysis-float-wrap"><button type="button" className="analysis-float" onClick={() => setView('intel')}>

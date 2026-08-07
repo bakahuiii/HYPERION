@@ -1,4 +1,4 @@
-const DB_NAME = 'theia-automation'
+const DB_NAME = 'hyperion-automation'
 const STORE_NAME = 'handles'
 const HANDLE_KEY = 'export-directory'
 
@@ -51,7 +51,7 @@ export async function chooseExportDirectory() {
   const picker = (window as unknown as {
     showDirectoryPicker: (options: { id: string; mode: 'read'; startIn: 'documents' }) => Promise<LocalDirectoryHandle>
   }).showDirectoryPicker
-  return picker({ id: 'theia-exports', mode: 'read', startIn: 'documents' })
+  return picker({ id: 'hyperion-exports', mode: 'read', startIn: 'documents' })
 }
 
 export async function saveDirectoryHandle(handle: LocalDirectoryHandle) {

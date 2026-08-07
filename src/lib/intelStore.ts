@@ -3,7 +3,7 @@ import { localProxyUrl } from './apiUrl'
 import { compactIntelItem, compactIntelItems, hydrateIntelItems } from './intelPersistence'
 import { intelSignatures, planIntelDelta } from './intelDelta'
 
-const DB_NAME = 'theia-data'
+const DB_NAME = 'hyperion-data'
 const STORE_NAME = 'snapshots'
 const RECORD_STORE_NAME = 'intelRecords'
 const META_STORE_NAME = 'intelMeta'
@@ -19,6 +19,12 @@ export interface SharedIntelMeta {
   updatedAt: string | null
   sourceFingerprint: string | null
   recordCount: number
+}
+
+export interface SharedIntelChanges extends SharedIntelMeta {
+  requiresReload: boolean
+  upserts: IntelItem[]
+  deleteIds: string[]
 }
 
 interface SharedIntelSnapshot extends SharedIntelMeta {
@@ -202,6 +208,28 @@ export async function loadSharedIntelMeta(): Promise<SharedIntelMeta> {
   }
 }
 
+/**
+ * Reads only append-only operations committed after a known archive version.
+ * It is used for local producers such as Iris, where fetching the full chat
+ * archive just to display one new journal entry would freeze the renderer.
+ */
+export async function loadSharedIntelChanges(since: string, limit = 2_000): Promise<SharedIntelChanges> {
+  const payload = await sharedIntelRequest<Partial<SharedIntelChanges>>(
+    archiveQuery('/api/sync/intel/changes', { since, limit }),
+  )
+  const upserts = Array.isArray(payload.upserts) ? hydrateIntelItems(payload.upserts) : []
+  return {
+    updatedAt: typeof payload.updatedAt === 'string' ? payload.updatedAt : null,
+    sourceFingerprint: typeof payload.sourceFingerprint === 'string' ? payload.sourceFingerprint : null,
+    recordCount: Math.max(0, Number(payload.recordCount) || 0),
+    requiresReload: payload.requiresReload === true,
+    upserts,
+    deleteIds: Array.isArray(payload.deleteIds)
+      ? payload.deleteIds.filter((id): id is string => typeof id === 'string' && Boolean(id))
+      : [],
+  }
+}
+
 function archiveQuery(path: string, parameters: Record<string, string | number | undefined>) {
   const query = new URLSearchParams()
   for (const [key, value] of Object.entries(parameters)) {
@@ -276,7 +304,7 @@ export function primeSharedIntelSnapshot(items: IntelItem[], sourceFingerprint?:
   sharedIntelSourceFingerprint = sourceFingerprint ?? null
 }
 
-/** Persists raw chat records only to the loopback THEIA proxy, never an AI provider. */
+/** Persists raw chat records only to the loopback HYPERION proxy, never an AI provider. */
 export function saveSharedIntelSnapshot(items: IntelItem[], sourceFingerprint?: string, expectedUpdatedAt?: string | null | (() => string | null)): Promise<SharedIntelMeta> {
   // Two large POST bodies can finish uploading in the opposite order from
   // their UI changes. Serialize them before fetch so an older import cannot
@@ -304,6 +332,38 @@ export function saveSharedIntelSnapshot(items: IntelItem[], sourceFingerprint?: 
         })
     sharedIntelSignatures = plan?.nextSignatures ?? intelSignatures(compacted)
     sharedIntelSourceFingerprint = fingerprint
+    return {
+      updatedAt: typeof payload.updatedAt === 'string' ? payload.updatedAt : null,
+      sourceFingerprint: typeof payload.sourceFingerprint === 'string' ? payload.sourceFingerprint : null,
+      recordCount: Math.max(0, Number(payload.recordCount) || 0),
+    }
+  })
+  sharedIntelWriteQueue = write.catch(() => undefined)
+  return write
+}
+
+/**
+ * Writes a small local producer change without requiring the renderer to hold
+ * the complete chat archive. This is used for self-journal additions and
+ * deletions while a large archive stays body-deferred.
+ */
+export function saveSharedIntelDelta(
+  upserts: IntelItem[],
+  deleteIds: string[],
+  expectedUpdatedAt?: string | null | (() => string | null),
+): Promise<SharedIntelMeta> {
+  const write = sharedIntelWriteQueue.then(async () => {
+    const expected = typeof expectedUpdatedAt === 'function' ? expectedUpdatedAt() : expectedUpdatedAt
+    const compactedUpserts = compactIntelItems(upserts)
+    const payload = await sharedIntelRequest<SharedIntelMeta>('/api/sync/intel/delta', 'POST', {
+      upserts: compactedUpserts,
+      deleteIds,
+      ...(expected !== undefined ? { expectedUpdatedAt: expected || null } : {}),
+    })
+    if (sharedIntelSignatures) {
+      for (const id of deleteIds) sharedIntelSignatures.delete(id)
+      for (const item of compactedUpserts) sharedIntelSignatures.set(item.id, JSON.stringify(item))
+    }
     return {
       updatedAt: typeof payload.updatedAt === 'string' ? payload.updatedAt : null,
       sourceFingerprint: typeof payload.sourceFingerprint === 'string' ? payload.sourceFingerprint : null,

@@ -1,75 +1,134 @@
+import { access, mkdir, rename } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { dirname, resolve } from 'node:path'
+import { dirname, resolve, sep } from 'node:path'
 
 const serverDirectory = dirname(fileURLToPath(import.meta.url))
 const applicationRoot = resolve(serverDirectory, '..')
-const requestedRuntimeRoot = typeof process.env.THEIA_RUNTIME_ROOT === 'string'
-  ? process.env.THEIA_RUNTIME_ROOT.trim()
-  : ''
 
-export const releaseLayoutEnabled = process.env.THEIA_RELEASE_LAYOUT === '1'
-export const runtimeRoot = requestedRuntimeRoot ? resolve(requestedRuntimeRoot) : applicationRoot
+function environmentPath(name) {
+  const value = process.env[name]
+  return typeof value === 'string' && value.trim() ? resolve(value.trim()) : ''
+}
 
-const releasePaths = {
-  dataDirectory: resolve(runtimeRoot, 'data'),
-  logDirectory: resolve(runtimeRoot, 'logs'),
-  imageDirectory: resolve(runtimeRoot, 'assets', 'img'),
+function releaseRuntimePaths(root) {
+  const dataDirectory = resolve(root, 'data')
+  const logDirectory = resolve(root, 'logs')
+  const imageDirectory = resolve(root, 'assets', 'img')
+  return {
+    workspace: root,
+    sharedStatePath: resolve(dataDirectory, 'state.json'),
+    sharedIntelPath: resolve(dataDirectory, 'chat-archive.json.gz'),
+    sharedIntelStoreDirectoryPath: resolve(dataDirectory, 'chat-archive'),
+    sharedIntelMetaPath: resolve(dataDirectory, 'chat-archive.meta.json'),
+    sharedIntelLegacyPath: resolve(dataDirectory, 'chat-archive.json'),
+    seleneInboxStatePath: resolve(dataDirectory, 'selene-inbox-state.json'),
+    mnemoInboxDirectoryPath: resolve(dataDirectory, 'mnemo-inbox'),
+    mnemoInboxStatePath: resolve(dataDirectory, 'mnemo-inbox-state.json'),
+    mnemoExportDirectoryPath: resolve(dataDirectory, 'mnemo-export'),
+    settingsPath: resolve(dataDirectory, 'settings.ini'),
+    credentialStorePath: resolve(dataDirectory, 'credentials.json'),
+    legacyProviderPath: resolve(dataDirectory, 'legacy-provider.json'),
+    aiDebugLogPath: resolve(logDirectory, 'ai-debug.jsonl'),
+    taskLogDirectoryPath: resolve(logDirectory, 'tasks'),
+    crashLogPath: resolve(logDirectory, 'crash-recovery.jsonl'),
+    serviceSessionPath: resolve(dataDirectory, 'runtime', 'service-session.json'),
+    avatarCacheDirectoryPath: resolve(imageDirectory, 'avatars'),
+    mapTileCacheDirectoryPath: resolve(dataDirectory, 'cache', 'map-tiles'),
+    backgroundDirectoryPath: resolve(imageDirectory, 'backgrounds'),
+    electronUserDataPath: resolve(dataDirectory, 'electron'),
+    desktopPidPath: resolve(dataDirectory, 'runtime', 'desktop.pid'),
+    migrationDirectoryPath: resolve(dataDirectory, 'migrations'),
+    dataDirectory,
+    logDirectory,
+    imageDirectory,
+  }
+}
+
+function developmentRuntimePaths(root, prefix) {
+  return {
+    workspace: root,
+    sharedStatePath: resolve(root, `${prefix}-shared-state.json`),
+    sharedIntelPath: resolve(root, `${prefix}-shared-intel.json.gz`),
+    sharedIntelStoreDirectoryPath: resolve(root, `${prefix}-intel-store`),
+    sharedIntelMetaPath: resolve(root, `${prefix}-shared-intel.meta.json`),
+    sharedIntelLegacyPath: resolve(root, `${prefix}-shared-intel.json`),
+    seleneInboxStatePath: resolve(root, `${prefix}-selene-inbox-state.json`),
+    mnemoInboxDirectoryPath: resolve(root, `${prefix}-mnemo-inbox`),
+    mnemoInboxStatePath: resolve(root, `${prefix}-mnemo-inbox-state.json`),
+    mnemoExportDirectoryPath: resolve(root, `${prefix}-mnemo-export`),
+    settingsPath: resolve(root, `${prefix}-settings.ini`),
+    credentialStorePath: resolve(root, `${prefix}-credentials.json`),
+    legacyProviderPath: resolve(root, '.ai-provider.json'),
+    aiDebugLogPath: resolve(root, `${prefix}-ai-debug.log`),
+    taskLogDirectoryPath: resolve(root, `${prefix}-task-logs`),
+    crashLogPath: resolve(root, `${prefix}-crash-recovery.log`),
+    serviceSessionPath: resolve(root, `${prefix}-service-session.json`),
+    avatarCacheDirectoryPath: resolve(root, `${prefix}-avatar-cache`),
+    mapTileCacheDirectoryPath: resolve(root, `${prefix}-map-tile-cache`),
+    backgroundDirectoryPath: resolve(root, `${prefix}-backgrounds`),
+    electronUserDataPath: resolve(root, `${prefix}-user-data`),
+    desktopPidPath: resolve(root, `${prefix}-desktop.pid`),
+    migrationDirectoryPath: resolve(root, `${prefix}-migrations`),
+    dataDirectory: root,
+    logDirectory: root,
+    imageDirectory: root,
+  }
+}
+
+export const releaseLayoutEnabled = process.env.HYPERION_RELEASE_LAYOUT === '1'
+export const runtimeRoot = environmentPath('HYPERION_RUNTIME_ROOT') || applicationRoot
+export const runtimePaths = releaseLayoutEnabled
+  ? releaseRuntimePaths(runtimeRoot)
+  : developmentRuntimePaths(runtimeRoot, '.hyperion')
+
+const legacyRuntimeRoot = environmentPath('THEIA_RUNTIME_ROOT')
+  || (releaseLayoutEnabled ? resolve(dirname(runtimeRoot), 'THEIA') : applicationRoot)
+const legacyReleaseLayoutEnabled = process.env.THEIA_RELEASE_LAYOUT === '1' || releaseLayoutEnabled
+export const legacyRuntimePaths = legacyReleaseLayoutEnabled
+  ? releaseRuntimePaths(legacyRuntimeRoot)
+  : developmentRuntimePaths(legacyRuntimeRoot, '.theia')
+
+async function exists(path) {
+  try {
+    await access(path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
- * Keeps the development workspace backward compatible while allowing the
- * distributable to place all mutable data in explicit, reviewable folders.
+ * Moves legacy mutable state only when the HYPERION destination is absent.
+ * The caller owns when this runs so tests and a concurrently running old app
+ * never relocate live state behind each other's backs.
  */
-export const runtimePaths = releaseLayoutEnabled ? {
-  workspace: runtimeRoot,
-  sharedStatePath: resolve(releasePaths.dataDirectory, 'state.json'),
-  sharedIntelPath: resolve(releasePaths.dataDirectory, 'chat-archive.json.gz'),
-  sharedIntelStoreDirectoryPath: resolve(releasePaths.dataDirectory, 'chat-archive'),
-  sharedIntelMetaPath: resolve(releasePaths.dataDirectory, 'chat-archive.meta.json'),
-  sharedIntelLegacyPath: resolve(releasePaths.dataDirectory, 'chat-archive.json'),
-  seleneInboxStatePath: resolve(releasePaths.dataDirectory, 'selene-inbox-state.json'),
-  mnemoInboxDirectoryPath: resolve(releasePaths.dataDirectory, 'mnemo-inbox'),
-  mnemoInboxStatePath: resolve(releasePaths.dataDirectory, 'mnemo-inbox-state.json'),
-  mnemoExportDirectoryPath: resolve(releasePaths.dataDirectory, 'mnemo-export'),
-  settingsPath: resolve(releasePaths.dataDirectory, 'settings.ini'),
-  credentialStorePath: resolve(releasePaths.dataDirectory, 'credentials.json'),
-  legacyProviderPath: resolve(releasePaths.dataDirectory, 'legacy-provider.json'),
-  aiDebugLogPath: resolve(releasePaths.logDirectory, 'ai-debug.jsonl'),
-  taskLogDirectoryPath: resolve(releasePaths.logDirectory, 'tasks'),
-  crashLogPath: resolve(releasePaths.logDirectory, 'crash-recovery.jsonl'),
-  serviceSessionPath: resolve(releasePaths.dataDirectory, 'runtime', 'service-session.json'),
-  avatarCacheDirectoryPath: resolve(releasePaths.imageDirectory, 'avatars'),
-  mapTileCacheDirectoryPath: resolve(releasePaths.dataDirectory, 'cache', 'map-tiles'),
-  backgroundDirectoryPath: resolve(releasePaths.imageDirectory, 'backgrounds'),
-  electronUserDataPath: resolve(releasePaths.dataDirectory, 'electron'),
-  desktopPidPath: resolve(releasePaths.dataDirectory, 'runtime', 'desktop.pid'),
-  migrationDirectoryPath: resolve(releasePaths.dataDirectory, 'migrations'),
-  ...releasePaths,
-} : {
-  workspace: applicationRoot,
-  sharedStatePath: resolve(applicationRoot, '.theia-shared-state.json'),
-  sharedIntelPath: resolve(applicationRoot, '.theia-shared-intel.json.gz'),
-  sharedIntelStoreDirectoryPath: resolve(applicationRoot, '.theia-intel-store'),
-  sharedIntelMetaPath: resolve(applicationRoot, '.theia-shared-intel.meta.json'),
-  sharedIntelLegacyPath: resolve(applicationRoot, '.theia-shared-intel.json'),
-  seleneInboxStatePath: resolve(applicationRoot, '.theia-selene-inbox-state.json'),
-  mnemoInboxDirectoryPath: resolve(applicationRoot, '.theia-mnemo-inbox'),
-  mnemoInboxStatePath: resolve(applicationRoot, '.theia-mnemo-inbox-state.json'),
-  mnemoExportDirectoryPath: resolve(applicationRoot, '.theia-mnemo-export'),
-  settingsPath: resolve(applicationRoot, '.theia-settings.ini'),
-  credentialStorePath: resolve(applicationRoot, '.theia-credentials.json'),
-  legacyProviderPath: resolve(applicationRoot, '.ai-provider.json'),
-  aiDebugLogPath: resolve(applicationRoot, '.theia-ai-debug.log'),
-  taskLogDirectoryPath: resolve(applicationRoot, '.theia-task-logs'),
-  crashLogPath: resolve(applicationRoot, '.theia-crash-recovery.log'),
-  serviceSessionPath: resolve(applicationRoot, '.theia-service-session.json'),
-  avatarCacheDirectoryPath: resolve(applicationRoot, '.theia-avatar-cache'),
-  mapTileCacheDirectoryPath: resolve(applicationRoot, '.theia-map-tile-cache'),
-  backgroundDirectoryPath: resolve(applicationRoot, '.theia-backgrounds'),
-  electronUserDataPath: resolve(applicationRoot, '.theia-user-data'),
-  desktopPidPath: resolve(applicationRoot, '.theia-desktop.pid'),
-  migrationDirectoryPath: resolve(applicationRoot, '.theia-migrations'),
-  dataDirectory: applicationRoot,
-  logDirectory: applicationRoot,
-  imageDirectory: applicationRoot,
+export async function migrateRuntimePaths(legacyPaths, currentPaths) {
+  const candidates = Object.entries(currentPaths)
+    .filter(([name, destination]) => name !== 'workspace' && typeof destination === 'string')
+    .map(([name, destination]) => ({ name, source: legacyPaths[name], destination }))
+    .filter((entry) => typeof entry.source === 'string' && resolve(entry.source) !== resolve(entry.destination))
+    .sort((left, right) => left.source.split(sep).length - right.source.split(sep).length)
+  const migrated = []
+  const skipped = []
+  const handledSources = new Set()
+
+  for (const entry of candidates) {
+    const source = resolve(entry.source)
+    const destination = resolve(entry.destination)
+    if (handledSources.has(source)) continue
+    handledSources.add(source)
+    if (!await exists(source)) continue
+    if (await exists(destination)) {
+      skipped.push(entry.name)
+      continue
+    }
+    await mkdir(dirname(destination), { recursive: true, mode: 0o700 })
+    await rename(source, destination)
+    migrated.push(entry.name)
+  }
+  return { migrated, skipped }
+}
+
+export function migrateLegacyRuntimeData() {
+  return migrateRuntimePaths(legacyRuntimePaths, runtimePaths)
 }

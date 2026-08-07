@@ -1,20 +1,20 @@
-# THEIA
+# HYPERION
 
-THEIA 是一个本地优先的个人现实任务图工具。它把你主动导出的微信、QQ、校园平台等记录整理成可审核的候选任务，并在同一个界面中管理任务图、行程、地点、人物和原始来源。
+HYPERION 是一个本地优先的个人现实任务图工具。它把你主动导出的微信、QQ、校园平台等记录整理成可审核的候选任务，并在同一个界面中管理任务图、行程、地点、人物和原始来源。
 
-这是 THEIA `0.5.0` 源码发布包，不是免安装 EXE。第一次使用需要安装 Node.js 和项目依赖。发布包不包含任何真实聊天、任务、人物、API Key、头像缓存、个人设置或内部规划文档。
+这是 HYPERION `0.5.0` 源码发布包，不是免安装 EXE。第一次使用需要安装 Node.js 和项目依赖。发布包不包含任何真实聊天、任务、人物、API Key、头像缓存、个人设置或内部规划文档。
 
 ## 界面预览
 
 <p align="center">
-  <img src="docs/screenshots/task-atlas.png" alt="THEIA 可缩放任务图界面" width="100%">
+  <img src="docs/screenshots/task-atlas.png" alt="HYPERION 可缩放任务图界面" width="100%">
 </p>
 <p align="center"><sub>可缩放、可平移并支持拖拽归类的任务图</sub></p>
 
 <table>
   <tr>
-    <td width="50%" align="center"><img src="docs/screenshots/intel-workbench.png" alt="THEIA 情报库与模型提炼工作台"><br><sub>情报接入与模型提炼工作台</sub></td>
-    <td width="50%" align="center"><img src="docs/screenshots/appearance-customization.png" alt="THEIA 界面外观自定义"><br><sub>主题、头像与全局背景自定义</sub></td>
+    <td width="50%" align="center"><img src="docs/screenshots/intel-workbench.png" alt="HYPERION 情报库与模型提炼工作台"><br><sub>情报接入与模型提炼工作台</sub></td>
+    <td width="50%" align="center"><img src="docs/screenshots/appearance-customization.png" alt="HYPERION 界面外观自定义"><br><sub>主题、头像与全局背景自定义</sub></td>
   </tr>
 </table>
 
@@ -31,7 +31,7 @@ node --version
 npm --version
 ```
 
-### 第二步：安装 THEIA 依赖
+### 第二步：安装 HYPERION 依赖
 
 进入本发布包的 `app` 文件夹，在空白处按住 Shift 并点击右键，选择“在终端中打开”，然后运行：
 
@@ -45,8 +45,8 @@ npm install
 
 回到发布包根目录，双击：
 
-- `启动 THEIA 桌面版.cmd`：推荐，独立 16:9 窗口并默认使用 GPU 加速。
-- `启动 THEIA 浏览器版.cmd`：启动本地服务后，用 Chrome/Edge 打开终端显示的地址。
+- `启动 HYPERION 桌面版.cmd`：推荐，独立 16:9 窗口并默认使用 GPU 加速。
+- `启动 HYPERION 浏览器版.cmd`：启动本地服务后，用 Chrome/Edge 打开终端显示的地址。
 
 不要直接双击 `app/index.html`，因为设置、模型、共享数据、地图和头像需要本地 Node.js 服务。
 
@@ -65,7 +65,7 @@ npm install
 ## 目录说明
 
 ```text
-THEIA-release/
+HYPERION-release/
 ├─ app/                       应用源码、锁文件和运行脚本
 ├─ assets/img/
 │  ├─ backgrounds/           运行后上传的全局背景
@@ -79,15 +79,15 @@ THEIA-release/
 │  ├─ ai-debug.jsonl         运行后生成：不含正文的管线摘要
 │  └─ tasks/                 运行后生成：完整模型工作日志
 ├─ docs/                     完整文档
-├─ 启动 THEIA 桌面版.cmd
-└─ 启动 THEIA 浏览器版.cmd
+├─ 启动 HYPERION 桌面版.cmd
+└─ 启动 HYPERION 浏览器版.cmd
 ```
 
 `data/`、`logs/` 和 `assets/img/avatars/` 都可能含私密信息。不要把运行后的发布目录直接发给别人或上传到公共仓库。
 
 ## 网络与隐私
 
-THEIA 不绕过登录、不解密私人数据库，也不自行抓取微信、QQ 或校园平台。它只处理你主动选择或授权的导出文件。
+HYPERION 不绕过登录、不解密私人数据库，也不自行抓取微信、QQ 或校园平台。它只处理你主动选择或授权的导出文件。
 
 - 启动任务/人物提炼时，所选记录会发送到你配置的模型服务。
 - 主动启用自动提炼后，最短间隔为 24 小时，且当前需要页面保持打开。
@@ -117,9 +117,9 @@ THEIA 不绕过登录、不解密私人数据库，也不自行抓取微信、QQ
 ## 重要限制
 
 - 模型可能遗漏、误读或总结错误，候选和人物结论必须人工审核。
-- 发言方向无法从导出字段确认时，THEIA 会保留 unknown，不会安全地靠昵称猜测。
+- 发言方向无法从导出字段确认时，HYPERION 会保留 unknown，不会安全地靠昵称猜测。
 - 超长会话会连续分段覆盖全部消息，而不是塞进一个无限大的请求；第三方服务仍可能限流或返回 502。
 - 地图和搜索使用公共服务，没有可用性保证，必须保留手动选点。
 - 当前没有数据库加密、正式 schema 迁移、签名安装器和自动更新。
 
-重要数据请在关闭 THEIA 后备份 `data/`、`assets/img/` 和需要保留的 `logs/`。
+重要数据请在关闭 HYPERION 后备份 `data/`、`assets/img/` 和需要保留的 `logs/`。

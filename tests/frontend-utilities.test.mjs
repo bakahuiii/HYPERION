@@ -4,6 +4,7 @@ import test from 'node:test'
 import { estimateAttachmentQueue } from '../src/lib/attachmentQueue.ts'
 import { parseIntelFile } from '../src/lib/importer.ts'
 import { incrementalConversationRecords } from '../src/lib/intelConversationView.ts'
+import { automaticTriggerIsDue } from '../src/lib/automaticAnalysis.ts'
 import { relativeInteractionLabel, summarizePersonInteraction } from '../src/lib/personInteraction.ts'
 import { isHumanCenteredAdvice, interpersonalAdviceRisk } from '../src/lib/interpersonalSafety.ts'
 import { counterpartIdentityEvidence } from '../src/lib/personCounterpart.ts'
@@ -47,6 +48,17 @@ test('map configuration rejects unknown providers and clamps cache limits', () =
   assert.equal(normalizeMapSettings({ cacheMaxMb: 127.6 }).cacheMaxMb, 128)
 })
 
+test('automatic incremental analysis honors the selected time and message triggers', () => {
+  assert.equal(automaticTriggerIsDue('time', true, 0, 50), true)
+  assert.equal(automaticTriggerIsDue('time', false, 500, 50), false)
+  assert.equal(automaticTriggerIsDue('message-count', true, 49, 50), false)
+  assert.equal(automaticTriggerIsDue('message-count', false, 50, 50), true)
+  assert.equal(automaticTriggerIsDue('either', true, 0, 50), true)
+  assert.equal(automaticTriggerIsDue('either', false, 50, 50), true)
+  assert.equal(automaticTriggerIsDue('either', false, 49, 50), false)
+  assert.equal(automaticTriggerIsDue('message-count', false, 50, undefined), true)
+})
+
 test('large imports use the worker path and terminate it after a response', async () => {
   const previousWorker = globalThis.Worker
   let terminated = false
@@ -54,7 +66,7 @@ test('large imports use the worker path and terminate it after a response', asyn
   class FakeWorker {
     constructor(url, options) {
       assert.match(String(url), /intelParser\.worker\.ts$/)
-      assert.deepEqual(options, { type: 'module', name: 'theia-intel-parser' })
+      assert.deepEqual(options, { type: 'module', name: 'hyperion-intel-parser' })
     }
 
     postMessage(payload) {

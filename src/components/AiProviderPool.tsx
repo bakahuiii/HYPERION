@@ -46,7 +46,7 @@ const EMPTY_DRAFT: ChannelDraft = {
   maxConcurrency: 4,
 }
 
-const PROVIDER_STATUS_CACHE_KEY = 'theia:ai-provider-status:v1'
+const PROVIDER_STATUS_CACHE_KEY = 'hyperion:ai-provider-status:v1'
 
 function stripProviderSecrets(status: AiStatus): AiStatus {
   return {

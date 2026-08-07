@@ -5,8 +5,8 @@ import process from 'node:process'
 import { _electron as electron } from 'playwright'
 
 const root = resolve(import.meta.dirname, '..')
-const executablePath = resolve(root, 'release-bin', 'installer', 'win-unpacked', 'THEIA.exe')
-const runtimeRoot = await mkdtemp(resolve(tmpdir(), 'theia-unpacked-smoke-'))
+const executablePath = resolve(root, 'release-bin', 'installer', 'win-unpacked', 'HYPERION.exe')
+const runtimeRoot = await mkdtemp(resolve(tmpdir(), 'hyperion-unpacked-smoke-'))
 let application
 
 try {
@@ -15,18 +15,20 @@ try {
     env: {
       ...process.env,
       AI_PORT: '0',
-      THEIA_RUNTIME_ROOT: runtimeRoot,
-      THEIA_RELEASE_LAYOUT: '1',
-      THEIA_SOFTWARE_RENDERING: '1',
+      HYPERION_RUNTIME_ROOT: runtimeRoot,
+      HYPERION_RELEASE_LAYOUT: '1',
+      HYPERION_SELENE_AUTO_DISCOVERY: '0',
+      HYPERION_MNEMO_DISABLED: '1',
+      HYPERION_SOFTWARE_RENDERING: '1',
     },
     timeout: 60_000,
   })
   const page = await application.firstWindow()
   await page.getByRole('region', { name: '按主题组织的任务图' }).waitFor({ state: 'visible', timeout: 60_000 })
-  if (!(await page.title()).startsWith('THEIA')) throw new Error(`unpacked 桌面窗口标题异常：${await page.title()}`)
+  if (!(await page.title()).startsWith('HYPERION')) throw new Error(`unpacked 桌面窗口标题异常：${await page.title()}`)
   console.log('Packaged win-unpacked startup smoke test passed.')
 } finally {
   await application?.close().catch(() => undefined)
-  const expectedPrefix = resolve(tmpdir(), 'theia-unpacked-smoke-')
+  const expectedPrefix = resolve(tmpdir(), 'hyperion-unpacked-smoke-')
   if (runtimeRoot.startsWith(expectedPrefix)) await rm(runtimeRoot, { recursive: true, force: true })
 }

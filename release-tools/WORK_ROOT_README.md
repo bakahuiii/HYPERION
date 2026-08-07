@@ -1,9 +1,9 @@
-# THEIA Local Workspace
+# HYPERION Local Workspace
 
-This directory is the single local home for THEIA development and releases.
+This directory is the single local home for HYPERION development and releases.
 
 ```text
-THEIA/
+HYPERION/
   source/       Git repository and local development workspace
   releases/     Immutable, versioned release artifacts
   staging/      Builds waiting for validation

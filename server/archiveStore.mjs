@@ -9,10 +9,11 @@ import { writeFileAtomically } from './atomicFile.mjs'
 const gzipAsync = promisify(gzip)
 const gunzipAsync = promisify(gunzip)
 
-export const ARCHIVE_STORE_SCHEMA = 'theia-intel-archive/v1'
+export const ARCHIVE_STORE_SCHEMA = 'hyperion-intel-archive/v1'
 const SEGMENT_SUFFIX = '.jsonl.gz'
 const DEFAULT_COMPACTION_SEGMENTS = 24
-const ARCHIVE_METADATA_VERSION = 2
+const ARCHIVE_METADATA_VERSION = 3
+const STATE_IDLE_EVICTION_MS = 30_000
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex')
@@ -49,11 +50,11 @@ function compactItem(item) {
 }
 
 // A connected chat-export directory is authoritative only for that directory.
-// It must never erase notes created by THEIA or Iris while a large archive body
+// It must never erase notes created by HYPERION or Iris while a large archive body
 // is deferred in the renderer. Explicit delta deletes remain the supported
 // deletion path for these records.
 function isLocalManualRecord(item) {
-  return typeof item?.sourceFile === 'string' && item.sourceFile.startsWith('theia://')
+  return typeof item?.sourceFile === 'string' && item.sourceFile.startsWith('hyperion://')
 }
 
 function archivePayload(value) {
@@ -170,6 +171,23 @@ function metadataSegments(value) {
     .map((entry) => [entry.name, entry]))
 }
 
+function metadataConversationIndex(value) {
+  if (!Array.isArray(value?.conversationIndex)) return null
+  const entries = value.conversationIndex
+    .filter((entry) => entry && typeof entry.id === 'string' && typeof entry.name === 'string' && typeof entry.source === 'string')
+    .map((entry) => ({
+      id: entry.id,
+      name: entry.name,
+      kind: entry.kind === 'direct' || entry.kind === 'group' ? entry.kind : 'unknown',
+      source: entry.source,
+      recordCount: Math.max(0, Math.floor(Number(entry.recordCount) || 0)),
+      ...(typeof entry.firstAt === 'string' ? { firstAt: entry.firstAt } : {}),
+      ...(typeof entry.lastAt === 'string' ? { lastAt: entry.lastAt } : {}),
+      ...(entry.latestPreview && typeof entry.latestPreview === 'object' ? { latestPreview: entry.latestPreview } : {}),
+    }))
+  return entries.length || value.conversationIndex.length === 0 ? entries : null
+}
+
 function sameNames(left, right) {
   return left.length === right.length && left.every((name, index) => name === right[index])
 }
@@ -253,6 +271,55 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
   let loadedFromLegacy = false
   let integrity = { status: 'unverified', unindexedSegmentCount: 0 }
   let conversationIndex = null
+  let stateEvictionTimer = null
+
+  function retainState() {
+    if (stateEvictionTimer) clearTimeout(stateEvictionTimer)
+    stateEvictionTimer = null
+  }
+
+  function releaseStateWhenIdle() {
+    retainState()
+    if (!state) return
+    stateEvictionTimer = setTimeout(() => {
+      state = null
+      knownSegments = []
+      knownSegmentInfo = new Map()
+      sequence = 0
+      loadedFromLegacy = false
+      integrity = { status: 'unverified', unindexedSegmentCount: 0 }
+      conversationIndex = null
+      stateEvictionTimer = null
+    }, STATE_IDLE_EVICTION_MS)
+    stateEvictionTimer.unref?.()
+  }
+
+  async function readCurrentMetadata() {
+    const metadata = await readArchiveMetadata(metadataPath)
+    if (!metadata || !Number.isFinite(Number(metadata.recordCount))) return null
+    const names = await listSegments()
+    const indexedNames = [...metadataSegments(metadata).keys()].sort()
+    if (!sameNames(names, indexedNames)) return null
+    if (metadata.integrity?.status !== 'verified') return null
+    return metadata
+  }
+
+  function archiveMeta(metadata) {
+    return {
+      updatedAt: typeof metadata?.updatedAt === 'string' ? metadata.updatedAt : null,
+      sourceFingerprint: typeof metadata?.sourceFingerprint === 'string' ? metadata.sourceFingerprint : null,
+      recordCount: Math.max(0, Number(metadata?.recordCount) || 0),
+      schemaVersion: 1,
+      metadataVersion: Number(metadata?.metadataVersion) || ARCHIVE_METADATA_VERSION,
+      storageEngine: 'append-only-jsonl-gzip',
+      segmentCount: Math.max(0, Number(metadata?.segmentCount) || 0),
+      integrity: {
+        algorithm: 'sha256',
+        status: typeof metadata?.integrity?.status === 'string' ? metadata.integrity.status : integrity.status,
+        unindexedSegmentCount: Math.max(0, Number(metadata?.integrity?.unindexedSegmentCount) || 0),
+      },
+    }
+  }
 
   async function listSegments() {
     try {
@@ -267,6 +334,7 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
   }
 
   async function reload(force = false) {
+    retainState()
     const names = await listSegments()
     if (!force && state && sameNames(names, knownSegments)) return state
     const next = { updatedAt: null, sourceFingerprint: null, items: new Map() }
@@ -316,6 +384,7 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
       recordCount: state.items.size,
       segmentCount: knownSegments.length,
       metadataVersion: ARCHIVE_METADATA_VERSION,
+      ...(conversationIndex ? { conversationIndex } : {}),
       segments: knownSegments.map((name) => knownSegmentInfo.get(name)).filter(Boolean),
       integrity: {
         algorithm: 'sha256',
@@ -327,8 +396,15 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
   }
 
   async function migrate() {
+    // The old single-file archive is only relevant when no verified segmented
+    // store exists. Checking a healthy archive must not expand every message
+    // into memory on every HYPERION launch.
+    if (!state && await readCurrentMetadata()) return false
     await reload()
-    if (!loadedFromLegacy) return false
+    if (!loadedFromLegacy) {
+      releaseStateWhenIdle()
+      return false
+    }
     const updatedAt = monotonicTimestamp(state.updatedAt)
     sequence += 1
     const operations = [...state.items.values()].map((item) => ({ op: 'upsert', item }))
@@ -340,12 +416,16 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
     integrity = { status: 'verified', unindexedSegmentCount: 0 }
     conversationIndex = null
     await writeMetadata()
+    releaseStateWhenIdle()
     return true
   }
 
   async function compact() {
     await reload()
-    if (knownSegments.length <= 1) return false
+    if (knownSegments.length <= 1) {
+      releaseStateWhenIdle()
+      return false
+    }
     const oldSegments = [...knownSegments]
     const updatedAt = monotonicTimestamp(state.updatedAt)
     sequence += 1
@@ -361,6 +441,7 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
     integrity = { status: 'verified', unindexedSegmentCount: 0 }
     conversationIndex = null
     await writeMetadata()
+    releaseStateWhenIdle()
     return true
   }
 
@@ -401,6 +482,7 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
     const updatedAt = monotonicTimestamp(state.updatedAt)
     const sourceFingerprint = typeof payload?.sourceFingerprint === 'string' ? payload.sourceFingerprint : null
     if (!operations.length && sourceFingerprint === state.sourceFingerprint) {
+      releaseStateWhenIdle()
       return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
     }
     sequence += 1
@@ -412,8 +494,12 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
     integrity = { status: 'verified', unindexedSegmentCount: 0 }
     conversationIndex = null
     await writeMetadata()
-    if (knownSegments.length >= Math.max(2, Math.floor(compactionSegments))) await compact()
-    return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
+    // Replacing a large archive with a small one should reclaim its old
+    // segments immediately; retaining a giant delete delta defeats removal.
+    if (knownSegments.length >= Math.max(2, Math.floor(compactionSegments)) || operations.length >= Math.max(10_000, state.items.size)) await compact()
+    const result = { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
+    releaseStateWhenIdle()
+    return result
   }
 
   async function commitDelta(payload) {
@@ -460,6 +546,7 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
       ? (typeof payload.sourceFingerprint === 'string' ? payload.sourceFingerprint : null)
       : state.sourceFingerprint
     if (!operations.length && sourceFingerprint === state.sourceFingerprint) {
+      releaseStateWhenIdle()
       return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
     }
     sequence += 1
@@ -472,12 +559,16 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
     conversationIndex = null
     await writeMetadata()
     if (knownSegments.length >= Math.max(2, Math.floor(compactionSegments))) await compact()
-    return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
+    const result = { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
+    releaseStateWhenIdle()
+    return result
   }
 
   async function loadSnapshot() {
     await reload()
-    return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, items: [...state.items.values()] }
+    const result = { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, items: [...state.items.values()] }
+    releaseStateWhenIdle()
+    return result
   }
 
   /**
@@ -488,46 +579,56 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
    */
   async function loadChanges({ since, limit = 2_000 } = {}) {
     await reload()
-    const watermark = typeof since === 'string' && Number.isFinite(Date.parse(since)) ? since : null
-    if (!watermark) return { requiresReload: true, updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, upserts: [], deleteIds: [] }
-    const max = Math.max(1, Math.min(20_000, Math.floor(Number(limit) || 2_000)))
-    const upserts = new Map()
-    const deleteIds = new Set()
-    for (const name of knownSegments) {
-      const info = knownSegmentInfo.get(name)
-      if (!info || !info.updatedAt || info.updatedAt <= watermark) continue
-      if (info.kind === 'snapshot') {
-        return { requiresReload: true, updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, upserts: [], deleteIds: [] }
-      }
-      const segment = await readSegment(resolve(directory, name), info.checksum)
-      for (const operation of segment.operations) {
-        if (operation?.op === 'delete' && typeof operation.id === 'string') {
-          deleteIds.add(operation.id)
-          upserts.delete(operation.id)
-        } else if (operation?.op === 'upsert' && operation.item?.id) {
-          upserts.set(operation.item.id, compactItem(operation.item))
-          deleteIds.delete(operation.item.id)
-        }
-        if (upserts.size + deleteIds.size > max) {
+    try {
+      const watermark = typeof since === 'string' && Number.isFinite(Date.parse(since)) ? since : null
+      if (!watermark) return { requiresReload: true, updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, upserts: [], deleteIds: [] }
+      const max = Math.max(1, Math.min(20_000, Math.floor(Number(limit) || 2_000)))
+      const upserts = new Map()
+      const deleteIds = new Set()
+      for (const name of knownSegments) {
+        const info = knownSegmentInfo.get(name)
+        if (!info || !info.updatedAt || info.updatedAt <= watermark) continue
+        if (info.kind === 'snapshot') {
           return { requiresReload: true, updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, upserts: [], deleteIds: [] }
         }
+        const segment = await readSegment(resolve(directory, name), info.checksum)
+        for (const operation of segment.operations) {
+          if (operation?.op === 'delete' && typeof operation.id === 'string') {
+            deleteIds.add(operation.id)
+            upserts.delete(operation.id)
+          } else if (operation?.op === 'upsert' && operation.item?.id) {
+            upserts.set(operation.item.id, compactItem(operation.item))
+            deleteIds.delete(operation.item.id)
+          }
+          if (upserts.size + deleteIds.size > max) {
+            return { requiresReload: true, updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, upserts: [], deleteIds: [] }
+          }
+        }
       }
+      return { requiresReload: false, updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, upserts: [...upserts.values()].filter(Boolean), deleteIds: [...deleteIds] }
+    } finally {
+      releaseStateWhenIdle()
     }
-    return { requiresReload: false, updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, upserts: [...upserts.values()].filter(Boolean), deleteIds: [...deleteIds] }
   }
 
   async function loadMeta() {
+    // Startup needs only this compact header. Avoid expanding a multi-hundred
+    // thousand record JSONL snapshot just to paint an archive badge.
+    if (!state) {
+      const metadata = await readCurrentMetadata()
+      if (metadata) return archiveMeta(metadata)
+    }
     await reload()
-    return {
+    const result = archiveMeta({
       updatedAt: state.updatedAt,
       sourceFingerprint: state.sourceFingerprint,
       recordCount: state.items.size,
-      schemaVersion: 1,
       metadataVersion: ARCHIVE_METADATA_VERSION,
-      storageEngine: 'append-only-jsonl-gzip',
       segmentCount: knownSegments.length,
-      integrity: { ...integrity, algorithm: 'sha256' },
-    }
+      integrity,
+    })
+    releaseStateWhenIdle()
+    return result
   }
 
   function buildConversationIndex() {
@@ -569,24 +670,38 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
   }
 
   async function loadConversationIndex({ query, cursor, limit } = {}) {
-    await reload()
+    let metadata = null
+    let cachedIndex = null
+    if (!state) {
+      metadata = await readCurrentMetadata()
+      cachedIndex = metadataConversationIndex(metadata)
+    }
+    if (!cachedIndex) await reload()
     const normalizedQuery = typeof query === 'string' ? query.trim().toLocaleLowerCase('zh-CN') : ''
+    const index = cachedIndex ?? buildConversationIndex()
+    // Persist the compact directory after its first build. Later launches can
+    // browse and search conversations without holding the complete archive.
+    if (!cachedIndex) {
+      try { await writeMetadata() } catch { /* The in-memory index remains usable for this request. */ }
+    }
     const entries = normalizedQuery
-      ? buildConversationIndex().filter((entry) => `${entry.name}\u0000${entry.id}\u0000${entry.source}`.toLocaleLowerCase('zh-CN').includes(normalizedQuery))
-      : buildConversationIndex()
+      ? index.filter((entry) => `${entry.name}\u0000${entry.id}\u0000${entry.source}`.toLocaleLowerCase('zh-CN').includes(normalizedQuery))
+      : index
     const decodedCursor = decodePageCursor(cursor)
     const offset = decodedCursor
       ? Math.max(0, entries.findIndex((entry) => entry.id === decodedCursor.id && entry.lastAt === decodedCursor.lastAt) + 1)
       : 0
     const page = entries.slice(offset, offset + normalizedLimit(limit))
     const final = page.at(-1)
-    return {
-      updatedAt: state.updatedAt,
-      recordCount: state.items.size,
+    const result = {
+      updatedAt: cachedIndex ? archiveMeta(metadata).updatedAt : state.updatedAt,
+      recordCount: cachedIndex ? archiveMeta(metadata).recordCount : state.items.size,
       totalConversations: entries.length,
       items: page,
       nextCursor: final && offset + page.length < entries.length ? encodePageCursor({ id: final.id, lastAt: final.lastAt ?? null }) : null,
     }
+    if (!cachedIndex) releaseStateWhenIdle()
+    return result
   }
 
   async function loadConversationPage(conversationId, { cursor, limit } = {}) {
@@ -600,22 +715,26 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
       : 0
     const page = records.slice(offset, offset + normalizedLimit(limit, 200))
     const final = page.at(-1)
-    return {
+    const result = {
       updatedAt: state.updatedAt,
       conversation: buildConversationIndex().find((entry) => entry.id === id) ?? null,
       totalRecords: records.length,
       items: page,
       nextCursor: final && offset + page.length < records.length ? encodePageCursor({ id: final.id, capturedAt: final.capturedAt ?? null }) : null,
     }
+    releaseStateWhenIdle()
+    return result
   }
 
   async function verifyIntegrity() {
     await reload(true)
-    return {
+    const result = {
       recordCount: state.items.size,
       segmentCount: knownSegments.length,
       integrity: { ...integrity, algorithm: 'sha256' },
     }
+    releaseStateWhenIdle()
+    return result
   }
 
   return { commit, commitDelta, compact, loadMeta, loadSnapshot, loadChanges, loadConversationIndex, loadConversationPage, migrate, verifyIntegrity }

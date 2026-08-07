@@ -48,12 +48,12 @@ async function copyDirectory(source, target, filter) {
   await cp(source, target, { recursive: true, filter })
 }
 
-const excludedNames = new Set(['node_modules', 'dist', '.git', '.npm-cache', '.theia-user-data'])
+const excludedNames = new Set(['node_modules', 'dist', '.git', '.npm-cache', '.hyperion-user-data'])
 const sourceFilter = (entry) => !excludedNames.has(basename(entry))
 const privatePlanningDocs = new Set([
   'PROJECT_VISION.md',
   'PROJECT_VISION.en.md',
-  'THEIA_PROJECT_VISION_BILINGUAL.docx',
+  'HYPERION_PROJECT_VISION_BILINGUAL.docx',
 ])
 const releaseDocsFilter = (entry) => !privatePlanningDocs.has(basename(entry))
 
@@ -72,12 +72,12 @@ await copyDirectory(resolve(sourceRoot, 'release', 'logs'), resolve(destination,
 // release copy caused installation requirements and model behavior to drift.
 // Internal product-planning documents stay in the source workspace.
 await copyDirectory(resolve(sourceRoot, 'docs'), resolve(destination, 'docs'), releaseDocsFilter)
-for (const file of ['README.md', '启动 THEIA 桌面版.cmd', '启动 THEIA 浏览器版.cmd', '.gitignore', 'LICENSE']) {
+for (const file of ['README.md', '启动 HYPERION 桌面版.cmd', '启动 HYPERION 浏览器版.cmd', '.gitignore', 'LICENSE']) {
   await cp(resolve(sourceRoot, 'release', file), resolve(destination, file))
 }
 
 const manifest = {
-  product: 'THEIA',
+  product: 'HYPERION',
   format: 'source-release',
   generatedAt: new Date().toISOString(),
   sourceVersion: JSON.parse(await readFile(resolve(sourceRoot, 'package.json'), 'utf8')).version,
@@ -95,5 +95,5 @@ const manifest = {
 await writeFile(resolve(destination, 'RELEASE_MANIFEST.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
 
 const listing = await readdir(destination)
-console.log(`Created clean THEIA release at ${destination}`)
+console.log(`Created clean HYPERION release at ${destination}`)
 console.log(`Top-level entries: ${listing.join(', ')}`)

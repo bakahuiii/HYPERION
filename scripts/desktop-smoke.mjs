@@ -5,7 +5,7 @@ import process from 'node:process'
 import { _electron as electron } from 'playwright'
 
 const root = resolve(import.meta.dirname, '..')
-const runtimeRoot = await mkdtemp(resolve(tmpdir(), 'theia-desktop-smoke-'))
+const runtimeRoot = await mkdtemp(resolve(tmpdir(), 'hyperion-desktop-smoke-'))
 const dataDirectory = resolve(runtimeRoot, 'data')
 const secret = `smoke-${Date.now()}-only`
 await mkdir(dataDirectory, { recursive: true })
@@ -37,16 +37,18 @@ try {
     env: {
       ...process.env,
       AI_PORT: '18788',
-      VITE_THEIA_API_PORT: '18788',
-      THEIA_RUNTIME_ROOT: runtimeRoot,
-      THEIA_RELEASE_LAYOUT: '1',
-      THEIA_SOFTWARE_RENDERING: '1',
+      VITE_HYPERION_API_PORT: '18788',
+      HYPERION_RUNTIME_ROOT: runtimeRoot,
+      HYPERION_RELEASE_LAYOUT: '1',
+      HYPERION_SELENE_AUTO_DISCOVERY: '0',
+      HYPERION_MNEMO_DISABLED: '1',
+      HYPERION_SOFTWARE_RENDERING: '1',
     },
     timeout: 60_000,
   })
   const page = await application.firstWindow()
   await page.getByRole('region', { name: '按主题组织的任务图' }).waitFor({ state: 'visible', timeout: 60_000 })
-  if (!(await page.title()).startsWith('THEIA')) throw new Error(`桌面窗口标题异常：${await page.title()}`)
+  if (!(await page.title()).startsWith('HYPERION')) throw new Error(`桌面窗口标题异常：${await page.title()}`)
   const safeStorageAvailable = await application.evaluate(({ safeStorage }) => safeStorage.isEncryptionAvailable())
   if (!safeStorageAvailable) throw new Error('当前 Electron 会话无法使用系统 safeStorage')
   const credentialPath = resolve(dataDirectory, 'credentials.json')
@@ -79,6 +81,6 @@ try {
   console.log('Electron startup and safeStorage plaintext migration smoke test passed.')
 } finally {
   await application?.close().catch(() => undefined)
-  const expectedPrefix = resolve(tmpdir(), 'theia-desktop-smoke-')
+  const expectedPrefix = resolve(tmpdir(), 'hyperion-desktop-smoke-')
   if (runtimeRoot.startsWith(expectedPrefix)) await rm(runtimeRoot, { recursive: true, force: true })
 }

@@ -1,4 +1,4 @@
-﻿:root {
+:root {
   font-family: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
   color: #e9e6dc;
   background: #101513;
@@ -601,8 +601,8 @@ h1 { font-size: 26.5px; letter-spacing: .03em; }
 .provider-pool-section { overflow: hidden; }
 .provider-pool-heading-actions { display: inline-flex; align-items: center; flex: 0 0 auto; gap: 7px; }
 .provider-pool-heading-actions .icon-button { width: 30px; height: 30px; }
-.is-spinning { animation: theia-spin .85s linear infinite; }
-@keyframes theia-spin { to { transform: rotate(360deg); } }
+.is-spinning { animation: hyperion-spin .85s linear infinite; }
+@keyframes hyperion-spin { to { transform: rotate(360deg); } }
 .provider-usage-dashboard { display: grid; grid-template-columns: minmax(230px, .9fr) minmax(280px, 1.35fr); gap: 14px; margin-bottom: 4px; padding: 13px; border: 1px solid var(--line); background: color-mix(in srgb, var(--surface) 75%, transparent); }
 .provider-usage-overview { display: grid; grid-template-rows: auto auto auto minmax(46px, 1fr); gap: 9px; min-width: 0; }
 .provider-usage-overview-heading, .provider-usage-channels-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }

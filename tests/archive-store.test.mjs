@@ -8,7 +8,7 @@ import { gzipSync } from 'node:zlib'
 import { ARCHIVE_STORE_SCHEMA, createAppendOnlyArchiveStore } from '../server/archiveStore.mjs'
 
 async function fixture(options = {}) {
-  const root = await mkdtemp(join(tmpdir(), 'theia-archive-store-'))
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-archive-store-'))
   const directory = join(root, 'archive')
   const metadataPath = join(root, 'archive.meta.json')
   const legacyCompressedPath = join(root, 'legacy.json.gz')
@@ -57,6 +57,54 @@ test('delta commits append only changed records and preserve deletions', async (
   assert.equal(second.recordCount, 1)
   assert.deepEqual((await scope.store.loadSnapshot()).items, [{ id: 'a', content: 'updated' }])
   assert.equal((await readdir(scope.directory)).filter((name) => name.endsWith('.jsonl.gz')).length, 2)
+})
+
+test('authoritative chat snapshots preserve local manual records until an explicit delta delete', async (t) => {
+  const scope = await fixture({ compactionSegments: 20 })
+  t.after(() => rm(scope.root, { recursive: true, force: true }))
+  const first = await scope.store.commit({ items: [
+    { id: 'chat-1', source: 'wechat', sourceFile: 'chat.json', content: 'Imported chat row.' },
+    { id: 'journal-1', source: 'manual', sourceFile: 'hyperion://self-journal', conversationId: 'self-journal', content: 'Keep this journal entry.' },
+  ] })
+  const refreshed = await scope.store.commit({
+    expectedUpdatedAt: first.updatedAt,
+    items: [{ id: 'chat-2', source: 'wechat', sourceFile: 'chat.json', content: 'Replacement directory row.' }],
+  })
+  assert.equal(refreshed.recordCount, 2)
+  assert.deepEqual((await scope.store.loadSnapshot()).items.map((item) => item.id).sort(), ['chat-2', 'journal-1'])
+  const removed = await scope.store.commitDelta({
+    expectedUpdatedAt: refreshed.updatedAt,
+    upserts: [],
+    deleteIds: ['journal-1'],
+  })
+  assert.equal(removed.recordCount, 1)
+  assert.deepEqual((await scope.store.loadSnapshot()).items.map((item) => item.id), ['chat-2'])
+})
+
+test('archive changes return only delta operations after a watermark', async (t) => {
+  const scope = await fixture({ compactionSegments: 20 })
+  t.after(() => rm(scope.root, { recursive: true, force: true }))
+  const first = await scope.store.commit({ items: [{ id: 'old', content: 'kept' }] })
+  const second = await scope.store.commitDelta({
+    expectedUpdatedAt: first.updatedAt,
+    upserts: [{ id: 'journal', content: 'new self note', conversationId: 'self-journal', speakerRole: 'self' }],
+    deleteIds: ['old'],
+  })
+  const changes = await scope.store.loadChanges({ since: first.updatedAt })
+  assert.equal(changes.requiresReload, false)
+  assert.equal(changes.updatedAt, second.updatedAt)
+  assert.deepEqual(changes.upserts, [{ id: 'journal', content: 'new self note', conversationId: 'self-journal', speakerRole: 'self' }])
+  assert.deepEqual(changes.deleteIds, ['old'])
+})
+
+test('archive changes require a safe reload across a snapshot boundary', async (t) => {
+  const scope = await fixture({ compactionSegments: 2 })
+  t.after(() => rm(scope.root, { recursive: true, force: true }))
+  const first = await scope.store.commit({ items: [{ id: 'a', content: 'one' }] })
+  await scope.store.commit({ expectedUpdatedAt: first.updatedAt, items: [{ id: 'a', content: 'two' }] })
+  const changes = await scope.store.loadChanges({ since: first.updatedAt })
+  assert.equal(changes.requiresReload, true)
+  assert.deepEqual(changes.upserts, [])
 })
 
 test('unchanged delta is a no-op and does not create an empty archive segment', async (t) => {
@@ -163,4 +211,14 @@ test('compaction replaces many deltas with one complete snapshot', async (t) => 
   }
   assert.equal((await readdir(scope.directory)).filter((name) => name.endsWith('.jsonl.gz')).length, 1)
   assert.deepEqual((await scope.store.loadSnapshot()).items, [{ id: 'a', content: 'value-2' }])
+})
+
+test('clearing a large archive compacts obsolete chat segments immediately', async (t) => {
+  const scope = await fixture({ compactionSegments: 99 })
+  t.after(() => rm(scope.root, { recursive: true, force: true }))
+  const items = Array.from({ length: 10_000 }, (_, index) => ({ id: `message-${index}`, content: `message ${index}` }))
+  const first = await scope.store.commit({ items })
+  await scope.store.commit({ expectedUpdatedAt: first.updatedAt, items: [] })
+  assert.equal((await readdir(scope.directory)).filter((name) => name.endsWith('.jsonl.gz')).length, 1)
+  assert.deepEqual((await scope.store.loadSnapshot()).items, [])
 })

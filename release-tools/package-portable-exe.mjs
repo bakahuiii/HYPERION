@@ -6,10 +6,10 @@ import { dirname, resolve } from 'node:path'
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const packageInfo = JSON.parse(await readFile(resolve(projectRoot, 'package.json'), 'utf8'))
-const destination = resolve(process.argv[2] || resolve(projectRoot, 'release-bin', `THEIA-${packageInfo.version}-portable`))
+const destination = resolve(process.argv[2] || resolve(projectRoot, 'release-bin', `HYPERION-${packageInfo.version}-portable`))
 const electronDistribution = resolve(projectRoot, 'node_modules', 'electron', 'dist')
 const bundledApp = resolve(destination, 'resources', 'app')
-const executablePath = resolve(destination, 'THEIA.exe')
+const executablePath = resolve(destination, 'HYPERION.exe')
 const iconPath = resolve(projectRoot, 'release', 'app-icon.ico')
 
 async function exists(path) {
@@ -73,15 +73,15 @@ try {
   ], bundledApp)
 
   await writeFile(resolve(destination, 'README-EXE.txt'), [
-    'THEIA Windows x64 portable edition',
+    'HYPERION Windows x64 portable edition',
     '',
-    'Run THEIA.exe. Node.js and npm are not required.',
+    'Run HYPERION.exe. Node.js and npm are not required.',
     'Your tasks, settings, chat archive, logs, backgrounds, and avatar cache are stored locally under:',
-    '%APPDATA%\\THEIA',
+    '%APPDATA%\\HYPERION',
     '',
     'Do not share that data directory or data/settings.ini because it can contain imported chats and API keys.',
   ].join('\r\n'), 'utf8')
-  console.log(`Created portable THEIA executable at ${destination}`)
+  console.log(`Created portable HYPERION executable at ${destination}`)
 } catch (error) {
   await rm(destination, { recursive: true, force: true })
   throw error

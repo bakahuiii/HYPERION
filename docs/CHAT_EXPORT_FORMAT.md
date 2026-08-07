@@ -1,6 +1,6 @@
-# THEIA 聊天导出格式
+# HYPERION 聊天导出格式
 
-本文说明如何把第三方导出工具的结果整理成 THEIA 能可靠解析的格式。最重要的不是“JSON 能打开”，而是每条消息都能保留会话边界、时间、正文、发言人和发言方向。
+本文说明如何把第三方导出工具的结果整理成 HYPERION 能可靠解析的格式。最重要的不是“JSON 能打开”，而是每条消息都能保留会话边界、时间、正文、发言人和发言方向。
 
 ## 1. 推荐目录结构
 
@@ -26,7 +26,7 @@
 | 私聊 | `私聊`、`单聊`、`好友`、`friend`、`direct`、`personal` |
 | 群聊 | `群聊`、`群组`、`群消息`、`group`、`groups`、`chatroom` |
 
-THEIA 使用分类文件夹下一层作为会话身份。不要把所有人的 JSON 直接放在同一个 `私聊/` 目录，也不要把同一个人的每个月放成同级会话文件夹。
+HYPERION 使用分类文件夹下一层作为会话身份。不要把所有人的 JSON 直接放在同一个 `私聊/` 目录，也不要把同一个人的每个月放成同级会话文件夹。
 
 ## 2. 最佳 JSON 结构
 
@@ -108,7 +108,7 @@ sendTime, msgTime
 - `2026年7月29日 1时48分30秒`；
 - JavaScript 可解析且包含可靠年份的其他日期字符串。
 
-推荐始终导出完整年份和时区一致的本地时间。`07-29 01:48:30` 没有年份，不能独立用于任务目标时间。THEIA 不会用文件修改时间补聊天时间。
+推荐始终导出完整年份和时区一致的本地时间。`07-29 01:48:30` 没有年份，不能独立用于任务目标时间。HYPERION 不会用文件修改时间补聊天时间。
 
 ### 3.3 发言人名称
 
@@ -136,7 +136,7 @@ name, username
 type, msgType, messageType
 ```
 
-类型最长保留 80 字符。推荐使用稳定短值：`text`、`image`、`file`、`voice`、`video`、`system`、`link`。如果导出器把 `type` 用作方向（例如 `发送`/`接收`），THEIA 也能识别方向，但此时会失去准确消息类型，最好另加 `direction`。
+类型最长保留 80 字符。推荐使用稳定短值：`text`、`image`、`file`、`voice`、`video`、`system`、`link`。如果导出器把 `type` 用作方向（例如 `发送`/`接收`），HYPERION 也能识别方向，但此时会失去准确消息类型，最好另加 `direction`。
 
 ### 3.5 发言方向
 
@@ -170,7 +170,7 @@ selfUin / myUin / selfId / myId / myAccountId
 senderUin / senderId / fromUin / fromId / authorId / senderAccountId
 ```
 
-二者完全相等表示 self，不等表示 other。不要只提供昵称并要求 THEIA 猜测；备注名、群名片、改名和同名都会导致执行者反转。
+二者完全相等表示 self，不等表示 other。不要只提供昵称并要求 HYPERION 猜测；备注名、群名片、改名和同名都会导致执行者反转。
 
 ### 3.6 头像
 
@@ -183,11 +183,11 @@ bigHeadUrl, face, faceUrl, icon, iconUrl, profileImage,
 profileImageUrl, portrait
 ```
 
-值可以是 HTTP(S) URL、`data:image/...`，或带 `url`/`uri`/`src`/`href` 的嵌套对象。THEIA 会递归检查 message、sender/profile/contact/userInfo/senderInfo，以及任意层级的 `session` 对象。
+值可以是 HTTP(S) URL、`data:image/...`，或带 `url`/`uri`/`src`/`href` 的嵌套对象。HYPERION 会递归检查 message、sender/profile/contact/userInfo/senderInfo，以及任意层级的 `session` 对象。
 
 远程头像显示还受本地代理白名单限制。当前只允许常见 QQ/微信图床域名，避免任意 URL 导致 SSRF。其他平台头像建议由导出工具转为 data URL，或未来扩展受信域名配置。
 
-MNEMO 是例外的本机适配器：它不把头像 data URL 或本地路径放进 record。它从已授权账号的只读 snapshot 读取头像 blob，检查 JPEG/PNG/GIF/WebP/AVIF 二进制签名后，直接写入 THEIA 头像缓存。增量 record 只带可选 `avatarId` 内容哈希，THEIA 将其转换为本地安全地址。
+MNEMO 是例外的本机适配器：它不把头像 data URL 或本地路径放进 record。它从已授权账号的只读 snapshot 读取头像 blob，检查 JPEG/PNG/GIF/WebP/AVIF 二进制签名后，直接写入 HYPERION 头像缓存。增量 record 只带可选 `avatarId` 内容哈希，HYPERION 将其转换为本地安全地址。
 
 ## 4. CSV 格式
 
@@ -220,7 +220,7 @@ TXT 通常没有独立 `isSelf` 字段，所以发言方向会是 unknown。它�
 
 ## 6. JSON 递归解析规则
 
-THEIA 不要求固定顶层键。它递归进入对象和数组，并把上层发现的时间、发言人、类型、头像和方向传给子消息。某个对象一旦发现正文，就把它作为一条消息，不再把其子字段重复解析。
+HYPERION 不要求固定顶层键。它递归进入对象和数组，并把上层发现的时间、发言人、类型、头像和方向传给子消息。某个对象一旦发现正文，就把它作为一条消息，不再把其子字段重复解析。
 
 这支持以下结构：
 
@@ -238,7 +238,7 @@ THEIA 不要求固定顶层键。它递归进入对象和数组，并把上层�
 }
 ```
 
-如果完全识别不到消息对象，THEIA 会把 JSON 的叶子值扁平化成普通文本作为最后降级。这会丢失可靠结构，不应作为正式导入成功的标准。
+如果完全识别不到消息对象，HYPERION 会把 JSON 的叶子值扁平化成普通文本作为最后降级。这会丢失可靠结构，不应作为正式导入成功的标准。
 
 ## 6.1 本地归档与模型请求的边界
 
@@ -308,7 +308,7 @@ THEIA 不要求固定顶层键。它递归进入对象和数组，并把上层�
 
 ## 10. AI 对话导入
 
-THEIA 可以导入你自行导出的 ChatGPT、Gemini、DeepSeek、Claude 等 AI 对话；它不会读取浏览器历史、登录态、在线账户或应用私有数据库。每一个真实对话必须放在独立目录中：
+HYPERION 可以导入你自行导出的 ChatGPT、Gemini、DeepSeek、Claude 等 AI 对话；它不会读取浏览器历史、登录态、在线账户或应用私有数据库。每一个真实对话必须放在独立目录中：
 
 ```text
 聊天导出/
@@ -339,11 +339,11 @@ THEIA 可以导入你自行导出的 ChatGPT、Gemini、DeepSeek、Claude 等 AI
 
 ## 11. 导出器适配建议
 
-如果要为 THEIA 编写适配器，优先输出一个规范化中间格式，而不是让 UI 继续增加平台特例：
+如果要为 HYPERION 编写适配器，优先输出一个规范化中间格式，而不是让 UI 继续增加平台特例：
 
 ```ts
 interface NormalizedMessage {
-  /** Stable within the source archive; THEIA may generate one when omitted. */
+  /** Stable within the source archive; HYPERION may generate one when omitted. */
   id?: string
   /** ISO 8601 timestamp. Keep null/empty when the export cannot verify it. */
   sentAt?: string | null
@@ -368,15 +368,15 @@ interface NormalizedMessage {
 
 ## 12. MNEMO 微信适配器
 
-MNEMO 为 THEIA 的持续本机导入提供一个固定输出契约，而不是另一个手工导入格式。THEIA 只读取完整的 `MNEMO-v1-*/records.json` immutable batch，并依据 record 的稳定 ID 去重。
+MNEMO 为 HYPERION 的持续本机导入提供一个固定输出契约，而不是另一个手工导入格式。HYPERION 只读取完整的 `MNEMO-v1-*/records.json` immutable batch，并依据 record 的稳定 ID 去重。
 
-会话的可读副本由 MNEMO 写到 THEIA 提供的 export root：
+会话的可读副本由 MNEMO 写到 HYPERION 提供的 export root：
 
 ```text
 <export-root>/<account>/direct/<remark-or-nickname>/<remark-or-nickname>.json
 <export-root>/<account>/group/<remark-or-nickname>/<remark-or-nickname>.json
 ```
 
-命名顺序固定为联系人备注、联系人昵称、稳定会话 ID；Windows 非法字符会被替换，只有重名才加 hash 后缀。显示名变更只能改变可读副本路径，绝不能改变 `id` 或 `conversationId`。会话副本 schema 为 `mnemo-conversation-export/v1`，其中的 `messages[].id` 与 THEIA archive 的 MNEMO message ID 一致。
+命名顺序固定为联系人备注、联系人昵称、稳定会话 ID；Windows 非法字符会被替换，只有重名才加 hash 后缀。显示名变更只能改变可读副本路径，绝不能改变 `id` 或 `conversationId`。会话副本 schema 为 `mnemo-conversation-export/v1`，其中的 `messages[].id` 与 HYPERION archive 的 MNEMO message ID 一致。
 
-MNEMO 应只使用它的本机私钥和只读 snapshot。批次、可读导出、日志和 THEIA archive 不得包含私钥、原始密钥材料、base64 头像或绝对头像路径。字段和 runtime 行为见 [MNEMO 集成](MNEMO.md)。
+MNEMO 应只使用它的本机私钥和只读 snapshot。批次、可读导出、日志和 HYPERION archive 不得包含私钥、原始密钥材料、base64 头像或绝对头像路径。字段和 runtime 行为见 [MNEMO 集成](MNEMO.md)。

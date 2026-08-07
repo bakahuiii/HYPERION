@@ -12,7 +12,7 @@ export default tseslint.config(
     ignores: [
       'dist/**',
       'node_modules/**',
-      '.theia-*/**',
+      '.hyperion-*/**',
       '.exe-*/**',
       'release/**',
       'release-bin/**',

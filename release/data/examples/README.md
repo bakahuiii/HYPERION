@@ -1,6 +1,6 @@
 # 示例导入文件
 
-`sample-chat-export.json` 和 `sample-chat-export.csv` 展示 THEIA 可识别的最小字段：
+`sample-chat-export.json` 和 `sample-chat-export.csv` 展示 HYPERION 可识别的最小字段：
 
 - `formattedTime`：消息时间。
 - `type`：消息类型，例如 `text`。

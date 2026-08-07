@@ -1,6 +1,6 @@
 import { localProxyUrl } from './apiUrl'
 
-export const MAP_CONFIG_CHANGED_EVENT = 'theia:map-config-changed'
+export const MAP_CONFIG_CHANGED_EVENT = 'hyperion:map-config-changed'
 
 export interface MapServiceOption {
   id: string

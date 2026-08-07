@@ -1,19 +1,19 @@
-# THEIA
+# HYPERION
 
 [简体中文](README.md) | [English](README.en.md)
 
-THEIA is a local-first personal task-atlas application. It turns conversations and deliberate personal records into reviewable tasks, schedules, people, and places while preserving traceable source evidence.
+HYPERION is a local-first personal task-atlas application. It turns conversations and deliberate personal records into reviewable tasks, schedules, people, and places while preserving traceable source evidence.
 
-Alongside JSON, CSV, and TXT imports, THEIA can manage the local MNEMO WeChat adapter. After the user captures a key once for their own account in MNEMO, the adapter makes read-only local snapshots and continuously delivers deltas to THEIA. Keys, message bodies, and avatars never leave the machine through MNEMO. Records leave the machine only when the user enables model analysis with a configured provider.
+HYPERION automatically manages the local MNEMO WeChat adapter at startup. With the local WeChat desktop app signed in, MNEMO detects the current account database, creates read-only snapshots, and continuously delivers deltas to HYPERION. It waits silently when no local database is ready and reports only archive or batch-data anomalies. Keys, message bodies, and avatars never leave the machine through MNEMO. Records leave the machine only when the user enables model analysis with a configured provider.
 
-> Current source version: `0.6.0`. Windows x64 NSIS and portable builds bundle Electron and Node.js. Tasks, settings, conversation archives, and logs are stored under `%APPDATA%\THEIA` in an installed build. Back up important data regularly.
+> Current source version: `0.6.0`. Windows x64 NSIS and portable builds bundle Electron and Node.js. Tasks, settings, conversation archives, and logs are stored under `%APPDATA%\HYPERION` in an installed build. Back up important data regularly.
 
 ## Changelog
 
 **0.6.0**
 
-- Added MNEMO, a THEIA-managed local WeChat sidecar with idempotent stable IDs and no repeated manual import after one local key capture.
-- Readable conversation copies use the contact remark first and nickname second: `remark-or-nickname/remark-or-nickname.json`. THEIA content-addresses and verifies locally captured avatar files.
+- Added MNEMO, a HYPERION-managed local WeChat sidecar with idempotent stable IDs and no repeated manual import after one local key capture.
+- Readable conversation copies use the contact remark first and nickname second: `remark-or-nickname/remark-or-nickname.json`. HYPERION content-addresses and verifies locally captured avatar files.
 - New archive deltas feed the existing per-conversation incremental analysis watermarks, so the next automatic pass sends only changed messages plus bounded context.
 
 **0.5.0**
@@ -27,21 +27,20 @@ See [Release Notes](docs/RELEASE_NOTES.md) for the full history.
 ## Interface Preview
 
 <p align="center">
-  <img src="docs/screenshots/task-atlas.png" alt="THEIA zoomable task atlas" width="100%">
+  <img src="docs/screenshots/task-atlas.png" alt="HYPERION zoomable task atlas" width="100%">
 </p>
 <p align="center"><sub>A zoomable, pannable task atlas with drag-based classification</sub></p>
 
 <table>
   <tr>
-    <td width="50%" align="center"><img src="docs/screenshots/intel-workbench.png" alt="THEIA intelligence archive and model-analysis workbench"><br><sub>Archive intake and model-analysis workbench</sub></td>
-    <td width="50%" align="center"><img src="docs/screenshots/appearance-customization.png" alt="THEIA appearance customization"><br><sub>Theme, avatar, and global-background customization</sub></td>
+    <td width="50%" align="center"><img src="docs/screenshots/intel-workbench.png" alt="HYPERION intelligence archive and model-analysis workbench"><br><sub>Conversation archive and model-analysis workbench</sub></td>
+    <td width="50%" align="center"><img src="docs/screenshots/appearance-customization.png" alt="HYPERION appearance customization"><br><sub>Theme, avatar, and global-background customization</sub></td>
   </tr>
 </table>
 
 ## Current Capabilities
 
-- Recursively scan exported directories and import JSON, CSV, and TXT grouped by conversation.
-- Manage authorized MNEMO incremental WeChat intake, readable remark/nickname-named conversation copies, and THEIA-owned local avatar storage.
+- Detect the local WeChat database and manage MNEMO incremental intake, readable remark/nickname-named conversation copies, and HYPERION-owned local avatar storage.
 - Preserve message text, time, sender, speaker direction, message type, platform, conversation, and avatar URL.
 - Select full conversations by last-contact time, or strictly crop messages to an exact time interval.
 - Segment oversized conversations continuously without random message sampling, retaining bounded overlap between adjacent segments.
@@ -64,7 +63,7 @@ See [Release Notes](docs/RELEASE_NOTES.md) for the full history.
 | npm | Installed with a supported Node.js version; validated with `11.18.0` |
 | Disk | At least 1 GB for development dependencies, plus archives, media, logs, and release artifacts |
 | Memory | 8 GB minimum recommended; 16 GB or more for hundreds of thousands of messages |
-| Browser | Current Chrome or Edge for browser mode and File System Access API directory connections |
+| Browser | Current Chrome or Edge for browser mode |
 | Network | Required for first dependency install and for remote maps, geocoding, avatars, weather, quotations, or model services |
 | Model service | Optional; analysis requires a valid OpenAI-compatible endpoint and API key |
 
@@ -100,7 +99,7 @@ npm run dist:installer
 
 ### Installer and portable editions
 
-The NSIS installer and portable package include their own runtime; they do not require Node.js or `npm install`. Installed mutable data lives under `%APPDATA%\THEIA`.
+The NSIS installer and portable package include their own runtime; they do not require Node.js or `npm install`. Installed mutable data lives under `%APPDATA%\HYPERION`.
 
 The source-release package is intended for inspection and customization. Install dependencies from its `app` directory, then use the provided desktop or browser launcher from the package root.
 
@@ -109,24 +108,20 @@ The source-release package is intended for inspection and customization. Install
 1. Set a display name, avatar, theme, and global background under Options.
 2. Add an API root and key under Model Provider Pool, then detect and select a model. Add genuinely independent channels only when needed.
 3. Keep API mode on Auto unless the provider requires a specific compatible endpoint.
-4. Import one small example or one private conversation in the Intelligence Archive.
+4. Sign in to local WeChat and leave HYPERION running; MNEMO detects the database and writes the unified archive automatically.
 5. Inspect the conversation and verify time, speaker, and `you / other person` direction.
 6. Run the first analysis with a strict time range. Review candidates and person evidence before expanding scope.
 7. Generate accepted tasks. Dismiss unsuitable candidates with a reason so later prompts can incorporate that feedback.
 
-For the one-time MNEMO setup, local paths, status endpoint, and troubleshooting, see [MNEMO Integration](docs/MNEMO.md). MNEMO complements rather than replaces JSON/CSV/TXT imports.
+For MNEMO setup, local paths, status endpoint, and troubleshooting, see [MNEMO Integration](docs/MNEMO.md). External JSON/CSV/TXT and directory intake are currently disabled.
 
 ## Data Flow
 
 ```text
-User-selected JSON / CSV / TXT          Local MNEMO read-only snapshot
-                |
-                v
-      Browser parsing and deduplication          Immutable deltas
-                |                                      |
-                +------------------+-------------------+
-                |
-                +----> Raw archive (gzip JSONL segments / IndexedDB v2)
+Local WeChat database -> MNEMO read-only snapshot -> HYPERION-owned immutable outbox
+                                                        |
+                                                        v
+                           Raw archive (gzip JSONL segments / IndexedDB v2)
                 |
                 v
       User selects conversations and starts analysis
@@ -149,7 +144,7 @@ Model credentials are sent only to the loopback service. Packaged Electron uses 
 ## Runtime Layout
 
 ```text
-THEIA runtime/
+HYPERION runtime/
   assets/img/
     backgrounds/             user backgrounds
     avatars/                 downloaded and MNEMO-captured contact avatars
@@ -158,7 +153,7 @@ THEIA runtime/
     chat-archive/             append-only gzip JSONL segments
     chat-archive.json.gz      legacy archive retained for migration/rollback
     chat-archive.meta.json    schema and archive watermarks
-    mnemo-inbox/              immutable batches written by MNEMO and read by THEIA
+    mnemo-inbox/              immutable batches written by MNEMO and read by HYPERION
     mnemo-export/             readable conversation copies named by remark or nickname
     settings.ini             appearance, prompts, provider metadata, credentialRef
     credentials.json         Electron safeStorage ciphertext container
@@ -182,7 +177,7 @@ Task logs may contain full conversation text. Never publish runtime `data/`, `lo
 | `npm test` | Run deterministic importer, segmentation, validation, storage, migration, recovery, and provider tests |
 | `npm run test:e2e` | Run task-atlas, drag, map-setting, and storage-health visual tests |
 | `npm run test:desktop-smoke` | Verify Electron startup and safeStorage credential migration in an isolated runtime |
-| `npm run test:unpacked-smoke` | Start the generated unpacked `THEIA.exe` |
+| `npm run test:unpacked-smoke` | Start the generated unpacked `HYPERION.exe` |
 | `npm run build` | Run TypeScript project checks and build `dist/` |
 | `npm run lint` | Run ESLint |
 | `npm run dist:installer` | Build a Windows x64 NSIS installer locally |
@@ -203,8 +198,8 @@ Task logs may contain full conversation text. Never publish runtime `data/`, `lo
 ## Boundaries
 
 - Tasks and person descriptions come from probabilistic models and require user review.
-- Unknown speaker direction remains unknown; THEIA must not infer `you` from a nickname.
+- Unknown speaker direction remains unknown; HYPERION must not infer `you` from a nickname.
 - Maps, weather, quotations, and remote avatars depend on third-party public services and their policies.
-- The minimum automatic-analysis interval is 24 hours and currently requires the application page to stay open.
+- Automatic incremental analysis requires the application to remain open. It can trigger by elapsed time, new-message count, or either condition; after the first full-library run it submits only changed conversations with bounded context.
 - Conversation bodies are not stored in an encrypted database. Protect the Windows account, disk, backups, and runtime directory.
-- MNEMO handles only an account explicitly authorized by its local one-time key capture. It does not bypass login, collect other accounts, transmit keys, or support remote or unauthorized collection.
+- MNEMO handles only the current Windows user's signed-in local WeChat account. It does not bypass login, collect other accounts, transmit keys, or support remote collection.

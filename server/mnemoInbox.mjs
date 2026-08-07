@@ -55,11 +55,17 @@ function normalizeRecord(value, accountId, sourceFile) {
   }
 }
 
+function normalizeDeleteId(value, accountId) {
+  const id = text(value, 420)
+  return id.startsWith(`mnemo:${accountId}:`) ? id : ''
+}
+
 export function normalizeMnemoDocument(value, options = {}) {
   const input = object(value)
   const producer = object(input?.producer)
   const account = object(input?.account)
   const accountId = text(account?.id, 180)
+  const deleteCandidates = Array.isArray(input?.deleteIds) ? input.deleteIds : []
   if (
     !input
     || input.schema !== MNEMO_DELTA_SCHEMA
@@ -69,6 +75,7 @@ export function normalizeMnemoDocument(value, options = {}) {
     || !accountId
     || !Array.isArray(input.records)
     || input.records.length > 10_000
+    || deleteCandidates.length > 10_000
   ) return null
   const sourceFile = text(options.sourceFile, 700)
   const records = new Map()
@@ -76,11 +83,17 @@ export function normalizeMnemoDocument(value, options = {}) {
     const record = normalizeRecord(candidate, accountId, sourceFile)
     if (record) records.set(record.id, record)
   }
-  if (!records.size) return null
+  const deleteIds = new Set()
+  for (const candidate of deleteCandidates) {
+    const id = normalizeDeleteId(candidate, accountId)
+    if (id && !records.has(id)) deleteIds.add(id)
+  }
+  if (!records.size && !deleteIds.size) return null
   return {
     accountId,
     generatedAt: iso(input.generatedAt),
     records: [...records.values()].sort((left, right) => left.capturedAt.localeCompare(right.capturedAt) || left.id.localeCompare(right.id)),
+    deleteIds: [...deleteIds].sort(),
   }
 }
 
@@ -174,12 +187,13 @@ export function createMnemoInboxWatcher(options) {
     if (scanPromise) return scanPromise
     scanPromise = (async () => {
       try {
-        if (!(await stat(root)).isDirectory()) throw new Error('THEIA MNEMO inbox is not a directory')
+        if (!(await stat(root)).isDirectory()) throw new Error('HYPERION MNEMO inbox is not a directory')
         if (!state) state = await readState(statePath)
         const now = Date.now()
         let pendingFiles = 0
         let processedFiles = 0
         let importedRecords = 0
+        let dataIssue = ''
         for (const candidate of await batches(root, maximumBatches)) {
           const relativePath = sourcePath(root, candidate.path)
           const previous = state.files[relativePath]
@@ -202,24 +216,29 @@ export function createMnemoInboxWatcher(options) {
             continue
           }
           let document
-          try { document = JSON.parse(raw.toString('utf8')) } catch { pendingFiles += 1; continue }
+          try { document = JSON.parse(raw.toString('utf8')) } catch {
+            pendingFiles += 1
+            dataIssue = 'MNEMO data batch is not valid JSON.'
+            continue
+          }
           const normalized = normalizeMnemoDocument(document, { sourceFile: relativePath })
           if (!normalized) {
             logger('warn', `ignored invalid MNEMO batch: ${relativePath}`)
-            state.files[relativePath] = { hash, size: afterRead.size, mtimeMs: afterRead.mtimeMs, importedAt: new Date().toISOString(), recordCount: 0 }
-            await writeState(statePath, state)
+            pendingFiles += 1
+            dataIssue = 'MNEMO data batch does not match the expected schema.'
             continue
           }
           const outcome = await onImport(normalized.records, {
             accountId: normalized.accountId,
             sourceFile: relativePath,
             generatedAt: normalized.generatedAt,
+            deleteIds: normalized.deleteIds,
           })
           state.files[relativePath] = { hash, size: afterRead.size, mtimeMs: afterRead.mtimeMs, importedAt: new Date().toISOString(), recordCount: normalized.records.length }
           await writeState(statePath, state)
           processedFiles += 1
           importedRecords += Number(outcome?.importedRecords) || normalized.records.length
-          logger('info', `imported MNEMO batch ${relativePath}: ${normalized.records.length} records`)
+          logger('info', `imported MNEMO batch ${relativePath}: ${normalized.records.length} records, ${normalized.deleteIds.length} deletions`)
         }
         status = {
           ...status,
@@ -228,7 +247,7 @@ export function createMnemoInboxWatcher(options) {
           importedRecords,
           lastScanAt: new Date().toISOString(),
           ...(processedFiles ? { lastSuccessAt: new Date().toISOString() } : {}),
-          lastError: null,
+          lastError: dataIssue || null,
         }
       } catch (error) {
         status = { ...status, lastScanAt: new Date().toISOString(), lastError: error instanceof Error ? error.message : String(error) }

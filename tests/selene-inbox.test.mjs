@@ -49,7 +49,7 @@ test('normalizes SELENE movement while retaining precise coordinates only behind
 })
 
 test('imports a completed immutable snapshot once and retries a partial file', async (context) => {
-  const root = await mkdtemp(join(tmpdir(), 'theia-selene-inbox-'))
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-selene-inbox-'))
   const inbox = join(root, 'inbox')
   const statePath = join(root, 'state', 'selene-inbox.json')
   const firstDirectory = join(inbox, 'SELENE-v1-20260806T170000000Z')
@@ -115,4 +115,48 @@ test('imports a completed immutable snapshot once and retries a partial file', a
   context.after(() => restarted.stop())
   await restarted.start()
   assert.equal(restartedImports.length, 0)
+})
+
+test('keeps a completed snapshot pending while HYPERION shared state initializes', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-selene-startup-'))
+  const inbox = join(root, 'inbox')
+  const statePath = join(root, 'state', 'selene-inbox.json')
+  const snapshotDirectory = join(inbox, 'SELENE-v1-20260807T020000000Z')
+  const snapshotPath = join(snapshotDirectory, 'context-events.json')
+  await mkdir(snapshotDirectory, { recursive: true })
+  await writeFile(snapshotPath, JSON.stringify(snapshot([movementEvent()])), 'utf8')
+  const old = new Date(Date.now() - 3_000)
+  await utimes(snapshotPath, old, old)
+
+  let ready = false
+  let imports = 0
+  const warnings = []
+  const watcher = createSeleneInboxWatcher({
+    directory: inbox,
+    statePath,
+    settleMs: 1_000,
+    intervalMs: 5_000,
+    logger: (level, message) => warnings.push({ level, message }),
+    onImport: async (events) => {
+      imports += 1
+      if (!ready) throw Object.assign(new Error('Shared state is starting'), { code: 'HYPERION_STATE_UNINITIALIZED' })
+      return { added: events.length }
+    },
+  })
+  context.after(() => {
+    watcher.stop()
+    return rm(root, { recursive: true, force: true })
+  })
+
+  const waiting = await watcher.start()
+  assert.equal(imports, 1)
+  assert.equal(waiting.lastError, null)
+  assert.equal(waiting.processedFiles, 0)
+  assert.equal(warnings.length, 0)
+
+  ready = true
+  const imported = await watcher.scan()
+  assert.equal(imports, 2)
+  assert.equal(imported.processedFiles, 1)
+  assert.equal(imported.lastError, null)
 })

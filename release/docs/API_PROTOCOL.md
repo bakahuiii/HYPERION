@@ -1,11 +1,11 @@
-# THEIA 本地 API 与模型协议参考
+# HYPERION 本地 API 与模型协议参考
 
-本文是 THEIA `0.3.0` 的协议级参考，面向前端、桌面壳、第三方导出适配器、测试服务和二次开发者。它描述的是当前 `server/index.mjs` 和 `src/lib/aiClient.ts` 的实际行为，不是未来规划。
+本文是 HYPERION `0.3.0` 的协议级参考，面向前端、桌面壳、第三方导出适配器、测试服务和二次开发者。它描述的是当前 `server/index.mjs` 和 `src/lib/aiClient.ts` 的实际行为，不是未来规划。
 
 协议有两个边界：
 
-1. THEIA 本地 HTTP API 只监听 `127.0.0.1`，供浏览器、Electron renderer 和开发脚本使用。
-2. 本地服务再把经过校验的模型请求转发到用户配置的 OpenAI-compatible 服务。外部服务不会直接访问 THEIA 的本地文件。
+1. HYPERION 本地 HTTP API 只监听 `127.0.0.1`，供浏览器、Electron renderer 和开发脚本使用。
+2. 本地服务再把经过校验的模型请求转发到用户配置的 OpenAI-compatible 服务。外部服务不会直接访问 HYPERION 的本地文件。
 
 本地 API 没有用户认证，不能暴露到局域网或公网。尤其是设置接口会返回当前明文 API Key，这是现有产品为了方便编辑和迁移而保留的行为。
 

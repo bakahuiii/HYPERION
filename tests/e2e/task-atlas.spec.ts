@@ -1,5 +1,13 @@
 import { expect, test } from '@playwright/test'
 
+test('journal keeps one low-friction text entry point and removes direct daily state fields', async ({ page }) => {
+  await page.goto('/')
+  await page.locator('.nav-list .nav-item').nth(4).click()
+  await expect(page.locator('.journal-composer textarea')).toBeVisible()
+  await expect(page.locator('.checkin-panel')).toHaveCount(0)
+  await expect(page.locator('.checkin-history')).toHaveCount(0)
+})
+
 test('task atlas renders, zooms and drags a category without selecting text', async ({ page }) => {
   await page.goto('/')
   const atlas = page.getByRole('region', { name: '按主题组织的任务图' })

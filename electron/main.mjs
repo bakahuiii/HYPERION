@@ -6,25 +6,33 @@ import { dirname, extname, isAbsolute, relative, resolve } from 'node:path'
 import process from 'node:process'
 
 const root = resolve(import.meta.dirname, '..')
-app.setName('THEIA')
+app.setName('HYPERION')
 protocol.registerSchemesAsPrivileged([{
-  scheme: 'theia',
+  scheme: 'hyperion',
   privileges: { standard: true, secure: true, supportFetchAPI: true },
 }])
 // A packaged executable cannot persist data inside app.asar or its temporary
 // extraction directory, so resolve mutable paths before loading server code.
 if (app.isPackaged) {
-  process.env.THEIA_RELEASE_LAYOUT ??= '1'
-  process.env.THEIA_RUNTIME_ROOT ??= app.getPath('userData')
-  process.env.AI_PORT ??= '0'
-  process.env.THEIA_ALLOW_FILE_ORIGIN = '1'
+  process.env.HYPERION_RELEASE_LAYOUT ??= '1'
+  process.env.HYPERION_RUNTIME_ROOT ??= app.getPath('userData')
+  process.env.HYPERION_SELENE_AUTO_DISCOVERY ??= '1'
+  // Iris and other local adapters use the documented loopback endpoint. A
+  // random packaged port would make a healthy HYPERION instance unreachable
+  // unless every adapter first discovered an opaque runtime file.
+  process.env.AI_PORT ??= '8787'
+  process.env.HYPERION_ALLOW_FILE_ORIGIN = '1'
 }
 
-const [{ server, startAiProxy }, { runtimePaths }] = await Promise.all([
+const [{ server, startAiProxy }, { runtimePaths, migrateLegacyRuntimeData }] = await Promise.all([
   import('../server/index.mjs'),
   import('../server/runtimePaths.mjs'),
 ])
 const { recordRuntimeFailure } = await import('../server/crashRecovery.mjs')
+
+// Migrate before Electron creates a new user-data profile. The operation only
+// moves absent destinations and preserves the old files if it cannot proceed.
+await migrateLegacyRuntimeData()
 
 let viteServer
 let mainWindow
@@ -34,7 +42,7 @@ const { electronUserDataPath: userDataPath, desktopPidPath, crashLogPath } = run
 // Large task maps and Leaflet tiles need Chromium compositing and raster work
 // on the GPU. Software rendering remains an explicit fallback for a broken
 // graphics driver, rather than the default for every desktop session.
-const softwareRendering = process.env.THEIA_SOFTWARE_RENDERING === '1'
+const softwareRendering = process.env.HYPERION_SOFTWARE_RENDERING === '1'
 if (softwareRendering) {
   app.disableHardwareAcceleration()
   app.commandLine.appendSwitch('disable-gpu')
@@ -78,7 +86,7 @@ async function startLocalServices() {
     await startAiProxy()
     ownsAiProxy = true
     const address = server.address()
-    if (!address || typeof address === 'string') throw new Error('THEIA local service did not expose a loopback port.')
+    if (!address || typeof address === 'string') throw new Error('HYPERION local service did not expose a loopback port.')
     return `http://127.0.0.1:${address.port}/`
   }
 
@@ -91,7 +99,7 @@ async function startLocalServices() {
     if (error?.code !== 'EADDRINUSE') throw error
   }
 
-  // Do not reuse an arbitrary Vite instance on 5173. It may be a prior THEIA
+  // Do not reuse an arbitrary Vite instance on 5173. It may be a prior HYPERION
   // session serving stale source, which makes the desktop app appear unchanged.
   // Vite selects the next free loopback port when a browser dev session exists.
   viteServer = await createServer({
@@ -116,7 +124,7 @@ async function registerPackagedProtocol() {
     '.svg': 'image/svg+xml',
     '.webp': 'image/webp',
   }
-  protocol.handle('theia', async (request) => {
+  protocol.handle('hyperion', async (request) => {
     try {
       const url = new URL(request.url)
       if (url.hostname !== 'app') return new Response('Not found', { status: 404 })
@@ -133,9 +141,9 @@ async function registerPackagedProtocol() {
 }
 
 function createWindow(apiBase) {
-  const pageUrl = app.isPackaged ? 'theia://app/index.html' : apiBase
+  const pageUrl = app.isPackaged ? 'hyperion://app/index.html' : apiBase
   const window = new BrowserWindow({
-    title: 'THEIA',
+    title: 'HYPERION',
     icon: resolve(import.meta.dirname, 'app-icon.png'),
     width: 1600,
     height: 900,
@@ -149,7 +157,7 @@ function createWindow(apiBase) {
       nodeIntegration: false,
       sandbox: true,
       preload: resolve(import.meta.dirname, 'preload.mjs'),
-      additionalArguments: app.isPackaged ? [`--theia-api-base=${apiBase}`] : [],
+      additionalArguments: app.isPackaged ? [`--hyperion-api-base=${apiBase}`] : [],
     },
   })
   mainWindow = window
@@ -171,7 +179,7 @@ function createWindow(apiBase) {
     let closeTimeout
     const timeout = new Promise((resolveTimeout) => { closeTimeout = setTimeout(resolveTimeout, 8_000) })
     void Promise.race([
-      window.webContents.executeJavaScript('window.theiaFlush ? window.theiaFlush() : Promise.resolve()'),
+      window.webContents.executeJavaScript('window.hyperionFlush ? window.hyperionFlush() : Promise.resolve()'),
       timeout,
     ]).finally(() => {
       clearTimeout(closeTimeout)
@@ -192,12 +200,12 @@ async function enableAutomaticUpdates() {
     if (!autoUpdater) throw new Error('electron-updater did not expose autoUpdater')
     autoUpdater.autoDownload = true
     autoUpdater.autoInstallOnAppQuit = true
-    autoUpdater.on('error', (error) => console.warn(`[THEIA] update check failed: ${error instanceof Error ? error.message : String(error)}`))
+    autoUpdater.on('error', (error) => console.warn(`[HYPERION] update check failed: ${error instanceof Error ? error.message : String(error)}`))
     autoUpdater.on('update-downloaded', (info) => {
       void dialog.showMessageBox(mainWindow, {
         type: 'info',
-        title: 'THEIA 更新已就绪',
-        message: `THEIA ${info.version} 已下载完成。`,
+        title: 'HYPERION 更新已就绪',
+        message: `HYPERION ${info.version} 已下载完成。`,
         detail: '立即重启会先等待当前本地数据写入完成；也可以稍后在退出应用时自动安装。',
         buttons: ['立即重启安装', '稍后'],
         defaultId: 0,
@@ -207,13 +215,13 @@ async function enableAutomaticUpdates() {
     })
     await autoUpdater.checkForUpdatesAndNotify()
   } catch (error) {
-    console.warn(`[THEIA] automatic updates unavailable: ${error instanceof Error ? error.message : String(error)}`)
+    console.warn(`[HYPERION] automatic updates unavailable: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
 if (hasSingleInstanceLock) app.whenReady().then(async () => {
   Menu.setApplicationMenu(null)
-  app.setName('THEIA')
+  app.setName('HYPERION')
   await registerPackagedProtocol()
   writeDesktopPid()
   const apiBase = await startLocalServices()
@@ -232,7 +240,7 @@ app.on('window-all-closed', () => {
 })
 
 // Keep loopback persistence services alive while BrowserWindow's close handler
-// awaits window.theiaFlush(). `before-quit` fires before windows close, whereas
+// awaits window.hyperionFlush(). `before-quit` fires before windows close, whereas
 // `will-quit` runs after their close handlers have completed.
 app.on('will-quit', () => {
   clearDesktopPid()

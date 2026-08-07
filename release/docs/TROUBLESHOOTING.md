@@ -1,4 +1,4 @@
-# THEIA 故障排查手册
+# HYPERION 故障排查手册
 
 本手册按“现象 -> 判断 -> 处理 -> 日志证据”组织。先用最小范围复现，不要在 30 万条记录上反复试错。
 
@@ -35,7 +35,7 @@ Node 版本太旧。Node 20 即使能安装部分包，也不满足 Electron 43/
 
 ### `EPERM`、`EBUSY` 或文件被占用
 
-关闭 THEIA、Vite、编辑器中正在扫描 `node_modules` 的插件和可能锁文件的杀毒软件窗口，再重试。不要用管理员权限作为第一反应；先确认是哪一个进程持有路径。
+关闭 HYPERION、Vite、编辑器中正在扫描 `node_modules` 的插件和可能锁文件的杀毒软件窗口，再重试。不要用管理员权限作为第一反应；先确认是哪一个进程持有路径。
 
 ## 3. 启动问题
 
@@ -43,7 +43,7 @@ Node 版本太旧。Node 20 即使能安装部分包，也不满足 Electron 43/
 
 Electron profile 正被另一实例使用。发布版用根目录启动脚本结束该发布目录的旧 PID。若仍失败：
 
-1. 关闭所有 THEIA 窗口。
+1. 关闭所有 HYPERION 窗口。
 2. 在任务管理器确认没有对应 Electron 进程。
 3. 确认没有同时从两个终端启动同一发布目录。
 4. 退出后备份并删除仅该发布目录的 `data/runtime/desktop.pid`；不要删除整个用户目录。
@@ -64,11 +64,11 @@ netstat -ano -p tcp | Select-String ':8787'
 
 ### Vite `EBUSY ... Cookies` watcher 错误
 
-当前 `vite.config.ts` 已排除 `.theia-user-data/**` 和 `data/electron/**`。如果仍出现，确认运行的是新版本配置，并且 `THEIA_RUNTIME_ROOT` 没有错误指向源码树内未被排除的其他 Chromium profile。
+当前 `vite.config.ts` 已排除 `.hyperion-user-data/**` 和 `data/electron/**`。如果仍出现，确认运行的是新版本配置，并且 `HYPERION_RUNTIME_ROOT` 没有错误指向源码树内未被排除的其他 Chromium profile。
 
 ### Electron cache `Unable to create cache`
 
-通常是旧实例仍持有 profile、目录权限不足或杀毒软件锁定。先关闭旧实例，用项目/发布启动器重新打开。当前 Electron 设置独立 userData/sessionData；不要给两个发布副本配置同一个 `THEIA_RUNTIME_ROOT`。
+通常是旧实例仍持有 profile、目录权限不足或杀毒软件锁定。先关闭旧实例，用项目/发布启动器重新打开。当前 Electron 设置独立 userData/sessionData；不要给两个发布副本配置同一个 `HYPERION_RUNTIME_ROOT`。
 
 ## 4. 窗口、GPU 和卡顿
 
@@ -77,8 +77,8 @@ netstat -ano -p tcp | Select-String ':8787'
 更新显卡驱动。临时用软件渲染验证：
 
 ```cmd
-set THEIA_SOFTWARE_RENDERING=1
-启动 THEIA 桌面版.cmd
+set HYPERION_SOFTWARE_RENDERING=1
+启动 HYPERION 桌面版.cmd
 ```
 
 若软件渲染正常，问题多半在 Chromium/驱动。软件模式任务图和地图会更卡，不应长期作为性能方案。
@@ -112,7 +112,7 @@ data/settings.ini
 在“选项 -> 数据与存储”确认应用显示的 workspace 是当前发布目录，而不是另一个复制件。常见原因：
 
 - 从源码和发布目录分别启动，实际用了两套数据；
-- `THEIA_RUNTIME_ROOT` 指向别处；
+- `HYPERION_RUNTIME_ROOT` 指向别处；
 - 目录只读或被同步软件占用；
 - 关闭窗口时另一个旧页面写回旧快照；
 - JSON 写入时磁盘满或杀毒软件锁 `.tmp`。
@@ -131,7 +131,7 @@ data/settings.ini
 
 ### 只能检测到少量会话
 
-检查目录层次。THEIA 以 `私聊/A` 或 `群聊/B` 为会话，不以每个 JSON 文件为会话。若所有文件都位于 `私聊/` 根下，它们可能共享不正确边界。推荐一个会话一个子文件夹。
+检查目录层次。HYPERION 以 `私聊/A` 或 `群聊/B` 为会话，不以每个 JSON 文件为会话。若所有文件都位于 `私聊/` 根下，它们可能共享不正确边界。推荐一个会话一个子文件夹。
 
 其他限制：单文件 50 MB、最多 20,000 文件、深度 24、只支持 JSON/CSV/TXT。被跳过文件不会自动变成会话。
 
@@ -178,11 +178,11 @@ Key 无效、过期、复制了空格，或 Key 属于另一个平台。不要�
 
 ### 404/405/422
 
-兼容通道可能不支持 Responses 或 JSON Schema。API 模式设为自动后，THEIA 会在允许错误上回退 Chat Completions，并在 schema 400/422 时再回退 `json_object`。若明确模式仍报错，改为通道实际支持的模式。
+兼容通道可能不支持 Responses 或 JSON Schema。API 模式设为自动后，HYPERION 会在允许错误上回退 Chat Completions，并在 schema 400/422 时再回退 `json_object`。若明确模式仍报错，改为通道实际支持的模式。
 
 ### 429
 
-频率或配额限制。THEIA 会最多重试 5 次并尊重 `retry_after`，故障通道会单独冷却，但不会无限轰炸服务。先降低该通道的“并发容量”；若服务商允许，也可以添加一条真正独立的 API 通道分担不同会话。多个 Key 若属于同一账户、同一中转或同一上游，通常仍共享额度。
+频率或配额限制。HYPERION 会最多重试 5 次并尊重 `retry_after`，故障通道会单独冷却，但不会无限轰炸服务。先降低该通道的“并发容量”；若服务商允许，也可以添加一条真正独立的 API 通道分担不同会话。多个 Key 若属于同一账户、同一中转或同一上游，通常仍共享额度。
 
 ### 502/503/504
 
@@ -306,7 +306,7 @@ UI 的“0 候选”不是单一故障码。依次看：
 工作日志第一行：
 
 ```json
-{"schema":"theia-task-log/v1","startedAt":"...","kind":"task-analysis","request":{"conversation":{},"records":[]}}
+{"schema":"hyperion-task-log/v1","startedAt":"...","kind":"task-analysis","request":{"conversation":{},"records":[]}}
 ```
 
 后续行记录 completed/failed/fallback 等事件。排查时核对同一文件内：

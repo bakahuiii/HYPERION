@@ -1,8 +1,12 @@
 import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { defineConfig } from '@playwright/test'
 
-const edgePath = process.platform === 'win32' && existsSync('C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe')
-  ? 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
+const edgeCandidate = process.env['ProgramFiles(x86)']
+  ? join(process.env['ProgramFiles(x86)'], 'Microsoft', 'Edge', 'Application', 'msedge.exe')
+  : ''
+const edgePath = process.platform === 'win32' && edgeCandidate && existsSync(edgeCandidate)
+  ? edgeCandidate
   : undefined
 
 export default defineConfig({

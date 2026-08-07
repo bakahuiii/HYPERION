@@ -1,7 +1,7 @@
 {
-  "name": "theia",
+  "name": "hyperion",
   "private": true,
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Local-first personal task atlas built from user-exported conversations.",
   "author": "bakahuiii",
   "type": "module",
@@ -49,11 +49,11 @@
     "data:rollback": "node scripts/rollback-data.mjs"
   },
   "build": {
-    "appId": "io.github.bakahuiii.theia",
-    "productName": "THEIA",
+    "appId": "io.github.bakahuiii.hyperion",
+    "productName": "HYPERION",
     "electronDist": "node_modules/electron/dist",
     "asar": true,
-    "artifactName": "THEIA-${version}-${arch}-${os}.${ext}",
+    "artifactName": "HYPERION-${version}-${arch}-${os}.${ext}",
     "directories": {
       "output": "release-bin/installer"
     },
@@ -85,7 +85,7 @@
     "publish": {
       "provider": "github",
       "owner": "bakahuiii",
-      "repo": "THEIA",
+      "repo": "HYPERION",
       "releaseType": "release"
     }
   },

@@ -5,21 +5,21 @@ import { normalizeProviderRecords } from '../server/settings.mjs'
 
 test('protected secondary channels never inherit the ambient API key', () => {
   const previous = process.env.OPENAI_API_KEY
-  const previousOptIn = process.env.THEIA_USE_ENV_PROVIDER
+  const previousOptIn = process.env.HYPERION_USE_ENV_PROVIDER
   process.env.OPENAI_API_KEY = 'ambient-key-must-not-enter-a-saved-channel'
-  process.env.THEIA_USE_ENV_PROVIDER = '1'
+  process.env.HYPERION_USE_ENV_PROVIDER = '1'
   try {
     const records = normalizeProviderRecords([
       {
         id: 'primary',
         name: 'Primary',
-        credentialRef: 'theia/provider/primary',
+        credentialRef: 'hyperion/provider/primary',
         baseURL: 'https://relay.example/v1',
       },
       {
         id: 'secondary',
         name: 'Secondary',
-        credentialRef: 'theia/provider/secondary',
+        credentialRef: 'hyperion/provider/secondary',
         baseURL: 'https://relay.example/v1',
       },
     ], {
@@ -35,11 +35,11 @@ test('protected secondary channels never inherit the ambient API key', () => {
 
     assert.equal(records[0].apiKey, '')
     assert.equal(records[1].apiKey, '')
-    assert.equal(records[1].credentialRef, 'theia/provider/secondary')
+    assert.equal(records[1].credentialRef, 'hyperion/provider/secondary')
   } finally {
     if (previous === undefined) delete process.env.OPENAI_API_KEY
     else process.env.OPENAI_API_KEY = previous
-    if (previousOptIn === undefined) delete process.env.THEIA_USE_ENV_PROVIDER
-    else process.env.THEIA_USE_ENV_PROVIDER = previousOptIn
+    if (previousOptIn === undefined) delete process.env.HYPERION_USE_ENV_PROVIDER
+    else process.env.HYPERION_USE_ENV_PROVIDER = previousOptIn
   }
 })

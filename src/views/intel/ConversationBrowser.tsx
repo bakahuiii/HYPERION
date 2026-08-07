@@ -7,6 +7,7 @@ import type { IntelItem } from '../../types'
 
 const MESSAGE_ROW_HEIGHT = 118
 const MESSAGE_OVERSCAN = 5
+const CONVERSATION_RENDER_BATCH_SIZE = 120
 
 interface ConversationBrowserProps {
   open: boolean
@@ -55,16 +56,21 @@ export function ConversationBrowser({
   const [selectedConversationError, setSelectedConversationError] = useState('')
   const [messageScrollTop, setMessageScrollTop] = useState(0)
   const [messageViewportHeight, setMessageViewportHeight] = useState(600)
+  const [conversationRenderLimit, setConversationRenderLimit] = useState(CONVERSATION_RENDER_BATCH_SIZE)
   const messageListRef = useRef<HTMLDivElement>(null)
   const messageScrollFrame = useRef(0)
   const pendingMessageScrollTop = useRef(0)
   const selectedRequestRef = useRef(0)
-  const visibleConversations = useMemo(() => {
+  const matchingConversations = useMemo(() => {
     const query = conversationSearch.trim().toLocaleLowerCase()
     return query
       ? filteredConversations.filter((conversation) => conversation.name.toLocaleLowerCase().includes(query))
       : filteredConversations
   }, [conversationSearch, filteredConversations])
+  const visibleConversations = useMemo(
+    () => matchingConversations.slice(0, conversationSearch.trim() ? CONVERSATION_RENDER_BATCH_SIZE : conversationRenderLimit),
+    [conversationRenderLimit, conversationSearch, matchingConversations],
+  )
   const conversationsByPeriod = useMemo(() => {
     const groups = new Map<string, ArchiveConversationSummary[]>()
     for (const conversation of visibleConversations) {
@@ -178,7 +184,7 @@ export function ConversationBrowser({
 
   return (
     <section className={`intel-list-section conversation-section intel-collapsible-section ${open ? 'is-open' : 'is-collapsed'}`}>
-      <div className="list-heading"><div><span className="section-kicker">LOCAL CONVERSATIONS · 原始对话目录</span><h2><button type="button" className="intel-section-toggle" aria-expanded={open} onClick={onToggleOpen}>对话档案<ChevronDown size={17} /></button></h2></div><div className="list-heading-actions"><label className="conversation-search"><Search size={15} /><input type="search" value={conversationSearch} onChange={(event) => setConversationSearch(event.target.value)} placeholder="搜索会话名称" aria-label="搜索会话名称" />{conversationSearch && <button type="button" aria-label="清除会话搜索" title="清除会话搜索" onClick={() => setConversationSearch('')}><X size={14} /></button>}</label><span>{visibleConversations.length}/{filteredConversations.length} 个对话{filteredConversations.length !== conversations.length ? ` · 全部 ${conversations.length}` : ''}</span></div></div>
+      <div className="list-heading"><div><span className="section-kicker">LOCAL CONVERSATIONS · 原始对话目录</span><h2><button type="button" className="intel-section-toggle" aria-expanded={open} onClick={onToggleOpen}>对话档案<ChevronDown size={17} /></button></h2></div><div className="list-heading-actions"><label className="conversation-search"><Search size={15} /><input type="search" value={conversationSearch} onChange={(event) => { setConversationSearch(event.target.value); if (event.target.value.trim()) onOpen() }} placeholder="搜索会话名称" aria-label="搜索会话名称" />{conversationSearch && <button type="button" aria-label="清除会话搜索" title="清除会话搜索" onClick={() => setConversationSearch('')}><X size={14} /></button>}</label><span>{visibleConversations.length}/{matchingConversations.length} 个对话{matchingConversations.length !== conversations.length ? ` · 全部 ${conversations.length}` : ''}</span></div></div>
       {open && <>
         <div className="bulk-note">这里是去重后的原始消息档案，不是模型候选。每个文件夹或导出会话被归为一个对话；按最后聊天时间倒序和月份分组。选择时间范围后，显示范围与模型提炼范围一致。</div>
         <div className="conversation-timeline">
@@ -196,6 +202,7 @@ export function ConversationBrowser({
           </section>)}
           {!visibleConversations.length && <p className="empty-note">{conversationSearch.trim() ? '没有名称匹配的对话。' : '当前时间范围内没有最后聊天时间可匹配的对话。'}</p>}
         </div>
+        {visibleConversations.length < matchingConversations.length && <button type="button" className="secondary-button conversation-load-more" onClick={() => setConversationRenderLimit((current) => current + CONVERSATION_RENDER_BATCH_SIZE)}>继续显示更多会话（已显示 {formatCount(visibleConversations.length)}/{formatCount(matchingConversations.length)} 个）</button>}
         {selectedConversation && <section className="conversation-detail" aria-label={`${selectedConversation.name} 的对话内容`}>
           <div className="conversation-detail-heading"><div><span className="section-kicker">DIALOGUE · 按消息时间排序</span><h3>{selectedConversation.name}</h3><p>{selectedConversation.source} · {selectedConversation.kind === 'group' ? '群聊' : selectedConversation.kind === 'direct' ? '私聊' : '对话'} · {formatCount(selectedConversationRecordCount || selectedConversation.recordCount)} 条消息 · 最后聊天 {formatChatTime(selectedConversation.lastAt)}</p></div><button type="button" className="icon-button" title="关闭对话内容" aria-label="关闭对话内容" onClick={() => setSelectedConversationId(undefined)}><X size={16} /></button></div>
           <div ref={messageListRef} className="conversation-message-list" onScroll={(event) => handleMessageScroll(event.currentTarget.scrollTop)}><div className="conversation-message-spacer" style={{ height: `${selectedConversationRecords.length * MESSAGE_ROW_HEIGHT}px` }}><div className="conversation-message-window" style={{ transform: `translateY(${firstMessage * MESSAGE_ROW_HEIGHT}px)` }}>{renderedMessages.map((item) => <article className="conversation-message" style={{ height: `${MESSAGE_ROW_HEIGHT}px` }} key={item.id}><div><span>{item.speakerRole === 'self' ? '本人发言' : item.speakerRole === 'other' ? '对方发言' : '发言方向未确认'}</span>{item.speaker && <strong>{item.speaker}</strong>}{item.messageType && <em>类型：{item.messageType}</em>}<time>{formatChatTime(item.capturedAt)}</time></div><p title={item.content || item.summary}>{item.content || item.summary}</p></article>)}</div></div></div>

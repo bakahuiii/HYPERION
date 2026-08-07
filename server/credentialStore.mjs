@@ -5,7 +5,7 @@ import { runtimePaths } from './runtimePaths.mjs'
 import { writeFileAtomically } from './atomicFile.mjs'
 
 const { credentialStorePath } = runtimePaths
-const SERVICE_NAME = 'THEIA'
+const SERVICE_NAME = 'HYPERION'
 let backendPromise
 let credentialCache = new Map()
 let writeQueue = Promise.resolve()

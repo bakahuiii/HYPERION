@@ -40,7 +40,7 @@ export async function writeFileAtomically(path, data, options) {
   } catch (error) {
     // Keep the previous destination untouched when replacement fails. The
     // unique temporary is safe to remove and will never collide with a
-    // concurrent writer from another THEIA process.
+    // concurrent writer from another HYPERION process.
     await unlink(temporary).catch(() => undefined)
     throw error
   }

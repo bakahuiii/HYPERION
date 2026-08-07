@@ -1,4 +1,4 @@
-# THEIA 开发者文档
+# HYPERION 开发者文档
 
 > 自 `0.4.2` 后，主动记录是与导入对话同等的一级数据。它服务于可回看、可校验的长期自我研究，不是被动抓取或监控能力。
 
@@ -22,7 +22,7 @@ buildSelfAnalysisInput(items, dailyCheckins) => {
 
 ### 自我分析流水线
 
-从情报库勾选“自我”并启动提炼后，THEIA 使用如下独立流程。打开“记录”页、保存日记或查看状态快照本身不会把数据发送给模型。
+从情报库勾选“自我”并启动提炼后，HYPERION 使用如下独立流程。打开“记录”页、保存日记或查看状态快照本身不会把数据发送给模型。
 
 ```text
 已确认的本人发言 + 手动日记 + 每日快照 + AI 对话导入中 isSelf=true 的消息
@@ -41,11 +41,11 @@ buildSelfAnalysisInput(items, dailyCheckins) => {
 
 [简体中文](DEVELOPER_GUIDE.md) | [English](DEVELOPER_GUIDE.en.md)
 
-本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.6.0` 源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理、MNEMO 和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 与 [MNEMO 集成](MNEMO.md) 的定义为准。
+本文面向维护、审查、二次开发和发布 HYPERION 的工程人员。内容对应 `0.6.0` 源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理、MNEMO 和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 与 [MNEMO 集成](MNEMO.md) 的定义为准。
 
 ## 1. 项目定位与工程边界
 
-THEIA 当前是单用户、本地优先的个人现实任务图应用。用户主动提供导出文件，本地前端负责解析和选择，本地 Node.js 服务负责持久化、受控媒体代理及模型转发，外部模型只接收用户主动提交的范围。工程实现必须保留时间、来源、发言方向和版本；推断不得伪装成事实；人物刻画不得把零散瞬时状态拼成确定性标签；建议不得演变为预测、评分、操控或道德裁决。
+HYPERION 当前是单用户、本地优先的个人现实任务图应用。用户主动提供导出文件，本地前端负责解析和选择，本地 Node.js 服务负责持久化、受控媒体代理及模型转发，外部模型只接收用户主动提交的范围。工程实现必须保留时间、来源、发言方向和版本；推断不得伪装成事实；人物刻画不得把零散瞬时状态拼成确定性标签；建议不得演变为预测、评分、操控或道德裁决。
 
 项目明确不实现：
 
@@ -56,7 +56,7 @@ THEIA 当前是单用户、本地优先的个人现实任务图应用。用户�
 - 把模型输出当作无需审核的事实数据库；
 - 云端账号、多人协作和远程同步。
 
-MNEMO 是唯一的例外路径：仅在用户为本人账号在本机完成一次密钥捕获后，独立的 MNEMO 进程才可创建该账号数据库的只读解密快照。密钥不进入 THEIA 的状态、归档、日志或模型请求；THEIA 只管理 agent 生命周期、outbox、可读导出与头像缓存。
+MNEMO 是唯一的例外路径：仅在用户为本人账号在本机完成一次密钥捕获后，独立的 MNEMO 进程才可创建该账号数据库的只读解密快照。密钥不进入 HYPERION 的状态、归档、日志或模型请求；HYPERION 只管理 agent 生命周期、outbox、可读导出与头像缓存。
 
 当前发布形态包含源码包、便携包和 electron-builder NSIS 安装器。已有本地崩溃恢复标记、schema 迁移备份、回滚脚本和 GitHub Release 更新检查；项目没有远程崩溃上报或遥测。Windows 签名是发布环境的可选步骤，本地无证书构建不会失败。聊天正文归档不加密；桌面版 API Key 使用系统凭据加密，纯 Node 开发模式有明文兼容回退。
 
@@ -115,16 +115,16 @@ MNEMO 是唯一的例外路径：仅在用户为本人账号在本机完成一�
 └─ package.json
 ```
 
-`App.tsx` 仍保留领域状态和任务图编排；共享同步位于 `useSharedSync.ts`，通用设置位于 `useSettingsSync.ts`。任务/人物串联、暂停检查点、恢复、失败重试和定时运行位于 `useAiWorkflow.ts`，不得把跨分钟请求闭包重新绑定到渲染时的旧 `data`。`IntelView.tsx` 只编排 `ArchivePanel`、`AnalysisPanel`、`CandidateQueue` 和 `ConversationBrowser`；时间线选择由 `useIntelAnalysisSelection.ts` 负责。
+`App.tsx` 仍保留领域状态和任务图编排；共享同步位于 `useSharedSync.ts`，通用设置位于 `useSettingsSync.ts`。任务/人物串联、暂停检查点、恢复、失败重试和定时运行位于 `useAiWorkflow.ts`，不得把跨分钟请求闭包重新绑定到渲染时的旧 `data`。`IntelView.tsx` 只编排 `AnalysisPanel`、`CandidateQueue` 和 `ConversationBrowser`；时间线选择由 `useIntelAnalysisSelection.ts` 负责。
 
-导入器以 1 MiB 为前后台分界：小文件直接调用 `parseIntelFileContent`，大文件通过 module Worker `workers/intelParser.worker.ts` 解析。File 由 structured clone 传入 Worker，结果仍经过同一套 ID、时间、会话和头像规则，Node 测试环境没有 Worker 时自动走直接路径。
+`src/lib/importer.ts` 与 `workers/intelParser.worker.ts` 暂时只保留给兼容测试；没有情报库 UI、目录恢复或服务端入口调用它们。生产聊天数据只能经 HYPERION 托管的 MNEMO 收件箱进入归档。
 
 ### 3.1 大归档存储边界
 
 `server/archiveStore.mjs` 是本机原始聊天归档的写入边界。它按 segment 顺序重放得到内存索引，但磁盘写入只追加一个 gzip JSONL segment：首段 `kind=snapshot`，增量段 `kind=delta`。每段首行是：
 
 ```json
-{"schema":"theia-intel-archive/v1","schemaVersion":1,"kind":"delta","updatedAt":"2026-08-04T00:00:00.001Z","sourceFingerprint":"sha256:..."}
+{"schema":"hyperion-intel-archive/v1","schemaVersion":1,"kind":"delta","updatedAt":"2026-08-04T00:00:00.001Z","sourceFingerprint":"sha256:..."}
 ```
 
 后续行只能是 `{ "op": "upsert", "item": {...} }` 或 `{ "op": "delete", "id": "..." }`。服务端在 `expectedUpdatedAt` 不匹配时返回 409，不能盲写。`/api/sync/intel/delta` 只接受 `upserts`、`deleteIds`、`sourceFingerprint` 和可选 `expectedUpdatedAt`。前端只有在已建立签名基线且变更量较小时使用 delta；否则使用全量 snapshot 兼容路径。
@@ -139,7 +139,7 @@ MNEMO 是唯一的例外路径：仅在用户为本人账号在本机完成一�
 | --- | --- | --- |
 | 启动 | 当本地归档索引可用且记录数超过 **25,000 条** 时，不把原始记录复制进 React 状态。 | 阈值以下仍可能走旧兼容加载；阈值以上若发现完整归档进入界面状态，应视为性能问题排查。 |
 | 会话浏览 | 列表只读取紧凑索引；打开一个会话每页加载 **250 条**，已加载行虚拟化。 | 大量会话可保持列表可用，但连续点“继续加载”仍会把该会话正文累积到浏览器页内。 |
-| 导入解析 | 大于 **1 MiB** 的 JSON/CSV/TXT 走 Worker。 | 深层或异常导出仍可能耗尽 renderer 内存；应按目录导入并保留原始导出备份。 |
+| MNEMO 接入 | sidecar 每 30 秒检测当前本机微信数据库，HYPERION 只消费其自有 outbox。 | 未发现数据库或可用密钥时静默等待；稳定 JSON/schema 异常会进入情报库错误提示，绝不导入。 |
 | 归档存储 | 磁盘以 append-only gzip JSONL delta 写入，使用 SHA-256 元数据与压实。 | 服务重载目前仍会重建内存 `Map`，上限仍受 Node/Electron 可用内存约束。 |
 | 提炼 | 用户触发的提炼桥接仍会为完整时间线读取所选原始归档，再生成连续分段。 | 这不是百万消息安全路径。**10 万条以上**进入高规模模式，应先跑合成基准并观察内存；**100 万条**目前只是待验证目标，不能宣称已支持。 |
 | 模型请求 | 任务默认 48 条核心记录 / 约 4,000 个紧凑字符；人物默认 320 条 / 约 24,000 个字符，均有受限 overlap。 | ensemble 的自定义 profile 只有经过对应服务实测才能放大；过长请求仍可能造成中转超时或 502。 |
@@ -187,7 +187,7 @@ enable-zero-copy
 enable-features=CanvasOopRasterization
 ```
 
-设置 `THEIA_SOFTWARE_RENDERING=1` 后调用 `app.disableHardwareAcceleration()`，并追加 `disable-gpu`、`disable-gpu-compositing`、`in-process-gpu`。任务图拖拽用 `requestAnimationFrame` 合并 DOM 写入；Leaflet 使用 `preferCanvas: true`。不要为规避个别驱动错误默认关闭所有用户的 GPU。
+设置 `HYPERION_SOFTWARE_RENDERING=1` 后调用 `app.disableHardwareAcceleration()`，并追加 `disable-gpu`、`disable-gpu-compositing`、`in-process-gpu`。任务图拖拽用 `requestAnimationFrame` 合并 DOM 写入；Leaflet 使用 `preferCanvas: true`。不要为规避个别驱动错误默认关闭所有用户的 GPU。
 
 ## 5. 领域模型
 
@@ -225,7 +225,7 @@ enable-features=CanvasOopRasterization
 
 ## 6. 状态所有权与持久化
 
-THEIA 刻意把大对象和频繁编辑对象分开。
+HYPERION 刻意把大对象和频繁编辑对象分开。
 
 ```text
 AppData（React 内存）
@@ -236,9 +236,8 @@ AppData（React 内存）
 
 ### 6.1 浏览器缓存
 
-- localStorage key：`theia-atlas-data-v1`。保存 `AppData` 但强制把 `intel` 写为空数组，避免超大同步阻塞。
-- IndexedDB `theia-data/snapshots/intel`：保存原始 `IntelItem[]`。
-- IndexedDB `theia-automation/handles/export-directory`：保存 File System Access API 目录句柄。
+- localStorage key：`hyperion-atlas-data-v1`。保存 `AppData` 但强制把 `intel` 写为空数组，避免超大同步阻塞。
+- IndexedDB `hyperion-data/snapshots/intel`：保存原始 `IntelItem[]`。
 
 浏览器缓存是性能和恢复辅助，不是跨浏览器共享的唯一真相。
 
@@ -248,16 +247,16 @@ AppData（React 内存）
 
 | 内容 | 路径 |
 | --- | --- |
-| 轻量快照 | `.theia-shared-state.json` |
-| 原始归档 | `.theia-shared-intel.json.gz`（兼容读取旧 JSON） |
-| 通用设置 | `.theia-settings.ini` |
-| 摘要日志 | `.theia-ai-debug.log` |
-| 工作日志 | `.theia-task-logs/` |
-| 头像缓存 | `.theia-avatar-cache/` |
-| 背景 | `.theia-backgrounds/` |
-| Electron profile | `.theia-user-data/` |
+| 轻量快照 | `.hyperion-shared-state.json` |
+| 原始归档 | `.hyperion-shared-intel.json.gz`（兼容读取旧 JSON） |
+| 通用设置 | `.hyperion-settings.ini` |
+| 摘要日志 | `.hyperion-ai-debug.log` |
+| 工作日志 | `.hyperion-task-logs/` |
+| 头像缓存 | `.hyperion-avatar-cache/` |
+| 背景 | `.hyperion-backgrounds/` |
+| Electron profile | `.hyperion-user-data/` |
 
-发布布局由 `THEIA_RELEASE_LAYOUT=1` 和 `THEIA_RUNTIME_ROOT` 激活：
+发布布局由 `HYPERION_RELEASE_LAYOUT=1` 和 `HYPERION_RUNTIME_ROOT` 激活：
 
 | 内容 | 路径 |
 | --- | --- |
@@ -283,7 +282,7 @@ AppData（React 内存）
 
 ### 6.4 大归档基线（开发中）
 
-`server/archiveStore.mjs` 的追加式归档本体保持 `theia-intel-archive/v1`：首段是 snapshot，之后是按稳定 `id` 写入的 upsert/delete delta，达到 compaction 阈值时先安全写入新 snapshot、更新元数据、再删除旧段并第二次更新元数据。这样任意时刻至少存在一条可重建当前状态的路径。
+`server/archiveStore.mjs` 的追加式归档本体保持 `hyperion-intel-archive/v1`：首段是 snapshot，之后是按稳定 `id` 写入的 upsert/delete delta，达到 compaction 阈值时先安全写入新 snapshot、更新元数据、再删除旧段并第二次更新元数据。这样任意时刻至少存在一条可重建当前状态的路径。
 
 从本开发基线起，`chat-archive.meta.json` 的 `metadataVersion: 2` 记录每个现存 gzip 段的 SHA-256、压缩大小、操作数与完整性状态。元数据是可丢失的索引缓存，不是唯一真相：缺失时从分段恢复并标记 `recovered-unindexed`；哈希不匹配时拒绝读取；无实际变化的 delta 不写新段。运行进程以文件名清单判断是否有外部进程提交了新段，未变化时复用已加载 map，避免每一次小的同步都重新解压全部段。
 
@@ -298,44 +297,15 @@ npm run bench:archive -- --records=1000000 --batch-size=10000
 
 记录写入耗时、冷启动读取与 hash 校验耗时、归档段数、分页首屏大小、heap 和 RSS。基准结果必须注明 Node/Electron 版本、磁盘类型、记录数和 batch 大小；不要用用户真实聊天作为可提交的基准样本。
 
-## 7. 导入流水线
+## 7. 统一聊天接入
 
-入口为 `src/lib/importer.ts` 和 `src/lib/directorySync.ts`。
+生产聊天数据只有一条入口：`server/mnemoAgent.mjs` 启动 sibling MNEMO 的 `python/mnemo_agent.py`，并把 HYPERION 自有的 inbox、可读导出和头像缓存目录显式传给它。agent 每 30 秒重新发现当前 Windows 用户的本机微信账号；没有账号目录或可用进程密钥时必须维持存活并输出 `mnemo-status: waiting`，不得以 stderr 作为异常上报。发现数据库后，agent 建立只读 snapshot，读取 `contact.db` 的 `remark -> nick_name` 映射、读取 `head_image.db` 的图像 blob，并写入 immutable `MNEMO-v1-*/records.json`。HYPERION 不读取 MNEMO 私钥，也不允许 agent 直接写 append-only archive。
 
-### 7.1 MNEMO sidecar
+`server/mnemoInbox.mjs` 只监听 `runtimePaths.mnemoInboxDirectoryPath`，不得恢复 `HYPERION_MNEMO_INBOX` 或其他外部路径。它只接收 `mnemo-delta/v1`，在稳定时间后读取完整批次，按文件 SHA-256 记录处理状态，再将经过限长和枚举校验的 records 交给 `writeSharedIntelDelta`。稳定 message ID 不得依赖 display name；可读导出以备注、昵称、必要时 hash 后缀命名。MNEMO avatar 必须先经二进制签名校验，按 SHA-256 写入 HYPERION 头像缓存；归档只保留 `/api/media/avatar/local?id=<hash>`。
 
-`server/mnemoAgent.mjs` 以子进程启动 `python/mnemo_agent.py`，并将 THEIA 的 inbox、可读导出和头像缓存目录显式传给它。agent 在每次源指纹变化时建立只读 snapshot，读取 `contact.db` 的 `remark -> nick_name` 映射、读取 `head_image.db` 的图像 blob，并写入 immutable `MNEMO-v1-*/records.json`。THEIA 不读取 MNEMO 私钥，也不允许 agent 直接写 append-only archive。
+情报库不显示健康的接入状态，也不提供 JSON/CSV/TXT 文件选择、目录授权或目录自动扫描。只在以下情况显示错误：MNEMO 进程不可启动或异常退出、归档读取失败、稳定的 batch 不是 JSON、或 batch 不符合 `mnemo-delta/v1` schema。`src/lib/importer.ts`、`src/lib/directorySync.ts` 和 parser worker 暂时只能由兼容测试使用，恢复它们必须重新设计并审查数据所有权与错误模型。
 
-`server/mnemoInbox.mjs` 仅接收 `mnemo-delta/v1`，在稳定时间后读取完整批次，按文件 SHA-256 记录处理状态，再将经过限长和枚举校验的 records 交给 `writeSharedIntelDelta`。稳定 message ID 不得依赖 display name；可读导出以备注、昵称、必要时 hash 后缀命名。MNEMO avatar 必须先经二进制签名校验，按 SHA-256 写入 THEIA 头像缓存；归档只保留 `/api/media/avatar/local?id=<hash>`。
-
-### 7.2 文件发现
-
-- 扩展名：JSON、CSV、TXT；
-- 最大 20,000 文件；
-- 最大深度 24；
-- 单文件最大 50 MB；
-- 签名：导入器版本 + 路径 + 文件大小 + `lastModified`；
-- 当前签名版本：`session-avatar-v1`。
-
-一个分类文件夹下一层被视为会话身份。例如 `私聊/A/data/messages.json` 与 `私聊/A/media/index.json` 都归入 `私聊/A`，不会被误算成两个会话。
-
-### 7.3 JSON
-
-递归遍历对象/数组，继承上层时间、发言人、头像、类型和方向上下文。记录层找到正文后停止继续把其子字段重复当作消息。没有识别到结构化消息时，最后才把 JSON 扁平化为文本行，这种降级模式不保证方向和时间。
-
-### 7.4 CSV
-
-内置支持带引号、逗号和 CRLF 的简易 CSV 解析器。首行必须能映射正文列；否则降级为 TXT 行解析。它不是通用 RFC 4180 库，复杂编码、嵌套换行和超大 CSV 应先转换为推荐 JSON。
-
-### 7.5 TXT
-
-识别以完整年份开头的时间戳，并支持 `发言人: 内容`。没有完整年份的 `07-29 01:48` 无法独立确定年份，推荐导出器补全年份。
-
-### 7.6 时间和方向
-
-时间支持秒/毫秒 epoch、`YYYY-MM-DD HH:mm:ss`、中文年月日等。无法解析时保持空字符串；文件修改时间绝不替代聊天时间。
-
-方向优先使用导出器字段：`isSelf`/`isSend` 等布尔值、direction 枚举，或 `selfId === senderId`。昵称不是可靠方向证据。字段映射及示例见 [聊天导出格式](CHAT_EXPORT_FORMAT.md)。
+手动提炼默认 `scope=all`，即选择数据库全部记录。自动提炼必须走会话水位：`autoTriggerMode` 为 `time`、`message-count` 或 `either`，`intervalHours` 限制在 1–720，`incrementalMessageCount` 限制在 1–10,000。只有存在未处理增量且选定条件满足时才启动；自动请求只发送新增消息及有界前序上下文，首次全库基线仍由用户手动确认。
 
 ## 8. 会话计划与超长上下文
 
@@ -603,7 +573,7 @@ Leaflet 请求本地 `/api/map/tiles/{z}/{x}/{y}.png?provider=&cacheMaxMb=`。�
 | GET | `/api/storage/overview` | 返回运行时数据路径、大小和条目数 |
 | GET/POST | `/api/bot/*` | QQ Bot 的最小化本机摘要与增量写入面；绝不提供完整快照或原始聊天正文 |
 | GET | `/api/media/avatar?src=` | 白名单代理并缓存 QQ/微信头像 |
-| GET | `/api/media/avatar/local?id=` | 经哈希、元数据和签名校验后读取 THEIA 已保存的 MNEMO 头像 |
+| GET | `/api/media/avatar/local?id=` | 经哈希、元数据和签名校验后读取 HYPERION 已保存的 MNEMO 头像 |
 | GET | `/api/mnemo/status` | MNEMO agent 与 immutable inbox 的无正文状态 |
 | GET | `/api/map/tiles/:z/:x/:y.png` | 代理公共 OSM 瓦片 |
 | GET | `/api/map/search?q=` | 多源公共地理搜索 |
@@ -625,7 +595,7 @@ QQ Bot 的边界、JSON 请求体、原子写入规则、首次 owner 绑定和�
 
 `logs/tasks/YYYYMMDD-HHmmss-mmm-kind-label-digest.jsonl.gz` 记录：
 
-1. schema `theia-task-log/v1`、开始时间、kind 和完整本地请求；
+1. schema `hyperion-task-log/v1`、开始时间、kind 和完整本地请求；
 2. 完成、失败或回退事件；
 3. 模型解析结果及错误细节。
 
@@ -643,18 +613,18 @@ QQ Bot 的边界、JSON 请求体、原子写入规则、首次 owner 绑定和�
 
 INI v4 分为 `[meta]`、`[profile]`、`[appearance]`、`[ai]`、`[map]`、兼容主通道 `[provider]` 和通道池 `[providers]`。`[providers] channels` 保存通道数组，`primaryId` 保存主通道；桌面版通道只写 `credentialRef`，密钥密文放在凭据容器。所有值 URL encode，JSON 子对象再整体编码。写入前做长度、枚举、URL 和数值归一化。
 
-启动优先级：已有 INI > 一次性迁移 legacy provider > 显式启用的环境变量默认值。桌面版默认忽略父进程中继承的 `OPENAI_*`，防止 IDE、Codex 或终端宿主的凭据污染用户通道；只有设置 `THEIA_USE_ENV_PROVIDER=1` 才读取环境通道。环境变量：
+启动优先级：已有 INI > 一次性迁移 legacy provider > 显式启用的环境变量默认值。桌面版默认忽略父进程中继承的 `OPENAI_*`，防止 IDE、Codex 或终端宿主的凭据污染用户通道；只有设置 `HYPERION_USE_ENV_PROVIDER=1` 才读取环境通道。环境变量：
 
 ```text
-THEIA_USE_ENV_PROVIDER=1
+HYPERION_USE_ENV_PROVIDER=1
 OPENAI_API_KEY
 OPENAI_BASE_URL
 OPENAI_MODEL
 OPENAI_API_MODE=auto|responses|chat-completions
 AI_PORT=8787
-THEIA_RELEASE_LAYOUT=1
-THEIA_RUNTIME_ROOT=<release-root>
-THEIA_SOFTWARE_RENDERING=1
+HYPERION_RELEASE_LAYOUT=1
+HYPERION_RUNTIME_ROOT=<release-root>
+HYPERION_SOFTWARE_RENDERING=1
 ```
 
 打包 Electron 的本地服务运行在主进程，可调用 `safeStorage`：INI 保存 `credentialRef`，密文写入 `credentials.json`。纯 Node 开发/浏览器入口没有 Electron 后端时保留 INI 明文回退。测试和日志不得输出任一形态的 Key。
@@ -698,9 +668,9 @@ node --check server/index.mjs
 node --check electron/main.mjs
 ```
 
-`npm run build` 先执行 `tsc -b`，再运行 Vite build。`npm test` 覆盖 importer、会话分段、候选校验、浏览器存储、append-only archive、schema 迁移/回滚、崩溃恢复/日志轮转和通道池；所有集成测试使用一次性 `THEIA_RUNTIME_ROOT`，不读取本机聊天、INI 或真实 API Key。
+`npm run build` 先执行 `tsc -b`，再运行 Vite build。`npm test` 覆盖 importer、会话分段、候选校验、浏览器存储、append-only archive、schema 迁移/回滚、崩溃恢复/日志轮转和通道池；所有集成测试使用一次性 `HYPERION_RUNTIME_ROOT`，不读取本机聊天、INI 或真实 API Key。
 
-`npm run test:e2e` 使用 Playwright 和隔离 API/Vite 端口，验证任务图视觉基线、缩放、主题拖拽、拖拽后无文本选择、地图设置和存储健康 UI。Windows 有 Edge 时直接使用系统 Edge，否则使用 Playwright 安装的 Chromium。`npm run test:desktop-smoke` 启动源码 Electron，验证首页、独立 runtime、`safeStorage` 明文 Key 迁移和无明文落盘。生成 unpacked 目录后，`npm run test:unpacked-smoke` 会实际启动打包后的 `THEIA.exe`。不要把视觉快照自动更新当作通过；必须人工查看图片后再提交。
+`npm run test:e2e` 使用 Playwright 和隔离 API/Vite 端口，验证任务图视觉基线、缩放、主题拖拽、拖拽后无文本选择、地图设置和存储健康 UI。Windows 有 Edge 时直接使用系统 Edge，否则使用 Playwright 安装的 Chromium。`npm run test:desktop-smoke` 启动源码 Electron，验证首页、独立 runtime、`safeStorage` 明文 Key 迁移和无明文落盘。生成 unpacked 目录后，`npm run test:unpacked-smoke` 会实际启动打包后的 `HYPERION.exe`。不要把视觉快照自动更新当作通过；必须人工查看图片后再提交。
 
 仍建议补充的测试：
 
@@ -723,7 +693,7 @@ node --check electron/main.mjs
 ### 18.2 打包器
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.6.0\THEIA-release-0.6.0
+node release-tools/package-release.mjs ..\staging\v0.6.0\HYPERION-release-0.6.0
 ```
 
 打包器要求目标在源码目录之外且不存在，避免误覆盖。它复制必要源码、锁文件、发布文档、默认资源和虚构示例，并生成 `RELEASE_MANIFEST.json`。明确排除：
@@ -745,7 +715,7 @@ node release-tools/package-release.mjs ..\staging\v0.6.0\THEIA-release-0.6.0
 npm run dist:installer
 ```
 
-electron-builder 输出到 `release-bin/installer/`，使用 `asar` 和 Windows x64 NSIS assisted installer；允许选择安装目录，创建桌面/开始菜单快捷方式，卸载默认不删除 `%APPDATA%\THEIA`。构建优先复用 `node_modules/electron/dist` 中已由 npm 安装的同版本 Electron，避免重复下载大型运行时；NSIS 工具链首次仍从 electron-builder 官方 GitHub Release 获取并校验固定 SHA-256。`npm run dist:unpacked` 只生成 unpacked 目录，适合发布前烟测。原有 `npm run dist:exe` 便携构建继续保留，两条路线不能混用更新元数据。
+electron-builder 输出到 `release-bin/installer/`，使用 `asar` 和 Windows x64 NSIS assisted installer；允许选择安装目录，创建桌面/开始菜单快捷方式，卸载默认不删除 `%APPDATA%\HYPERION`。构建优先复用 `node_modules/electron/dist` 中已由 npm 安装的同版本 Electron，避免重复下载大型运行时；NSIS 工具链首次仍从 electron-builder 官方 GitHub Release 获取并校验固定 SHA-256。`npm run dist:unpacked` 只生成 unpacked 目录，适合发布前烟测。原有 `npm run dist:exe` 便携构建继续保留，两条路线不能混用更新元数据。
 
 正式签名构建在干净 CI 中注入：
 
@@ -755,7 +725,7 @@ CSC_KEY_PASSWORD=<证书密码>
 GH_TOKEN=<仅发布 GitHub Release 时使用>
 ```
 
-仓库不保存 PFX、密码或 token。`win.forceCodeSigning=false` 只为本地开发保留未签名构建能力；公开发行应把“缺少签名”作为 CI 失败条件。GitHub publisher 固定为 `bakahuiii/THEIA`。electron-builder 生成 `app-update.yml` 和 `latest.yml`；Electron 仅在 packaged 且存在 `app-update.yml` 时调用 electron-updater。更新下载后询问立即重启，选择稍后则在正常退出时安装。
+仓库不保存 PFX、密码或 token。`win.forceCodeSigning=false` 只为本地开发保留未签名构建能力；公开发行应把“缺少签名”作为 CI 失败条件。GitHub publisher 固定为 `bakahuiii/HYPERION`。electron-builder 生成 `app-update.yml` 和 `latest.yml`；Electron 仅在 packaged 且存在 `app-update.yml` 时调用 electron-updater。更新下载后询问立即重启，选择稍后则在正常退出时安装。
 
 自动更新不能替代数据 schema 回滚。应用升级前仍应备份 runtime；应用二进制可回退，但新版本已经迁移过的数据必须通过 `migrations/` 和 `npm run data:rollback` 单独处理。
 
@@ -783,4 +753,4 @@ GH_TOKEN=<仅发布 GitHub Release 时使用>
 - 用 `bench:archive` 在百万级虚构数据上建立导入耗时、内存峰值、归档 compaction 和恢复时间基准；把提炼选择与执行进一步迁到按会话服务端读取，避免用户启动一次提炼时把整份归档放入 renderer；
 - 在明确预算、日志、证据校验和人工复核 UI 完成后，才接入多模型 ensemble 的真实 fan-out。
 
-THEIA 仍是单用户本地应用，不承诺无上限规模、任意导出格式、任何公共服务 SLA 或所有 OpenAI 兼容中转完全一致。新增协议必须继续保留 0.3.0 的并发、2 秒本地退避和 502 请求稳定基线。
+HYPERION 仍是单用户本地应用，不承诺无上限规模、任意导出格式、任何公共服务 SLA 或所有 OpenAI 兼容中转完全一致。新增协议必须继续保留 0.3.0 的并发、2 秒本地退避和 502 请求稳定基线。
