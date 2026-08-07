@@ -30,6 +30,9 @@ const BASE_WORLD_WIDTH = 1220
 const BASE_WORLD_HEIGHT = 760
 const NODE_ARC_LENGTH = 76
 const DRAG_THRESHOLD = 6
+const PAN_INERTIA_MIN_SPEED = .06
+const PAN_INERTIA_MAX_SPEED = 2.4
+const PAN_INERTIA_FRICTION = .005
 
 export interface TaskAtlasArrangement {
   questId: string
@@ -134,6 +137,14 @@ interface TaskMapViewProps {
 }
 
 type Camera = { x: number; y: number; scale: number }
+type CameraVelocity = { x: number; y: number }
+
+function cappedVelocity(velocity: CameraVelocity): CameraVelocity {
+  const speed = Math.hypot(velocity.x, velocity.y)
+  if (speed <= PAN_INERTIA_MAX_SPEED) return velocity
+  const scale = PAN_INERTIA_MAX_SPEED / speed
+  return { x: velocity.x * scale, y: velocity.y * scale }
+}
 
 export function TaskMapView({ profile, quests, places, people, intelById, atlas, onToggle, onEdit, onViewSource, onDelete, onGenerateGuidance, onArrange, onMoveCategory }: TaskMapViewProps) {
   const [selectedId, setSelectedId] = useState('')
@@ -145,7 +156,7 @@ export function TaskMapView({ profile, quests, places, people, intelById, atlas,
   const fieldRef = useRef<HTMLDivElement>(null)
   const worldRef = useRef<HTMLDivElement>(null)
   const initialFitRef = useRef(false)
-  const panRef = useRef<{ pointerId: number; startX: number; startY: number; originX: number; originY: number } | null>(null)
+  const panRef = useRef<{ pointerId: number; startX: number; startY: number; originX: number; originY: number; lastX: number; lastY: number; lastAt: number; velocityX: number; velocityY: number } | null>(null)
   const taskDragRef = useRef<{ pointerId: number; quest: Quest; sourceCategory: TaskAtlasCategory; startX: number; startY: number; node: HTMLButtonElement; dragged: boolean } | null>(null)
   const categoryDragRef = useRef<{ pointerId: number; category: TaskAtlasCategory; startX: number; startY: number; origin: TaskAtlasPosition; worldWidth: number; worldHeight: number; cluster: HTMLElement; dragged: boolean } | null>(null)
   const pendingCameraRef = useRef<Camera | null>(null)
@@ -156,6 +167,7 @@ export function TaskMapView({ profile, quests, places, people, intelById, atlas,
   const pendingCategoryDragRef = useRef<{ cluster: HTMLElement; position: TaskAtlasPosition } | null>(null)
   const wheelZoomRef = useRef<number | null>(null)
   const wheelFrameRef = useRef<number>(0)
+  const inertiaFrameRef = useRef<number>(0)
   const suppressClickRef = useRef(false)
   const placesById = useMemo(() => new Map(places.map((place) => [place.id, place])), [places])
   const peopleById = useMemo(() => new Map(people.map((person) => [person.id, person])), [people])
@@ -196,6 +208,7 @@ export function TaskMapView({ profile, quests, places, people, intelById, atlas,
     if (taskDragFrameRef.current) window.cancelAnimationFrame(taskDragFrameRef.current)
     if (categoryDragFrameRef.current) window.cancelAnimationFrame(categoryDragFrameRef.current)
     if (wheelFrameRef.current) window.cancelAnimationFrame(wheelFrameRef.current)
+    if (inertiaFrameRef.current) window.cancelAnimationFrame(inertiaFrameRef.current)
     taskDragRef.current?.node.classList.remove('is-dragging')
     taskDragRef.current?.node.style.removeProperty('--atlas-drag-x')
     taskDragRef.current?.node.style.removeProperty('--atlas-drag-y')
@@ -239,6 +252,38 @@ export function TaskMapView({ profile, quests, places, people, intelById, atlas,
     }
   }
 
+  const stopCameraInertia = (commit = true) => {
+    if (!inertiaFrameRef.current) return
+    window.cancelAnimationFrame(inertiaFrameRef.current)
+    inertiaFrameRef.current = 0
+    if (commit) setCamera({ ...cameraRef.current })
+  }
+
+  const startCameraInertia = (initialVelocity: CameraVelocity) => {
+    const initial = cappedVelocity(initialVelocity)
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches || Math.hypot(initial.x, initial.y) < PAN_INERTIA_MIN_SPEED) {
+      setCamera({ ...cameraRef.current })
+      return
+    }
+    let velocity = initial
+    let lastAt = performance.now()
+    const step = (now: number) => {
+      const elapsed = Math.min(32, Math.max(1, now - lastAt))
+      lastAt = now
+      const current = cameraRef.current
+      applyCamera({ ...current, x: current.x + velocity.x * elapsed, y: current.y + velocity.y * elapsed })
+      const damping = Math.exp(-PAN_INERTIA_FRICTION * elapsed)
+      velocity = { x: velocity.x * damping, y: velocity.y * damping }
+      if (Math.hypot(velocity.x, velocity.y) < PAN_INERTIA_MIN_SPEED) {
+        inertiaFrameRef.current = 0
+        setCamera({ ...cameraRef.current })
+        return
+      }
+      inertiaFrameRef.current = window.requestAnimationFrame(step)
+    }
+    inertiaFrameRef.current = window.requestAnimationFrame(step)
+  }
+
   const fittedScale = () => {
     const field = fieldRef.current
     if (!field) return 1
@@ -261,6 +306,7 @@ export function TaskMapView({ profile, quests, places, people, intelById, atlas,
   }, [worldBaseSize.height, worldBaseSize.width])
 
   const updateZoom = (next: number) => {
+    stopCameraInertia()
     const current = cameraRef.current
     const nextCamera = { ...current, scale: Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, next)) }
     applyCamera(nextCamera)
@@ -269,6 +315,7 @@ export function TaskMapView({ profile, quests, places, people, intelById, atlas,
 
   const handleWheel = (event: WheelEvent<HTMLElement>) => {
     event.preventDefault()
+    stopCameraInertia()
     const currentScale = wheelZoomRef.current ?? cameraRef.current.scale
     wheelZoomRef.current = currentScale + (event.deltaY < 0 ? .1 : -.1)
     if (wheelFrameRef.current) return
@@ -285,13 +332,23 @@ export function TaskMapView({ profile, quests, places, people, intelById, atlas,
     const target = event.target as HTMLElement
     if (target.closest('button, input, a, .task-atlas-detail, .task-atlas-context-menu')) return
     setContextMenu(null)
+    stopCameraInertia()
     event.currentTarget.setPointerCapture(event.pointerId)
-    panRef.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, originX: cameraRef.current.x, originY: cameraRef.current.y }
+    panRef.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, originX: cameraRef.current.x, originY: cameraRef.current.y, lastX: event.clientX, lastY: event.clientY, lastAt: performance.now(), velocityX: 0, velocityY: 0 }
   }
 
   const movePan = (event: PointerEvent<HTMLElement>) => {
     const pan = panRef.current
     if (!pan || pan.pointerId !== event.pointerId) return
+    const now = performance.now()
+    const elapsed = Math.max(1, now - pan.lastAt)
+    const velocityX = (event.clientX - pan.lastX) / elapsed
+    const velocityY = (event.clientY - pan.lastY) / elapsed
+    pan.velocityX = pan.velocityX * .28 + velocityX * .72
+    pan.velocityY = pan.velocityY * .28 + velocityY * .72
+    pan.lastX = event.clientX
+    pan.lastY = event.clientY
+    pan.lastAt = now
     pendingCameraRef.current = { ...cameraRef.current, x: pan.originX + event.clientX - pan.startX, y: pan.originY + event.clientY - pan.startY }
     if (dragFrameRef.current) return
     dragFrameRef.current = window.requestAnimationFrame(() => {
@@ -301,6 +358,22 @@ export function TaskMapView({ profile, quests, places, people, intelById, atlas,
   }
 
   const endPan = (event: PointerEvent<HTMLElement>) => {
+    const pan = panRef.current
+    if (!pan || pan.pointerId !== event.pointerId) return
+    if (dragFrameRef.current) window.cancelAnimationFrame(dragFrameRef.current)
+    dragFrameRef.current = 0
+    if (pendingCameraRef.current) {
+      applyCamera(pendingCameraRef.current)
+      setCamera(pendingCameraRef.current)
+      pendingCameraRef.current = null
+    }
+    const idleDamping = Math.exp(-Math.max(0, performance.now() - pan.lastAt) / 70)
+    panRef.current = null
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+    startCameraInertia({ x: pan.velocityX * idleDamping, y: pan.velocityY * idleDamping })
+  }
+
+  const cancelPan = (event: PointerEvent<HTMLElement>) => {
     if (panRef.current?.pointerId !== event.pointerId) return
     if (dragFrameRef.current) window.cancelAnimationFrame(dragFrameRef.current)
     dragFrameRef.current = 0
@@ -499,11 +572,11 @@ export function TaskMapView({ profile, quests, places, people, intelById, atlas,
       <div className="task-atlas-controls" aria-label="任务图视图控制">
         <button type="button" className="icon-button" title="放大任务图" aria-label="放大任务图" onClick={() => updateZoom(cameraRef.current.scale + .12)}><Plus size={16} /></button>
         <button type="button" className="icon-button" title="缩小任务图" aria-label="缩小任务图" onClick={() => updateZoom(cameraRef.current.scale - .12)}><Minus size={16} /></button>
-        <button type="button" className="icon-button" title="重置任务图视角" aria-label="重置任务图视角" onClick={() => { const reset = { x: 0, y: 0, scale: fittedScale() }; applyCamera(reset); setCamera(reset) }}><RotateCcw size={15} /></button>
+        <button type="button" className="icon-button" title="重置任务图视角" aria-label="重置任务图视角" onClick={() => { stopCameraInertia(); const reset = { x: 0, y: 0, scale: fittedScale() }; applyCamera(reset); setCamera(reset) }}><RotateCcw size={15} /></button>
         {selected && <button type="button" className="icon-button" title="生成个性化建议" aria-label="生成个性化建议" onClick={() => void requestGuidance()} disabled={guidanceBusy}><Sparkles size={15} /></button>}
         <span>{Math.round(camera.scale * 100)}%</span>
       </div>
-      <div ref={fieldRef} className={`task-atlas-field ${camera.scale < .75 ? 'is-overview' : ''}`} onWheel={handleWheel} onPointerDown={startPan} onPointerMove={movePan} onPointerUp={endPan} onPointerCancel={endPan}>
+      <div ref={fieldRef} className={`task-atlas-field ${camera.scale < .75 ? 'is-overview' : ''}`} onWheel={handleWheel} onPointerDown={startPan} onPointerMove={movePan} onPointerUp={endPan} onPointerCancel={cancelPan}>
         <div ref={worldRef} className="task-atlas-world" style={{ width: `${worldBaseSize.width * camera.scale}px`, height: `${worldBaseSize.height * camera.scale}px`, transform: `translate(-50%, -50%) translate3d(${camera.x}px, ${camera.y}px, 0)` }}>
           <div className="task-atlas-user-marker" aria-label={`${profile.name}的任务图中心`}>
             <span><AvatarImage source={profile.avatarUrl} alt="" /><i>{initialsFor(profile.name)}</i></span>

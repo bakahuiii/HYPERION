@@ -28,6 +28,24 @@ test('task atlas renders, zooms and drags a category without selecting text', as
   await page.mouse.up()
   await expect.poll(async () => (await category.boundingBox())?.x ?? before.x).not.toBe(before.x)
   await expect.poll(() => page.evaluate(() => window.getSelection()?.toString() ?? '')).toBe('')
+
+  const field = page.locator('.task-atlas-field')
+  const fieldBounds = await field.boundingBox()
+  if (!fieldBounds) throw new Error('任务图画布不可用')
+  const cameraOffset = () => world.evaluate((element) => {
+    const match = element.style.transform.match(/translate3d\(([-\d.]+)px, ([-\d.]+)px/)
+    return match ? { x: Number(match[1]), y: Number(match[2]) } : null
+  })
+  const start = { x: fieldBounds.x + 36, y: fieldBounds.y + fieldBounds.height * .55 }
+  await page.mouse.move(start.x, start.y)
+  await page.mouse.down()
+  await page.mouse.move(start.x + 220, start.y + 42, { steps: 8 })
+  await page.mouse.up()
+  const released = await cameraOffset()
+  await page.waitForTimeout(120)
+  const glided = await cameraOffset()
+  if (!released || !glided) throw new Error('任务图视角偏移不可读')
+  expect(Math.hypot(glided.x - released.x, glided.y - released.y)).toBeGreaterThan(4)
 })
 
 test('storage health and map provider controls are visible in options', async ({ page }) => {
@@ -40,16 +58,16 @@ test('storage health and map provider controls are visible in options', async ({
   await expect(page.getByText(/个归档段/)).toBeVisible()
 })
 
-test('conversation archive filters by name and shows chat-kind counts', async ({ page }) => {
+test('conversation archive filters by name and shows each chat kind', async ({ page }) => {
   await page.goto('/')
   await page.getByRole('button', { name: '情报库', exact: true }).first().click()
 
   const search = page.getByRole('searchbox', { name: '搜索会话名称' })
   await expect(search).toBeVisible()
-  await expect(page.getByLabel('归档对话分类')).toContainText('私聊 1 个')
+  await search.fill('示例同学')
+  await expect(page.locator('.conversation-row').first()).toContainText('私聊')
+  await expect(page.getByRole('heading', { name: '示例同学' })).toBeVisible()
 
   await search.fill('不存在的会话')
   await expect(page.getByText('没有名称匹配的对话。')).toBeVisible()
-  await search.fill('示例同学')
-  await expect(page.getByRole('heading', { name: '示例同学' })).toBeVisible()
 })
