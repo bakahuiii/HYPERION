@@ -2,7 +2,7 @@
 
 [简体中文](DEVELOPER_GUIDE.md) | [English](DEVELOPER_GUIDE.en.md)
 
-This guide is for engineers who maintain, review, extend, or package THEIA. It describes source version `0.5.0` and treats `package-lock.json`, `server/index.mjs`, and the current implementation as authoritative. Planned capabilities are not described as complete. For field-level local HTTP, upstream model JSON, session batching, and log formats, use [API_PROTOCOL.md](API_PROTOCOL.md) alongside this guide.
+This guide is for engineers who maintain, review, extend, or package THEIA. It describes source version `0.6.0` and treats `package-lock.json`, `server/index.mjs`, and the current implementation as authoritative. Planned capabilities are not described as complete. For field-level local HTTP, upstream model JSON, session batching, MNEMO, and log formats, use [API_PROTOCOL.md](API_PROTOCOL.md) and [MNEMO.md](MNEMO.md) alongside this guide.
 
 ## 1. System and Engineering Boundary
 
@@ -16,6 +16,8 @@ The project does not implement:
 - silent background scraping of chats or social feeds;
 - treatment of model output as an unquestionable fact database;
 - cloud accounts, multi-user collaboration, or remote synchronization.
+
+MNEMO is the only narrow exception: after the user completes a one-time local key capture for their own account, the separate MNEMO process may make a read-only decrypted snapshot for that account. The key never enters THEIA state, archives, logs, or model requests. THEIA owns only the agent lifecycle, outbox, readable exports, and avatar cache.
 
 Source, portable, and electron-builder NSIS packaging are supported. Crash markers, schema migration backups, rollback scripts, and GitHub update checks exist locally; remote crash reporting and telemetry do not. Conversation bodies are not encrypted at rest. Packaged Electron protects provider keys using operating-system `safeStorage`; plain Node development retains a documented plaintext compatibility fallback.
 
@@ -211,6 +213,12 @@ Reference only: the synthetic 100,000-record archive benchmark recorded on 2026-
 
 Directory discovery is recursive and accepts supported JSON, CSV, and TXT. One folder is treated as one conversation when the exporter provides that structure. Stable IDs combine source identity and record identity so rescans update or delete authoritative records instead of accumulating duplicates.
 
+### 7.1 MNEMO Sidecar
+
+`server/mnemoAgent.mjs` starts `python/mnemo_agent.py` as a child process and explicitly provides THEIA-owned inbox, readable-export, and avatar-cache directories. On each source fingerprint change, the agent creates a read-only snapshot, maps `contact.db` `remark -> nick_name`, reads local image blobs from `head_image.db`, and writes immutable `MNEMO-v1-*/records.json` documents. It must not write the append-only archive or read/write THEIA credentials.
+
+`server/mnemoInbox.mjs` accepts only `mnemo-delta/v1`, waits for a stable complete file, remembers the batch SHA-256, normalizes bounded fields, and sends records to `writeSharedIntelDelta`. Stable message IDs must not include display names. Readable exports use remark, nickname, then a collision-only hash suffix. MNEMO avatars must be binary-signature checked, content-addressed in THEIA storage, and represented in archive records only as `/api/media/avatar/local?id=<hash>`.
+
 Files larger than 1 MiB use `workers/intelParser.worker.ts`; smaller files call the same parser directly. Worker and direct paths must produce identical IDs, times, speaker roles, conversation keys, and avatar fields.
 
 JSON import traverses known arrays and exporter-specific containers. CSV uses structured parsing. TXT supports timestamped conversation lines. Avoid ad hoc comma splitting or timestamp guessing.
@@ -311,7 +319,7 @@ Merge output should use structured portrait paragraphs with referenced claim IDs
 
 Person fingerprints advance only after a successful durable update. Incremental updates send new records plus at most 16 preceding records for each addition. Unchanged conversations are not resubmitted.
 
-When a card lacks an avatar, the service searches the linked source conversation's session metadata for `avatar`, downloads only allowed remote media through the controlled cache path, and persists a local reference. Avatar failure must not block person evidence.
+When a card lacks an avatar, the service searches the linked source conversation's session metadata for `avatar`, downloads only allowed remote media through the controlled cache path, and persists a local reference. MNEMO local avatars are read by `server/mnemoAvatarStore.mjs`, which accepts only a 64-hex ID, a fixed `mnemo-<hash>` filename, regular non-symlink files up to 5 MiB, matching metadata, and JPEG/PNG/GIF/WebP/AVIF signatures. Avatar failure must not block person evidence.
 
 Person extraction is a separate evidence pass from task extraction:
 
@@ -351,6 +359,8 @@ The loopback service listens on `127.0.0.1:8787`. Major endpoint groups include:
 | `/api/sync/snapshot` | lightweight application state read/write |
 | `/api/sync/intel` | full raw-archive compatibility snapshot |
 | `/api/sync/intel/delta` | bounded append-only archive changes |
+| `/api/mnemo/status` | sidecar and immutable inbox status without messages or secrets |
+| `/api/media/avatar/local?id=` | signature-checked local MNEMO avatar |
 | `/api/settings` | INI-backed profile, appearance, prompts, and provider metadata |
 | `/api/ai/providers*` | provider CRUD, model discovery, and runtime status |
 | `/api/ai/analyze` | task and optional person-evidence analysis |
@@ -359,8 +369,14 @@ The loopback service listens on `127.0.0.1:8787`. Major endpoint groups include:
 | `/api/map/*` | tile proxy/cache and geocoding |
 | `/api/media/*` | controlled avatar/background retrieval |
 | `/api/storage/overview` | runtime paths, schema, archive, migration, and recovery health |
+| `/api/bot/*` | narrow QQ Bot summaries and incremental writes; never a raw archive or full snapshot surface |
 
 This is a local API, not an authenticated multi-user server. Do not bind it to non-loopback interfaces without designing authentication, authorization, CSRF, origin policy, rate limiting, and secret isolation first.
+
+The QQ Bot boundary, request JSON, atomic write behavior, first-owner binding,
+and proactive-notification queue are documented in
+[`QQ_BOT.en.md`](QQ_BOT.en.md). The Bot may use only `/api/bot/*`; it must not
+read-and-rewrite `/api/sync/snapshot` or read archive files directly.
 
 ## 14. Logs and Observability
 
@@ -444,8 +460,8 @@ Additional desired coverage includes person claim validation and same-name conve
 ### 18.2 Source and portable packages
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.5.0\THEIA-release-0.5.0
-npm run dist:exe -- ..\staging\v0.5.0\THEIA-0.5.0-portable
+node release-tools/package-release.mjs ..\staging\v0.6.0\THEIA-release-0.6.0
+npm run dist:exe -- ..\staging\v0.6.0\THEIA-0.6.0-portable
 ```
 
 The source packager refuses an existing destination and excludes conversations, tasks, people, places, candidates, keys, provider settings, browser/Electron profiles, logs, downloaded avatars, custom backgrounds, dependencies, builds, caches, and Git metadata. It includes source, lockfiles, canonical documentation, neutral assets, fictional examples, and a manifest.

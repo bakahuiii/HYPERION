@@ -163,6 +163,7 @@ node release-tools/update-release-index.mjs <THEIA_WORK_ROOT>
 
 ## 9. 当前迁移基线
 
+- `v0.6.0`：MNEMO 本机微信持续归档、THEIA 管理的 immutable inbox、备注/昵称可读导出、内容寻址本地头像和会话级增量提炼触发。
 - `v0.5.0`：手动日记、每日状态快照、AI 对话导入和来源关联的自我分析；追加式归档完整性、恢复与大数据浏览基础；多模型裁决数据契约（未启用实际 fan-out）。
 - `v0.1.0`：首个源码发布、多个历史源码快照和 Windows 便携版。
 - `v0.1.1`：当前 Windows x64 便携版。

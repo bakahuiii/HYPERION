@@ -13,6 +13,9 @@ playwright-report/
 .theia-crash-recovery.log*
 .theia-credentials.json
 .theia-intel-store/
+.theia-mnemo-inbox/
+.theia-mnemo-inbox-state.json*
+.theia-mnemo-export/
 .theia-map-tile-cache/
 .theia-migrations/
 .theia-service-session.json

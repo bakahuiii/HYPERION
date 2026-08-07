@@ -187,6 +187,8 @@ profileImageUrl, portrait
 
 远程头像显示还受本地代理白名单限制。当前只允许常见 QQ/微信图床域名，避免任意 URL 导致 SSRF。其他平台头像建议由导出工具转为 data URL，或未来扩展受信域名配置。
 
+MNEMO 是例外的本机适配器：它不把头像 data URL 或本地路径放进 record。它从已授权账号的只读 snapshot 读取头像 blob，检查 JPEG/PNG/GIF/WebP/AVIF 二进制签名后，直接写入 THEIA 头像缓存。增量 record 只带可选 `avatarId` 内容哈希，THEIA 将其转换为本地安全地址。
+
 ## 4. CSV 格式
 
 推荐首行：
@@ -363,3 +365,18 @@ interface NormalizedMessage {
 每条消息。
 
 适配器应记录自身版本、来源平台、导出账户 ID、时区和附件根目录。严禁在适配器里把无法确认的方向默认成 other；unknown 比错误方向更安全。
+
+## 12. MNEMO 微信适配器
+
+MNEMO 为 THEIA 的持续本机导入提供一个固定输出契约，而不是另一个手工导入格式。THEIA 只读取完整的 `MNEMO-v1-*/records.json` immutable batch，并依据 record 的稳定 ID 去重。
+
+会话的可读副本由 MNEMO 写到 THEIA 提供的 export root：
+
+```text
+<export-root>/<account>/direct/<remark-or-nickname>/<remark-or-nickname>.json
+<export-root>/<account>/group/<remark-or-nickname>/<remark-or-nickname>.json
+```
+
+命名顺序固定为联系人备注、联系人昵称、稳定会话 ID；Windows 非法字符会被替换，只有重名才加 hash 后缀。显示名变更只能改变可读副本路径，绝不能改变 `id` 或 `conversationId`。会话副本 schema 为 `mnemo-conversation-export/v1`，其中的 `messages[].id` 与 THEIA archive 的 MNEMO message ID 一致。
+
+MNEMO 应只使用它的本机私钥和只读 snapshot。批次、可读导出、日志和 THEIA archive 不得包含私钥、原始密钥材料、base64 头像或绝对头像路径。字段和 runtime 行为见 [MNEMO 集成](MNEMO.md)。

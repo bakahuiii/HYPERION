@@ -41,7 +41,7 @@ buildSelfAnalysisInput(items, dailyCheckins) => {
 
 [简体中文](DEVELOPER_GUIDE.md) | [English](DEVELOPER_GUIDE.en.md)
 
-本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.5.0` 源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 的逐字段定义为准。
+本文面向维护、审查、二次开发和发布 THEIA 的工程人员。内容对应 `0.6.0` 源码版，以 `package-lock.json`、`server/index.mjs` 和当前实现为准，不把规划中的能力写成已经完成的能力。涉及本地 HTTP、模型请求 JSON、session 批处理、MNEMO 和日志字段时，以 [API 协议参考](API_PROTOCOL.md) 与 [MNEMO 集成](MNEMO.md) 的定义为准。
 
 ## 1. 项目定位与工程边界
 
@@ -55,6 +55,8 @@ THEIA 当前是单用户、本地优先的个人现实任务图应用。用户�
 - 在后台未提示地抓取聊天或朋友圈；
 - 把模型输出当作无需审核的事实数据库；
 - 云端账号、多人协作和远程同步。
+
+MNEMO 是唯一的例外路径：仅在用户为本人账号在本机完成一次密钥捕获后，独立的 MNEMO 进程才可创建该账号数据库的只读解密快照。密钥不进入 THEIA 的状态、归档、日志或模型请求；THEIA 只管理 agent 生命周期、outbox、可读导出与头像缓存。
 
 当前发布形态包含源码包、便携包和 electron-builder NSIS 安装器。已有本地崩溃恢复标记、schema 迁移备份、回滚脚本和 GitHub Release 更新检查；项目没有远程崩溃上报或遥测。Windows 签名是发布环境的可选步骤，本地无证书构建不会失败。聊天正文归档不加密；桌面版 API Key 使用系统凭据加密，纯 Node 开发模式有明文兼容回退。
 
@@ -300,7 +302,13 @@ npm run bench:archive -- --records=1000000 --batch-size=10000
 
 入口为 `src/lib/importer.ts` 和 `src/lib/directorySync.ts`。
 
-### 7.1 文件发现
+### 7.1 MNEMO sidecar
+
+`server/mnemoAgent.mjs` 以子进程启动 `python/mnemo_agent.py`，并将 THEIA 的 inbox、可读导出和头像缓存目录显式传给它。agent 在每次源指纹变化时建立只读 snapshot，读取 `contact.db` 的 `remark -> nick_name` 映射、读取 `head_image.db` 的图像 blob，并写入 immutable `MNEMO-v1-*/records.json`。THEIA 不读取 MNEMO 私钥，也不允许 agent 直接写 append-only archive。
+
+`server/mnemoInbox.mjs` 仅接收 `mnemo-delta/v1`，在稳定时间后读取完整批次，按文件 SHA-256 记录处理状态，再将经过限长和枚举校验的 records 交给 `writeSharedIntelDelta`。稳定 message ID 不得依赖 display name；可读导出以备注、昵称、必要时 hash 后缀命名。MNEMO avatar 必须先经二进制签名校验，按 SHA-256 写入 THEIA 头像缓存；归档只保留 `/api/media/avatar/local?id=<hash>`。
+
+### 7.2 文件发现
 
 - 扩展名：JSON、CSV、TXT；
 - 最大 20,000 文件；
@@ -311,19 +319,19 @@ npm run bench:archive -- --records=1000000 --batch-size=10000
 
 一个分类文件夹下一层被视为会话身份。例如 `私聊/A/data/messages.json` 与 `私聊/A/media/index.json` 都归入 `私聊/A`，不会被误算成两个会话。
 
-### 7.2 JSON
+### 7.3 JSON
 
 递归遍历对象/数组，继承上层时间、发言人、头像、类型和方向上下文。记录层找到正文后停止继续把其子字段重复当作消息。没有识别到结构化消息时，最后才把 JSON 扁平化为文本行，这种降级模式不保证方向和时间。
 
-### 7.3 CSV
+### 7.4 CSV
 
 内置支持带引号、逗号和 CRLF 的简易 CSV 解析器。首行必须能映射正文列；否则降级为 TXT 行解析。它不是通用 RFC 4180 库，复杂编码、嵌套换行和超大 CSV 应先转换为推荐 JSON。
 
-### 7.4 TXT
+### 7.5 TXT
 
 识别以完整年份开头的时间戳，并支持 `发言人: 内容`。没有完整年份的 `07-29 01:48` 无法独立确定年份，推荐导出器补全年份。
 
-### 7.5 时间和方向
+### 7.6 时间和方向
 
 时间支持秒/毫秒 epoch、`YYYY-MM-DD HH:mm:ss`、中文年月日等。无法解析时保持空字符串；文件修改时间绝不替代聊天时间。
 
@@ -535,7 +543,7 @@ Responses API 使用 `text.format` JSON schema；Chat Completions 使用 `respon
 
 ### 10.3 头像
 
-导入器先从消息、sender/profile/contact/userInfo、顶层 session 等位置找头像。前端把远程 URL 改写到 `/api/media/avatar`。服务端仅允许 QQ/微信图床域名及其受控重定向，最多 3 次重定向、12 秒、受支持图片 MIME 和大小限制；成功后按 URL SHA-256 缓存图片与元数据。
+导入器先从消息、sender/profile/contact/userInfo、顶层 session 等位置找头像。前端把远程 URL 改写到 `/api/media/avatar`。服务端仅允许 QQ/微信图床域名及其受控重定向，最多 3 次重定向、12 秒、受支持图片 MIME 和大小限制；成功后按 URL SHA-256 缓存图片与元数据。MNEMO 本地头像由 `server/mnemoAvatarStore.mjs` 读取：只能用 64 位哈希 ID、固定 `mnemo-<hash>` 文件名、非符号链接普通文件、5 MiB 上限、元数据一致性和 PNG/JPEG/GIF/WebP/AVIF 签名验证。
 
 未知网站头像不会由代理任意抓取，这是 SSRF 防护的一部分。上传的用户头像复用背景资产接口，不走远程头像白名单。
 
@@ -593,12 +601,19 @@ Leaflet 请求本地 `/api/map/tiles/{z}/{x}/{y}.png?provider=&cacheMaxMb=`。�
 | POST | `/api/sync/snapshot` | 原子保存轻量共享快照 |
 | GET | `/api/sync/meta` | 读取快照时间和归档消息数 |
 | GET | `/api/storage/overview` | 返回运行时数据路径、大小和条目数 |
+| GET/POST | `/api/bot/*` | QQ Bot 的最小化本机摘要与增量写入面；绝不提供完整快照或原始聊天正文 |
 | GET | `/api/media/avatar?src=` | 白名单代理并缓存 QQ/微信头像 |
+| GET | `/api/media/avatar/local?id=` | 经哈希、元数据和签名校验后读取 THEIA 已保存的 MNEMO 头像 |
+| GET | `/api/mnemo/status` | MNEMO agent 与 immutable inbox 的无正文状态 |
 | GET | `/api/map/tiles/:z/:x/:y.png` | 代理公共 OSM 瓦片 |
 | GET | `/api/map/search?q=` | 多源公共地理搜索 |
 | GET | `/api/quote` | 在线语录及离线回退 |
 
 本 API 未设计为局域网或公网服务。不要将 8787 反向代理到外网；它没有用户认证，并且设置 API 可向本机界面返回已解密 Key 供编辑。
+
+QQ Bot 的边界、JSON 请求体、原子写入规则、首次 owner 绑定和主动通知机制见
+[`QQ_BOT.zh-CN.md`](QQ_BOT.zh-CN.md)。Bot 只能使用 `/api/bot/*`；不得通过
+`/api/sync/snapshot` 读取再回写完整状态，也不得直接读取归档文件。
 
 ## 14. 日志与可观测性
 
@@ -708,7 +723,7 @@ node --check electron/main.mjs
 ### 18.2 打包器
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.5.0\THEIA-release-0.5.0
+node release-tools/package-release.mjs ..\staging\v0.6.0\THEIA-release-0.6.0
 ```
 
 打包器要求目标在源码目录之外且不存在，避免误覆盖。它复制必要源码、锁文件、发布文档、默认资源和虚构示例，并生成 `RELEASE_MANIFEST.json`。明确排除：

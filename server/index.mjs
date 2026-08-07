@@ -28,6 +28,9 @@ import { listSharedStateBackups, migrateSharedStateFile, versionSharedState, SHA
 import { pruneLogDirectory } from './logRetention.mjs'
 import { finishRecoverySession, recordRuntimeFailure, startRecoverySession } from './crashRecovery.mjs'
 import { createSeleneInboxWatcher, mergeContextEvents } from './seleneInbox.mjs'
+import { createMnemoInboxWatcher } from './mnemoInbox.mjs'
+import { createMnemoAgentController } from './mnemoAgent.mjs'
+import { readMnemoAvatar } from './mnemoAvatarStore.mjs'
 
 const port = Number(process.env.AI_PORT || 8787)
 const maxBodyBytes = 256 * 1024 * 1024
@@ -46,6 +49,9 @@ const {
   sharedIntelMetaPath,
   sharedIntelLegacyPath,
   seleneInboxStatePath,
+  mnemoInboxDirectoryPath,
+  mnemoInboxStatePath,
+  mnemoExportDirectoryPath,
   aiDebugLogPath,
   taskLogDirectoryPath,
   crashLogPath,
@@ -76,7 +82,14 @@ let mapTileMaintenanceQueue = Promise.resolve()
 let recoveryStatus = { uncleanShutdownDetected: false, previous: null, session: null }
 let sharedStateMigrationStatus = { state: 'pending', migrated: false }
 let archiveMigrationStatus = { state: 'pending', migrated: false }
-let seleneInboxWatcher = null
+const seleneInboxWatchers = new Map()
+const mnemoInboxWatchers = new Map()
+const mnemoAgent = createMnemoAgentController({
+  workspace: runtimePaths.workspace,
+  outboxDirectory: mnemoInboxDirectoryPath,
+  archiveDirectory: mnemoExportDirectoryPath,
+  avatarDirectory: avatarCacheDirectoryPath,
+})
 const aiDebugMaxBytes = 8 * 1024 * 1024
 const aiDebugRotationCount = 3
 const taskLogMaxFiles = 2_000
@@ -414,6 +427,10 @@ async function loadSharedIntelMeta() {
   return sharedIntelStore.loadMeta()
 }
 
+async function loadSharedIntelChanges(options) {
+  return sharedIntelStore.loadChanges(options)
+}
+
 async function loadSharedIntelConversationIndex(options) {
   return sharedIntelStore.loadConversationIndex(options)
 }
@@ -524,10 +541,56 @@ function mutateSharedState(mutator) {
   return write
 }
 
-function configuredSeleneInbox() {
-  return typeof process.env.THEIA_SELENE_INBOX === 'string' && process.env.THEIA_SELENE_INBOX.trim()
-    ? resolve(process.env.THEIA_SELENE_INBOX.trim())
-    : null
+function configuredSeleneInboxDirectories() {
+  const configured = typeof process.env.THEIA_SELENE_INBOX === 'string'
+    ? process.env.THEIA_SELENE_INBOX.split(';').map((value) => value.trim()).filter(Boolean)
+    : []
+  // Development installs live under <work>/THEIA/source.  SELENE's synced
+  // inbox and its desktop writer are sibling projects, so recognize them
+  // without requiring an environment variable. Packaged installs remain
+  // explicit through THEIA_SELENE_INBOX.
+  const workRoot = resolve(runtimePaths.workspace, '..', '..')
+  // A custom runtime root is used by release installs and isolated test runs;
+  // it should not unexpectedly crawl an unrelated development workspace.
+  const discoveredDefaults = process.env.THEIA_RUNTIME_ROOT ? [] : [
+    resolve(workRoot, 'SELENE-Inbox'),
+    resolve(workRoot, '.tmp', 'selene.win.tmp'),
+    resolve(workRoot, 'SELENE', 'exports'),
+    resolve(workRoot, 'SELENE', 'outbox'),
+  ]
+  return [...new Set([...configured, ...discoveredDefaults].map((value) => resolve(value)))]
+}
+
+async function desktopSeleneConfiguredDirectories() {
+  if (process.env.THEIA_RUNTIME_ROOT && process.env.THEIA_SELENE_AUTO_DISCOVERY !== '1') return []
+  const localAppData = typeof process.env.LOCALAPPDATA === 'string' ? process.env.LOCALAPPDATA.trim() : ''
+  if (!localAppData) return []
+  try {
+    const settings = await readJsonFile(resolve(localAppData, 'SELENE', 'desktop-settings.json'))
+    const directory = typeof settings?.ExportDirectory === 'string' ? settings.ExportDirectory.trim() : ''
+    return directory ? [resolve(directory)] : []
+  } catch (error) {
+    console.warn(`[THEIA] cannot read SELENE desktop export setting: ${error instanceof Error ? error.message : String(error)}`)
+    return []
+  }
+}
+
+async function availableSeleneInboxDirectories() {
+  const available = []
+  const configured = [...new Set([...configuredSeleneInboxDirectories(), ...await desktopSeleneConfiguredDirectories()])]
+  for (const directory of configured) {
+    try {
+      if ((await stat(directory)).isDirectory()) available.push(directory)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') console.warn(`[THEIA] cannot inspect SELENE directory ${directory}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  return available
+}
+
+function seleneWatcherStatePath(directory) {
+  const suffix = createHash('sha256').update(directory).digest('hex').slice(0, 12)
+  return `${seleneInboxStatePath}.${suffix}.json`
 }
 
 async function importSeleneInboxEvents(events) {
@@ -546,20 +609,207 @@ async function importSeleneInboxEvents(events) {
 }
 
 async function startSeleneInboxSync() {
-  const directory = configuredSeleneInbox()
-  if (!directory) return null
-  if (seleneInboxWatcher) return seleneInboxWatcher
-  const watcher = createSeleneInboxWatcher({
-    directory,
-    statePath: seleneInboxStatePath,
-    intervalMs: process.env.THEIA_SELENE_SYNC_INTERVAL_MS,
-    settleMs: process.env.THEIA_SELENE_SYNC_SETTLE_MS,
-    onImport: importSeleneInboxEvents,
-    logger: (level, message) => console[level === 'warn' ? 'warn' : 'log'](`[THEIA] ${message}`),
+  const directories = await availableSeleneInboxDirectories()
+  for (const directory of directories) {
+    if (seleneInboxWatchers.has(directory)) continue
+    const watcher = createSeleneInboxWatcher({
+      directory,
+      statePath: seleneWatcherStatePath(directory),
+      intervalMs: process.env.THEIA_SELENE_SYNC_INTERVAL_MS,
+      settleMs: process.env.THEIA_SELENE_SYNC_SETTLE_MS,
+      onImport: importSeleneInboxEvents,
+      logger: (level, message) => console[level === 'warn' ? 'warn' : 'log'](`[THEIA] ${message}`),
+    })
+    seleneInboxWatchers.set(directory, watcher)
+    await watcher.start()
+  }
+  return [...seleneInboxWatchers.values()]
+}
+
+function configuredMnemoInboxDirectories() {
+  const configured = typeof process.env.THEIA_MNEMO_INBOX === 'string'
+    ? process.env.THEIA_MNEMO_INBOX.split(';').map((value) => value.trim()).filter(Boolean)
+    : []
+  return [...new Set([mnemoInboxDirectoryPath, ...configured].map((value) => resolve(value)))]
+}
+
+async function availableMnemoInboxDirectories() {
+  const available = []
+  for (const directory of configuredMnemoInboxDirectories()) {
+    try {
+      if ((await stat(directory)).isDirectory()) available.push(directory)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') console.warn(`[THEIA] cannot inspect MNEMO directory ${directory}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  return available
+}
+
+function mnemoWatcherStatePath(directory) {
+  const suffix = createHash('sha256').update(directory).digest('hex').slice(0, 12)
+  return `${mnemoInboxStatePath}.${suffix}.json`
+}
+
+async function importMnemoInboxRecords(records) {
+  const write = sharedIntelWriteQueue.then(async () => {
+    const saved = await writeSharedIntelDelta({ upserts: records, deleteIds: [] })
+    return { importedRecords: records.length, archiveRecordCount: Number(saved?.recordCount) || 0 }
   })
-  seleneInboxWatcher = watcher
-  await watcher.start()
-  return watcher
+  sharedIntelWriteQueue = write.catch(() => undefined)
+  return write
+}
+
+async function startMnemoInboxSync() {
+  const directories = await availableMnemoInboxDirectories()
+  for (const directory of directories) {
+    if (mnemoInboxWatchers.has(directory)) continue
+    const watcher = createMnemoInboxWatcher({
+      directory,
+      statePath: mnemoWatcherStatePath(directory),
+      intervalMs: process.env.THEIA_MNEMO_INBOX_INTERVAL_MS,
+      settleMs: process.env.THEIA_MNEMO_INBOX_SETTLE_MS,
+      onImport: importMnemoInboxRecords,
+      logger: (level, message) => console[level === 'warn' ? 'warn' : 'log'](`[THEIA] ${message}`),
+    })
+    mnemoInboxWatchers.set(directory, watcher)
+    await watcher.start()
+  }
+  return [...mnemoInboxWatchers.values()]
+}
+
+async function startMnemoIntegration() {
+  await mkdir(mnemoInboxDirectoryPath, { recursive: true, mode: 0o700 })
+  const agent = await mnemoAgent.start()
+  await startMnemoInboxSync()
+  return agent
+}
+
+function botLocalDate(now = new Date()) {
+  const offset = now.getTimezoneOffset() * 60_000
+  return new Date(now.getTime() - offset).toISOString().slice(0, 10)
+}
+
+function botJournalRecord(data, content) {
+  const body = cleanString(content, 8_000)
+  if (!body) throw new Error('日记内容不能为空')
+  const capturedAt = new Date().toISOString()
+  const id = `bot-journal-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
+  const speaker = cleanString(data?.profile?.name, 120) || '我'
+  return {
+    id,
+    title: body.length > 40 ? `${body.slice(0, 40)}...` : body,
+    summary: body.slice(0, 1_200),
+    content: body,
+    source: '手动记录',
+    sourceFile: 'theia://self-journal',
+    conversationId: 'self-journal',
+    conversationName: '我',
+    conversationKind: 'direct',
+    speaker,
+    messageType: 'journal',
+    speakerRole: 'self',
+    capturedAt,
+    status: 'reviewed',
+  }
+}
+
+function botCheckIn(data, fields) {
+  if (!fields || typeof fields !== 'object' || Array.isArray(fields)) throw new Error('状态数据格式无效')
+  const now = new Date()
+  if (fields.date !== undefined && (typeof fields.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(fields.date))) throw new Error('状态日期必须是 YYYY-MM-DD')
+  if (fields.mood !== undefined && ![1, 2, 3, 4, 5].includes(Number(fields.mood))) throw new Error('心情必须是 1 到 5')
+  if (fields.sleepHours !== undefined && (!Number.isFinite(Number(fields.sleepHours)) || Number(fields.sleepHours) < 0 || Number(fields.sleepHours) > 24)) throw new Error('睡眠时长必须在 0 到 24 小时之间')
+  if (fields.medication !== undefined && !['yes', 'no', 'reduced', 'unknown'].includes(fields.medication)) throw new Error('药物状态无效')
+  if (fields.alcohol !== undefined && !['none', 'low', 'high', 'unknown'].includes(fields.alcohol)) throw new Error('酒精状态无效')
+  const date = typeof fields.date === 'string' ? fields.date : botLocalDate(now)
+  const existing = Array.isArray(data?.dailyCheckins) ? data.dailyCheckins.find((item) => item?.date === date) : null
+  const mood = [1, 2, 3, 4, 5].includes(Number(fields.mood)) ? Number(fields.mood) : existing?.mood
+  const requestedHours = Number(fields.sleepHours)
+  const sleepHours = Number.isFinite(requestedHours) && requestedHours >= 0 && requestedHours <= 24
+    ? Math.round(requestedHours * 2) / 2
+    : existing?.sleepHours
+  const medication = ['yes', 'no', 'reduced', 'unknown'].includes(fields.medication) ? fields.medication : (existing?.medication ?? 'unknown')
+  const alcohol = ['none', 'low', 'high', 'unknown'].includes(fields.alcohol) ? fields.alcohol : (existing?.alcohol ?? 'unknown')
+  const mainFocus = cleanString(fields.mainFocus, 360) || existing?.mainFocus
+  const note = cleanString(fields.note, 1_200) || existing?.note
+  const createdAt = typeof existing?.createdAt === 'string' ? existing.createdAt : now.toISOString()
+  return {
+    id: `self-checkin-${date}`,
+    date,
+    ...(mood ? { mood } : {}),
+    ...(sleepHours !== undefined ? { sleepHours } : {}),
+    medication,
+    alcohol,
+    ...(mainFocus ? { mainFocus } : {}),
+    ...(note ? { note } : {}),
+    createdAt,
+    updatedAt: now.toISOString(),
+  }
+}
+
+function botCheckInRecord(data, checkIn) {
+  const medicationLabels = { yes: '是', no: '否', reduced: '减量', unknown: '未记录' }
+  const alcoholLabels = { none: '无', low: '少', high: '多', unknown: '未记录' }
+  const content = [
+    '[每日状态快照]',
+    checkIn.mood ? `状态：${checkIn.mood}/5` : '',
+    checkIn.sleepHours !== undefined ? `睡眠：${checkIn.sleepHours} 小时` : '',
+    `药物：${medicationLabels[checkIn.medication] ?? '未记录'}`,
+    `酒精：${alcoholLabels[checkIn.alcohol] ?? '未记录'}`,
+    checkIn.mainFocus ? `主要在做：${checkIn.mainFocus}` : '',
+    checkIn.note ? `一句话：${checkIn.note}` : '',
+  ].filter(Boolean).join('\n')
+  return {
+    id: checkIn.id,
+    title: `${checkIn.date} 状态快照`,
+    summary: content,
+    content,
+    source: '手动记录',
+    sourceFile: 'theia://self-journal',
+    conversationId: 'self-journal',
+    conversationName: '我',
+    conversationKind: 'direct',
+    speaker: cleanString(data?.profile?.name, 120) || '我',
+    messageType: 'daily-checkin',
+    speakerRole: 'self',
+    capturedAt: `${checkIn.date}T12:00:00.000`,
+    status: 'reviewed',
+  }
+}
+
+function botPersonSummary(person) {
+  return {
+    id: cleanString(person?.id, 160),
+    name: cleanString(person?.name, 160) || '未命名人物',
+    lastObservedAt: typeof person?.lastObservedAt === 'string' ? person.lastObservedAt : '',
+    portrait: cleanString(person?.portrait, 480),
+    factCount: Array.isArray(person?.facts) ? person.facts.length : 0,
+    preferenceCount: Array.isArray(person?.preferences) ? person.preferences.length : 0,
+  }
+}
+
+async function botOverview() {
+  const [snapshot, archive] = await Promise.all([loadSharedState(), loadSharedIntelMeta()])
+  const data = snapshot?.data ?? {}
+  const quests = Array.isArray(data.quests) ? data.quests : []
+  // Lightweight shared state intentionally omits archive metadata. When the
+  // old summary is absent, ask the archive's cached conversation index for
+  // its count without ever returning message bodies to the Bot.
+  let archiveConversationCount = Number(data?.archive?.conversationCount) || 0
+  if (!archiveConversationCount && Number(archive?.recordCount) > 0) {
+    archiveConversationCount = Number((await loadSharedIntelConversationIndex({ limit: 1 }))?.totalConversations) || 0
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    profileName: cleanString(data?.profile?.name, 120) || '我',
+    activeQuestCount: quests.filter((item) => item?.status === 'active' || item?.status === 'available').length,
+    completedQuestCount: quests.filter((item) => item?.status === 'done').length,
+    peopleCount: Array.isArray(data.people) ? data.people.length : 0,
+    journalCheckInCount: Array.isArray(data.dailyCheckins) ? data.dailyCheckins.length : 0,
+    archiveRecordCount: Number(archive?.recordCount) || 0,
+    archiveConversationCount,
+    archiveUpdatedAt: archive?.updatedAt ?? null,
+  }
 }
 
 const candidateSchema = {
@@ -1637,17 +1887,7 @@ function buildSelfObservationPrompt(payload) {
   const workflowInstructions = cleanString(payload.settings?.promptInstructions?.selfObservation, 6000)
   const compactRecords = compactModelRecords(payload.records)
   const coreRecordIndexes = new Set((Array.isArray(conversation.coreRecordIndexes) ? conversation.coreRecordIndexes : []).map(String))
-  const checkIns = Array.isArray(payload.dailyCheckins)
-    ? payload.dailyCheckins.map((checkIn) => ({
-      id: cleanString(checkIn?.id, 120), date: cleanString(checkIn?.date, 20),
-      mood: Number.isFinite(Number(checkIn?.mood)) ? Number(checkIn.mood) : null,
-      sleepHours: Number.isFinite(Number(checkIn?.sleepHours)) ? Number(checkIn.sleepHours) : null,
-      medication: cleanString(checkIn?.medication, 24) || null,
-      alcohol: cleanString(checkIn?.alcohol, 24) || null,
-      mainFocus: cleanString(checkIn?.mainFocus, 360) || null,
-      note: cleanString(checkIn?.note, 1200) || null,
-    })).filter((checkIn) => checkIn.id && checkIn.date).slice(0, 90)
-    : []
+  const contextEvents = Array.isArray(payload.contextEvents) ? payload.contextEvents : []
   return [
     'You are extracting evidence-backed observations about the app user from their own writing. This is not diagnosis, therapy, scoring, or prediction.',
     `This is chronological self-analysis window ${Number(conversation.segmentIndex) || 1}/${Number(conversation.segmentCount) || 1}. Rows are [RecordRef, sentAt, content, speakerRole]. Every row has been locally verified as self-authored. RecordRef is the only evidence reference you may return.`,
@@ -1655,9 +1895,9 @@ function buildSelfObservationPrompt(payload) {
     'Extract only concrete observations that help reconstruct a life timeline: events, actions, decisions, expressed emotions or thoughts, relationship interactions, routines, stressors, coping attempts, explicit uncertainty, and clearly evidenced changes. A proposed plan, joke, isolated phrase, or one emotional moment is not a stable trait. Preserve time and uncertainty in the wording.',
     'Each observation needs a concise Simplified-Chinese text and one or more evidence items. Each evidence quote must be an exact contiguous substring (2-180 characters) of the cited row. Cite every essential claim. If an observation cannot be expressed without adding an interpretation, omit it.',
     'Never diagnose or label the user with a disorder, personality type, attachment style, trauma, addiction, or other clinical conclusion. Do not infer motives, hidden feelings, risk, gender, relationship status, causes of a gap in contact, or events not stated in the records. Terms such as stress, fatigue, avoidance, rumination, coping, or emotional fluctuation are allowed only as ordinary descriptive observations when the user explicitly describes the relevant experience; no medical claim follows from them.',
-    'Daily check-ins are self-authored structured anchors. They may support an observation only when the matching check-in id is also present as a row RecordRef; otherwise they are chronology context, not evidence. Do not manufacture a missing message from a snapshot.',
+    'Authorized context events are contemporaneous background from a device or imported file, not user-authored statements and not evidence. Never cite them as RecordRef, turn them into a reported feeling, infer a cause, diagnosis, medication decision, or hidden motive from them, or claim that they explain a decision. They can only help you keep the chronology straight. Exact locations are intentionally absent.',
     `User-editable self-observation instructions are subordinate to these evidence rules: ${workflowInstructions || 'none'}`,
-    `Structured daily check-ins in this time window: ${JSON.stringify(checkIns)}`,
+    `Authorized context events in this time window: ${JSON.stringify(contextEvents)}`,
     `Self-authored rows: ${JSON.stringify(compactRecords)}`,
     'Return exactly {"observations":[{"kind":"event","text":"...","evidence":[{"sourceId":"1","quote":"..."}]}]}. Return an empty array when nothing satisfies every requirement.',
   ].join('\n')
@@ -2759,19 +2999,34 @@ function validateSelfObservationPayload(payload) {
   if (!payload.records.every((record) => record?.speakerRole === 'self')) {
     throw new Error('Self analysis accepts only locally verified self-authored records')
   }
-  const dailyCheckins = Array.isArray(payload.dailyCheckins)
-    ? payload.dailyCheckins.filter((item) => item && typeof item === 'object').map((item) => ({
-      id: cleanString(item.id, 120),
-      date: cleanString(item.date, 20),
-      mood: Number.isFinite(Number(item.mood)) ? Number(item.mood) : null,
-      sleepHours: Number.isFinite(Number(item.sleepHours)) ? Number(item.sleepHours) : null,
-      medication: cleanString(item.medication, 24) || null,
-      alcohol: cleanString(item.alcohol, 24) || null,
-      mainFocus: cleanString(item.mainFocus, 360) || null,
-      note: cleanString(item.note, 1200) || null,
-    })).filter((item) => item.id && /^\d{4}-\d{2}-\d{2}$/.test(item.date)).slice(0, 90)
+  const allowedKinds = new Set(['calendar', 'location', 'screen-time', 'activity', 'health', 'payment', 'device', 'custom'])
+  const allowedSources = new Set(['selene'])
+  const contextEvents = Array.isArray(payload.contextEvents)
+    ? payload.contextEvents.filter((item) => item && typeof item === 'object' && allowedSources.has(item.source)).map((item) => {
+      const values = item.values && typeof item.values === 'object' && !Array.isArray(item.values)
+        ? Object.fromEntries(Object.entries(item.values).flatMap(([key, value]) => {
+          if (!/^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$/.test(key) || /(?:^|[_.-])(?:lat(?:itude)?|lng|lon(?:gitude)?|coord(?:inate)?s?|address|geohash)(?:$|[_.-])/i.test(key)) return []
+          if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) return [[key, value]]
+          const text = cleanString(value, 800)
+          return text ? [[key, text]] : []
+        }).slice(0, 48))
+        : undefined
+      const startAt = validIsoTimestamp(item.startAt)
+      const endAt = validIsoTimestamp(item.endAt)
+      return {
+        id: cleanString(item.id, 160),
+        kind: allowedKinds.has(item.kind) ? item.kind : 'custom',
+        source: 'selene',
+        startAt,
+        ...(endAt && (!startAt || Date.parse(endAt) >= Date.parse(startAt)) ? { endAt } : {}),
+        title: cleanString(item.kind === 'location' ? 'Location capture' : item.title, 240),
+        ...(item.kind === 'location' ? {} : (cleanString(item.summary, 2400) ? { summary: cleanString(item.summary, 2400) } : {})),
+        ...(values && Object.keys(values).length ? { values } : {}),
+        privacy: 'coarse',
+      }
+    }).filter((item) => item.id && item.startAt && item.title).slice(0, 180)
     : []
-  return { ...payload, dailyCheckins }
+  return { ...payload, contextEvents }
 }
 
 function validateSelfMergePayload(payload) {
@@ -3452,6 +3707,16 @@ export const server = http.createServer(async (request, response) => {
     }
     return
   }
+  if (requestPath === '/api/media/avatar/local' && request.method === 'GET') {
+    try {
+      const avatarId = new URL(request.url || '/', 'http://127.0.0.1').searchParams.get('id') || ''
+      const image = await readMnemoAvatar(avatarCacheDirectoryPath, avatarId)
+      sendImage(response, image.mimeType, image.content, 60 * 60 * 24 * 30)
+    } catch (error) {
+      sendRequestError(response, error, '本地 MNEMO 头像加载失败')
+    }
+    return
+  }
   if (requestPath === '/api/map/config' && request.method === 'GET') {
     try {
       const { settings } = await loadSettings()
@@ -3746,11 +4011,190 @@ export const server = http.createServer(async (request, response) => {
     }
     return
   }
+  if (requestPath === '/api/bot/summary' && request.method === 'GET') {
+    try {
+      sendJson(response, 200, await botOverview())
+    } catch (error) {
+      sendRequestError(response, error, '无法读取 THEIA 摘要')
+    }
+    return
+  }
+  if (requestPath === '/api/bot/ai' && request.method === 'GET') {
+    try {
+      const pool = await loadProviderPoolStatus()
+      sendJson(response, 200, {
+        scheduler: {
+          queueDepth: Number(pool.scheduler?.queueDepth) || 0,
+          activeRequests: Number(pool.scheduler?.activeRequests) || 0,
+          effectiveMaxConcurrency: Number(pool.scheduler?.effectiveMaxConcurrency) || 0,
+          availableCapacity: Number(pool.scheduler?.availableCapacity) || 0,
+        },
+        channels: (Array.isArray(pool.channels) ? pool.channels : []).map((channel) => ({
+          id: cleanString(channel?.id, 120),
+          name: cleanString(channel?.name, 120) || cleanString(channel?.id, 120) || '未命名通道',
+          enabled: channel?.enabled === true,
+          status: cleanString(channel?.runtime?.status, 40) || 'unknown',
+          activeRequests: Number(channel?.runtime?.activeRequests) || 0,
+          maxConcurrency: Number(channel?.runtime?.effectiveMaxConcurrency) || Number(channel?.maxConcurrency) || 1,
+          cooldownUntil: typeof channel?.runtime?.cooldownUntil === 'string' ? channel.runtime.cooldownUntil : null,
+        })),
+      })
+    } catch (error) {
+      sendRequestError(response, error, '无法读取 AI 通道状态')
+    }
+    return
+  }
+  if (requestPath === '/api/bot/selene' && request.method === 'GET') {
+    try {
+      const snapshot = await loadSharedState()
+      const events = (Array.isArray(snapshot?.data?.contextEvents) ? snapshot.data.contextEvents : [])
+        .filter((item) => item?.source === 'selene')
+        .sort((left, right) => String(right?.startAt ?? '').localeCompare(String(left?.startAt ?? '')))
+      const platforms = events.reduce((counts, item) => {
+        const source = String(item?.sourceFile ?? '')
+        const platform = /android/i.test(source) ? 'android' : /windows/i.test(source) ? 'windows' : 'unknown'
+        counts[platform] = (counts[platform] ?? 0) + 1
+        return counts
+      }, {})
+      sendJson(response, 200, {
+        eventCount: events.length,
+        platformMix: platforms,
+        latestCapturedAt: events[0]?.capturedAt ?? null,
+        // Location coordinates, consent tokens, source file paths, and all
+        // unbounded event values deliberately stay out of the Bot surface.
+        latestEvents: events.slice(0, 6).map((item) => ({
+          kind: cleanString(item?.kind, 40),
+          title: cleanString(item?.title, 180),
+          startAt: typeof item?.startAt === 'string' ? item.startAt : null,
+          privacy: item?.privacy === 'precise' ? 'precise' : 'coarse',
+        })),
+      })
+    } catch (error) {
+      sendRequestError(response, error, '无法读取 SELENE 时间线摘要')
+    }
+    return
+  }
   if (requestPath === '/api/selene-sync/status' && request.method === 'GET') {
-    const directory = configuredSeleneInbox()
-    sendJson(response, 200, seleneInboxWatcher
-      ? seleneInboxWatcher.status()
-      : { enabled: false, directory, reason: directory ? 'starting' : 'THEIA_SELENE_INBOX is not configured' })
+    const directories = configuredSeleneInboxDirectories()
+    const statuses = [...seleneInboxWatchers.values()].map((watcher) => watcher.status())
+    sendJson(response, 200, seleneInboxWatchers.size
+      ? { enabled: true, directories: statuses, directoryCount: statuses.length, lastError: statuses.find((item) => item.lastError)?.lastError ?? null, lastSuccessAt: statuses.map((item) => item.lastSuccessAt).filter(Boolean).sort().at(-1) ?? null }
+      : { enabled: false, directories, reason: directories.length ? 'starting' : 'No SELENE export directory was found' })
+    return
+  }
+  if (requestPath === '/api/mnemo/status' && request.method === 'GET') {
+    const directories = configuredMnemoInboxDirectories()
+    const watcherStatuses = [...mnemoInboxWatchers.values()].map((watcher) => watcher.status())
+    const agent = mnemoAgent.status()
+    sendJson(response, 200, {
+      enabled: agent.enabled,
+      agent,
+      directoryCount: watcherStatuses.length,
+      directories: watcherStatuses,
+      configuredDirectories: directories,
+      lastError: agent.lastError ?? watcherStatuses.find((item) => item.lastError)?.lastError ?? null,
+      lastSuccessAt: watcherStatuses.map((item) => item.lastSuccessAt).filter(Boolean).sort().at(-1) ?? null,
+    })
+    return
+  }
+  if (requestPath === '/api/bot/quests' && request.method === 'GET') {
+    try {
+      const snapshot = await loadSharedState()
+      const quests = (Array.isArray(snapshot?.data?.quests) ? snapshot.data.quests : [])
+        .filter((item) => item?.status === 'active' || item?.status === 'available')
+        .slice(0, 30)
+        .map((item) => ({
+          id: cleanString(item?.id, 160),
+          title: cleanString(item?.title, 240) || '未命名任务',
+          dueAt: typeof item?.dueAt === 'string' ? item.dueAt : null,
+          startAt: typeof item?.startAt === 'string' ? item.startAt : null,
+          status: item?.status === 'active' ? 'active' : 'available',
+        }))
+      sendJson(response, 200, { items: quests })
+    } catch (error) {
+      sendRequestError(response, error, '无法读取任务摘要')
+    }
+    return
+  }
+  if (requestPath === '/api/bot/people' && request.method === 'GET') {
+    try {
+      const query = (new URL(request.url || '/', 'http://127.0.0.1').searchParams.get('q') || '').trim().toLocaleLowerCase('zh-CN')
+      const snapshot = await loadSharedState()
+      const people = (Array.isArray(snapshot?.data?.people) ? snapshot.data.people : [])
+        .map(botPersonSummary)
+        .filter((item) => !query || `${item.name}\u0000${item.portrait}`.toLocaleLowerCase('zh-CN').includes(query))
+        .sort((left, right) => String(right.lastObservedAt).localeCompare(String(left.lastObservedAt)) || left.name.localeCompare(right.name, 'zh-CN'))
+        .slice(0, query ? 20 : 40)
+      sendJson(response, 200, { items: people })
+    } catch (error) {
+      sendRequestError(response, error, '无法读取人物摘要')
+    }
+    return
+  }
+  if (requestPath === '/api/bot/journal' && request.method === 'POST') {
+    try {
+      const payload = await readBody(request)
+      const snapshot = await loadSharedState()
+      if (!snapshot?.data) {
+        const error = new Error('THEIA 尚未初始化共享数据；请先启动一次桌面版或浏览器版。')
+        error.status = 409
+        throw error
+      }
+      const record = botJournalRecord(snapshot.data, payload?.content)
+      const archive = await saveSharedIntelDelta({ upserts: [record], deleteIds: [] })
+      // Return the persisted shape, not merely a 2xx acknowledgement. Iris
+      // treats this as its write receipt and will surface a protocol error if
+      // a future server change stops producing a self-journal row.
+      sendJson(response, 201, {
+        id: record.id,
+        capturedAt: record.capturedAt,
+        archiveUpdatedAt: archive.updatedAt ?? null,
+        record,
+      })
+    } catch (error) {
+      sendRequestError(response, error, '无法保存日记')
+    }
+    return
+  }
+  if (requestPath === '/api/bot/check-in' && request.method === 'POST') {
+    try {
+      const payload = await readBody(request)
+      let savedCheckIn
+      let archiveRecord
+      await mutateSharedState((data) => {
+        savedCheckIn = botCheckIn(data, payload)
+        archiveRecord = botCheckInRecord(data, savedCheckIn)
+        const checkins = Array.isArray(data.dailyCheckins) ? data.dailyCheckins.filter((item) => item?.date !== savedCheckIn.date) : []
+        return { ...data, dailyCheckins: [savedCheckIn, ...checkins].sort((left, right) => String(right?.date ?? '').localeCompare(String(left?.date ?? ''))) }
+      })
+      await saveSharedIntelDelta({ upserts: [archiveRecord], deleteIds: [] })
+      sendJson(response, 200, { item: savedCheckIn })
+    } catch (error) {
+      sendRequestError(response, error, '无法保存每日状态')
+    }
+    return
+  }
+  const botCompleteQuestMatch = requestPath.match(/^\/api\/bot\/quests\/([^/]+)\/complete$/)
+  if (botCompleteQuestMatch && request.method === 'POST') {
+    try {
+      let id
+      try { id = decodeURIComponent(botCompleteQuestMatch[1]) } catch { id = botCompleteQuestMatch[1] }
+      let completed
+      await mutateSharedState((data) => {
+        const quests = Array.isArray(data.quests) ? data.quests : []
+        const target = quests.find((item) => item?.id === id)
+        if (!target) {
+          const error = new Error('任务不存在或已被删除')
+          error.status = 404
+          throw error
+        }
+        completed = target.status === 'done' ? target : { ...target, previousStatus: target.status, status: 'done' }
+        return { ...data, quests: quests.map((item) => item?.id === id ? completed : item) }
+      })
+      sendJson(response, 200, { id: completed.id, title: completed.title, status: completed.status })
+    } catch (error) {
+      sendRequestError(response, error, '无法完成任务')
+    }
     return
   }
   if (request.url === '/api/runtime/recovery' && request.method === 'GET') {
@@ -3780,6 +4224,18 @@ export const server = http.createServer(async (request, response) => {
       sendJson(response, 200, await loadSharedIntelMeta())
     } catch (error) {
       sendJson(response, 500, { error: error instanceof Error ? error.message : '无法读取本机原始聊天归档' })
+    }
+    return
+  }
+  if (requestPath === '/api/sync/intel/changes' && request.method === 'GET') {
+    try {
+      const parameters = new URL(request.url || '/', 'http://127.0.0.1').searchParams
+      sendJson(response, 200, await loadSharedIntelChanges({
+        since: parameters.get('since') || undefined,
+        limit: parameters.get('limit') || undefined,
+      }))
+    } catch (error) {
+      sendJson(response, 500, { error: error instanceof Error ? error.message : 'Unable to read local archive changes.' })
     }
     return
   }
@@ -4256,7 +4712,11 @@ export function startAiProxy() {
         .then((status) => { recoveryStatus = status })
         .catch((error) => console.warn(`[THEIA] recovery marker unavailable: ${error instanceof Error ? error.message : String(error)}`))
       server.once('close', () => {
-        seleneInboxWatcher?.stop()
+        for (const watcher of seleneInboxWatchers.values()) watcher.stop()
+        seleneInboxWatchers.clear()
+        for (const watcher of mnemoInboxWatchers.values()) watcher.stop()
+        mnemoInboxWatchers.clear()
+        mnemoAgent.stop()
         void finishRecoverySession(serviceSessionPath).catch(() => undefined)
       })
       void withFileLock(`${sharedStatePath}.lock`, () => migrateSharedStateFile(sharedStatePath, migrationDirectoryPath))
@@ -4276,6 +4736,7 @@ export function startAiProxy() {
         })
       void compactExistingTaskLogs()
       void startSeleneInboxSync().catch((error) => console.warn(`[THEIA] SELENE inbox disabled: ${error instanceof Error ? error.message : String(error)}`))
+      void startMnemoIntegration().catch((error) => console.warn(`[THEIA] MNEMO integration disabled: ${error instanceof Error ? error.message : String(error)}`))
       resolve(server)
     })
   })

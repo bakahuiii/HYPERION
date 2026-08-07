@@ -1,5 +1,25 @@
 # Release Notes
 
+## 0.6.0 MNEMO Continuous Local WeChat Archive
+
+Release date: 2026-08-07
+
+Release type: backward-compatible feature release. It establishes MNEMO as a THEIA-managed local WeChat intake without adding a cloud service or changing the authoritative archive format.
+
+### Main Changes
+
+- Added the independent MNEMO agent controller and immutable `mnemo-delta/v1` inbox. THEIA owns process lifecycle, batch validation, deduplication, archive writes, status reporting, and restart-safe resume; no repeated manual import is needed after one local key capture.
+- Stable records use account/database/table/local-message identity, so name changes, avatar updates, sidecar restarts, and bounded replays cannot create new logical messages.
+- Readable conversation copies now use the counterpart's remark first and nickname second for both directory and JSON filename. Windows-safe collision handling adds a short hash only when necessary; a changed remark moves the readable copy without changing archive identity.
+- MNEMO reads local avatar blobs only from its read-only snapshot, checks JPEG/PNG/GIF/WebP/AVIF signatures, and writes SHA-256 addressed files directly to THEIA's avatar cache. Archive rows expose only a verified loopback avatar URL.
+- Documented the sidecar contract, backup boundary, status endpoint, local avatar route, export layout, and incremental-analysis timing across the user, developer, API, and export-format guides.
+
+### Compatibility And Verification
+
+- Existing JSON/CSV/TXT imports, append-only `theia-intel-archive/v1` segments, settings, and analysis watermarks remain compatible. MNEMO is an additional intake source, not a second archive database.
+- A changed MNEMO conversation becomes eligible at the next automatic analysis check; the existing workflow sends changed records plus bounded prior context rather than the full history.
+- Verification covers Python MNEMO unit tests, immutable inbox normalization, archive import idempotence, local avatar path/signature handling, THEIA regression tests, build, lint, and a live local MNEMO agent status check.
+
 ## 0.5.0 长期自我研究与大归档基础
 
 发布日期：2026-08-06

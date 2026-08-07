@@ -2,13 +2,19 @@
 
 [简体中文](README.md) | [English](README.en.md)
 
-THEIA 是一个本地优先的个人现实任务图工具。它将用户主动导出的聊天记录整理为可审核的任务、行程、人物和地点信息，并保留可追溯的原始来源。
+THEIA 是一个本地优先的个人现实任务图工具。它将聊天记录与主动记录整理为可审核的任务、行程、人物和地点信息，并保留可追溯的原始来源。
 
-它不是聊天软件插件，也不会绕过登录或解密应用数据库。THEIA 只读取你明确选择的导出文件；只有在你启动模型提炼后，选中的记录才会发送到你配置的模型服务。
+除 JSON、CSV、TXT 的手动导入外，THEIA 还可管理本机 MNEMO 微信适配器。用户在 MNEMO 中完成一次本人账号的本地密钥捕获后，MNEMO 仅在本机对该账号创建只读快照，持续把增量记录交给 THEIA；它不联网发送密钥、正文或头像。只有在你启动模型提炼后，选中的归档记录才会发送到你配置的模型服务。
 
-> 当前源码版本：`0.5.0`。Windows x64 NSIS 安装器、便携版与源码发布包分别生成；安装器和便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js，任务、设置、聊天归档和日志保存在 `%APPDATA%\\THEIA`。重要数据请定期备份。
+> 当前源码版本：`0.6.0`。Windows x64 NSIS 安装器、便携版与源码发布包分别生成；安装器和便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js，任务、设置、聊天归档和日志保存在 `%APPDATA%\\THEIA`。重要数据请定期备份。
 
 ## 更新日志
+
+**0.6.0**
+
+- 新增 MNEMO 本机微信持续归档：THEIA 启动、管理和监控独立 sidecar，无需重复手工导入；稳定消息 ID 让重启和重放保持幂等。
+- 会话导出统一按“备注优先、昵称回退”命名为 `备注或昵称/备注或昵称.json`；本地头像由 THEIA 内容寻址缓存并经签名校验后提供。
+- 增量写入会触发已有的会话级分析水位检查，下一轮自动分析只携带新消息与有限上下文。
 
 **0.5.0**
 
@@ -35,6 +41,7 @@ THEIA 是一个本地优先的个人现实任务图工具。它将用户主动�
 ## 能做什么
 
 - 递归扫描导出目录，识别 JSON、CSV、TXT，并按会话归档和去重。
+- 在授权的一次性密钥捕获后，管理 MNEMO 的静默微信增量归档、按联系人备注/昵称的可读会话文件和 THEIA 本地头像缓存。
 - 保留原始消息正文、时间、发言人、发言方向、消息类型、平台、会话和头像 URL。
 - 按“最后聊天时间”筛选整段会话，或用“严格时间”只提交指定时间段内的消息。
 - 对超长会话做连续分段，覆盖全部记录，并在相邻段之间保留少量上下文重叠；不会用固定消息条数随机抽样。
@@ -123,15 +130,19 @@ npm install
 6. 用严格时间范围做第一次模型提炼，先看候选和人物卡，再扩大范围。
 7. 候选确认后生成任务；不合适的候选要选择原因后忽略，磨合记录会影响后续提示。
 
+微信持续归档的首次设置、目录和状态接口见 [MNEMO 集成](docs/MNEMO.md)。它不替代已有的 JSON/CSV/TXT 导入。
+
 模型通道与导入格式的完整说明见 [用户手册](docs/USER_GUIDE.md) 和 [聊天导出格式](docs/CHAT_EXPORT_FORMAT.md)。
 
 ## 数据如何流动
 
 ```text
-用户主动导出的 JSON / CSV / TXT
+用户主动导出的 JSON / CSV / TXT        本机 MNEMO 只读快照
                 |
                 v
-      浏览器内本地解析与去重
+      浏览器内本地解析与去重                 不可变增量批次
+                |                              |
+                +---------------+--------------+
                 |
                 +----> 原始归档（gzip JSONL 分段 / IndexedDB v2）
                 |
@@ -162,12 +173,14 @@ THEIA-release/
   app/                       应用源码、依赖清单和运行脚本
   assets/img/
     backgrounds/             用户上传的全局背景
-    avatars/                 从导出记录下载的联系人头像缓存
+    avatars/                 远程缓存及 MNEMO 本地捕获的联系人头像
   data/
     state.json               任务、人物、地点、候选和任务图布局
     chat-archive/             append-only gzip JSONL 归档段
     chat-archive.json.gz      旧版原始聊天归档，只作为迁移/回滚源
     chat-archive.meta.json    归档 schema、水位、段数和消息计数
+    mnemo-inbox/              MNEMO 写入、THEIA 读取的不可变批次
+    mnemo-export/             可读会话副本，按备注或昵称命名
     settings.ini             名称、外观、提示词、模型地址和 credentialRef
     credentials.json         桌面版 safeStorage 加密密钥容器
     migrations/              schema 迁移前备份
@@ -210,8 +223,8 @@ THEIA-release/
 发布工具：
 
 ```powershell
-node release-tools/package-release.mjs ..\staging\v0.5.0\THEIA-release-0.5.0
-npm run dist:exe -- ..\staging\v0.5.0\THEIA-0.5.0-portable
+node release-tools/package-release.mjs ..\staging\v0.6.0\THEIA-release-0.6.0
+npm run dist:exe -- ..\staging\v0.6.0\THEIA-0.6.0-portable
 npm run release:index
 ```
 
@@ -224,6 +237,7 @@ npm run release:index
 - [开发者文档](docs/DEVELOPER_GUIDE.md)：技术栈、模块边界、状态流、模型流水线、API、性能和发布。
 - [API 协议参考](docs/API_PROTOCOL.md)：本地 HTTP、模型请求 JSON、session 批处理、通道状态、日志和错误回退的逐字段说明。
 - [聊天导出格式](docs/CHAT_EXPORT_FORMAT.md)：推荐 JSON/CSV/TXT 字段、目录结构、发言方向和头像规则。
+- [MNEMO 集成](docs/MNEMO.md)：微信本机持续归档、命名规则、头像存储、状态与排错。
 - [故障排查](docs/TROUBLESHOOTING.md)：启动、端口、GPU、导入、0 候选、502/403、地图和数据恢复。
 - [隐私与数据](docs/PRIVACY_AND_DATA.md)：文件敏感等级、模型传输、备份、迁移和问题报告脱敏。
 - [版本管理](docs/VERSIONING.md)：工作目录布局、语义化版本、发布步骤、校验、标签和回滚规范。
@@ -237,4 +251,4 @@ npm run release:index
 - 当前没有加密数据库。保护 Windows 账户、磁盘和备份介质是用户责任。
 - 当前通过版本化 schema、迁移前备份和离线回滚脚本兼容旧状态与归档；跨大版本升级前仍须备份整个运行时目录。
 
-本项目只支持用户授权的导出数据，不提供绕过登录、盗取凭据、解密私人数据库或未授权抓取能力。
+MNEMO 只处理用户已授权、在本机完成一次密钥捕获的账号数据；它不绕过登录、不采集其他账号、不发送密钥，也不提供远程或未授权抓取能力。

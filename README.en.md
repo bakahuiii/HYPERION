@@ -2,13 +2,19 @@
 
 [简体中文](README.md) | [English](README.en.md)
 
-THEIA is a local-first personal task-atlas application. It turns user-exported conversations into reviewable tasks, schedules, people, and places while preserving traceable source evidence.
+THEIA is a local-first personal task-atlas application. It turns conversations and deliberate personal records into reviewable tasks, schedules, people, and places while preserving traceable source evidence.
 
-THEIA is not a chat-client plugin. It does not bypass login systems or decrypt application databases. It reads only files deliberately selected by the user. Selected records leave the computer only after the user starts model analysis, and they are sent to the model provider configured by that user.
+Alongside JSON, CSV, and TXT imports, THEIA can manage the local MNEMO WeChat adapter. After the user captures a key once for their own account in MNEMO, the adapter makes read-only local snapshots and continuously delivers deltas to THEIA. Keys, message bodies, and avatars never leave the machine through MNEMO. Records leave the machine only when the user enables model analysis with a configured provider.
 
-> Current source version: `0.5.0`. Windows x64 NSIS and portable builds bundle Electron and Node.js. Tasks, settings, conversation archives, and logs are stored under `%APPDATA%\THEIA` in an installed build. Back up important data regularly.
+> Current source version: `0.6.0`. Windows x64 NSIS and portable builds bundle Electron and Node.js. Tasks, settings, conversation archives, and logs are stored under `%APPDATA%\THEIA` in an installed build. Back up important data regularly.
 
 ## Changelog
+
+**0.6.0**
+
+- Added MNEMO, a THEIA-managed local WeChat sidecar with idempotent stable IDs and no repeated manual import after one local key capture.
+- Readable conversation copies use the contact remark first and nickname second: `remark-or-nickname/remark-or-nickname.json`. THEIA content-addresses and verifies locally captured avatar files.
+- New archive deltas feed the existing per-conversation incremental analysis watermarks, so the next automatic pass sends only changed messages plus bounded context.
 
 **0.5.0**
 
@@ -35,6 +41,7 @@ See [Release Notes](docs/RELEASE_NOTES.md) for the full history.
 ## Current Capabilities
 
 - Recursively scan exported directories and import JSON, CSV, and TXT grouped by conversation.
+- Manage authorized MNEMO incremental WeChat intake, readable remark/nickname-named conversation copies, and THEIA-owned local avatar storage.
 - Preserve message text, time, sender, speaker direction, message type, platform, conversation, and avatar URL.
 - Select full conversations by last-contact time, or strictly crop messages to an exact time interval.
 - Segment oversized conversations continuously without random message sampling, retaining bounded overlap between adjacent segments.
@@ -107,13 +114,17 @@ The source-release package is intended for inspection and customization. Install
 6. Run the first analysis with a strict time range. Review candidates and person evidence before expanding scope.
 7. Generate accepted tasks. Dismiss unsuitable candidates with a reason so later prompts can incorporate that feedback.
 
+For the one-time MNEMO setup, local paths, status endpoint, and troubleshooting, see [MNEMO Integration](docs/MNEMO.md). MNEMO complements rather than replaces JSON/CSV/TXT imports.
+
 ## Data Flow
 
 ```text
-User-selected JSON / CSV / TXT
+User-selected JSON / CSV / TXT          Local MNEMO read-only snapshot
                 |
                 v
-      Local browser parsing and deduplication
+      Browser parsing and deduplication          Immutable deltas
+                |                                      |
+                +------------------+-------------------+
                 |
                 +----> Raw archive (gzip JSONL segments / IndexedDB v2)
                 |
@@ -141,12 +152,14 @@ Model credentials are sent only to the loopback service. Packaged Electron uses 
 THEIA runtime/
   assets/img/
     backgrounds/             user backgrounds
-    avatars/                 downloaded contact avatar cache
+    avatars/                 downloaded and MNEMO-captured contact avatars
   data/
     state.json               tasks, people, places, candidates, atlas layout
     chat-archive/             append-only gzip JSONL segments
     chat-archive.json.gz      legacy archive retained for migration/rollback
     chat-archive.meta.json    schema and archive watermarks
+    mnemo-inbox/              immutable batches written by MNEMO and read by THEIA
+    mnemo-export/             readable conversation copies named by remark or nickname
     settings.ini             appearance, prompts, provider metadata, credentialRef
     credentials.json         Electron safeStorage ciphertext container
     migrations/              pre-migration backups
@@ -182,6 +195,7 @@ Task logs may contain full conversation text. Never publish runtime `data/`, `lo
 - [Chinese User Guide](docs/USER_GUIDE.md): installation and operation for first-time users.
 - [API Protocol](docs/API_PROTOCOL.md): field-level local HTTP and upstream model protocol reference.
 - [Chat Export Format](docs/CHAT_EXPORT_FORMAT.md): JSON/CSV/TXT fields, directory layout, speaker direction, and avatars.
+- [MNEMO Integration](docs/MNEMO.md): local WeChat intake, naming, avatar storage, status, and troubleshooting.
 - [Troubleshooting](docs/TROUBLESHOOTING.md): startup, ports, GPU, imports, empty candidates, 502/403, maps, and recovery.
 - [Privacy and Data](docs/PRIVACY_AND_DATA.md): sensitivity levels, model transmission, backup, migration, and redaction.
 - [Versioning](docs/VERSIONING.md): local layout, semantic versions, checksums, tags, and rollback.
@@ -193,4 +207,4 @@ Task logs may contain full conversation text. Never publish runtime `data/`, `lo
 - Maps, weather, quotations, and remote avatars depend on third-party public services and their policies.
 - The minimum automatic-analysis interval is 24 hours and currently requires the application page to stay open.
 - Conversation bodies are not stored in an encrypted database. Protect the Windows account, disk, backups, and runtime directory.
-- THEIA does not provide login bypass, credential theft, private-database decryption, or unauthorized collection.
+- MNEMO handles only an account explicitly authorized by its local one-time key capture. It does not bypass login, collect other accounts, transmit keys, or support remote or unauthorized collection.

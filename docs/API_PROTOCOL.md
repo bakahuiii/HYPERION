@@ -1,6 +1,6 @@
 # THEIA 本地 API 与模型协议参考
 
-本文是 THEIA `0.5.0` 的协议级参考，面向前端、桌面壳、第三方导出适配器、测试服务和二次开发者。它描述的是当前 `server/index.mjs` 和 `src/lib/aiClient.ts` 的实际行为，不是未来规划。
+本文是 THEIA `0.6.0` 的协议级参考，面向前端、桌面壳、第三方导出适配器、测试服务和二次开发者。它描述的是当前 `server/index.mjs` 和 `src/lib/aiClient.ts` 的实际行为，不是未来规划。
 
 协议有两个边界：
 
@@ -597,6 +597,7 @@ Accept: application/json
 | `POST` | `/api/sync/snapshot` | 带 `expectedUpdatedAt` 原子写入；成功只返回新时间戳 |
 | `GET` | `/api/sync/meta` | 读取状态时间和归档计数 |
 | `GET` | `/api/sync/intel/meta` | 读取 gzip 原始归档元数据 |
+| `GET` | `/api/sync/intel/changes?since=` | 按 append-only 水位返回增量 upsert/delete；snapshot 边界返回 `requiresReload` |
 | `GET` | `/api/sync/intel` | 读取完整原始归档 |
 | `GET` | `/api/sync/intel/conversations` | 分页读取会话索引，不返回消息正文 |
 | `GET` | `/api/sync/intel/conversations/:id` | 分页读取单一会话的原始消息 |
@@ -671,6 +672,29 @@ GET /api/sync/intel/conversations/direct%3Aalice?limit=200&cursor=<opaque>
 
 `cursor` 是不透明游标，调用者只能原样传回；`limit` 限制在 `1..500`。单会话响应的 `items` 为按消息时间升序的完整归档记录，并包含 `totalRecords`、`conversation` 和同样语义的 `nextCursor`。桌面/浏览器默认每次读取 250 条，用户继续查看时再读取下一页。该接口不改变模型输入协议；分析开始前仍按会话加载需要的连续记录。禁止在 React 顶层状态、shared snapshot 或 localStorage 中重新保存整份正文。
 
+### 6.1.2 MNEMO 本机增量
+
+MNEMO 不通过公开写入 API 提交聊天。它向 THEIA 所有的 inbox 写入完整不可变目录 `MNEMO-v1-*/records.json`，由服务端 watcher 读取。文档必须满足：
+
+```json
+{
+  "schema": "mnemo-delta/v1",
+  "producer": { "name": "MNEMO", "version": "0.6.0", "layout": "immutable-delta-v1" },
+  "account": { "id": "wxid_example" },
+  "records": [{
+    "id": "mnemo:wxid_example:message_0:message:42",
+    "conversationId": "mnemo:wxid_example:wxid_contact",
+    "conversationName": "备注或昵称",
+    "conversationKind": "direct",
+    "content": "normalized local message",
+    "capturedAt": "2026-08-07T09:00:00.000Z",
+    "avatarId": "optional-64-lowercase-hex-content-hash"
+  }]
+}
+```
+
+THEIA 限制 batch record 数与文件大小，规范化所有文本/时间/枚举，并按 immutable file 的 SHA-256 记录导入状态。无效 record 被丢弃；无有效 record 的 batch 不进入 archive。`avatarId` 仅接受 64 位十六进制内容哈希，归档中被改写为本地 `avatarUrl`，绝不接收 base64 头像或本地路径。`GET /api/mnemo/status` 返回 agent 与 watcher 的无正文状态，不接受写入。
+
 ### 6.2 设置
 
 `GET/POST /api/settings` 读写 profile、appearance、AI settings；POST 未携带的 `mapSettings` 会保留，不会被界面设置保存覆盖。模型提示词四个字段为：`task`、`people`、`peopleMerge`、`taskGuidance`。设置文件使用 URL 编码的 INI v4；调用方不要手写 INI 覆盖整个文件，优先使用接口以保留迁移、凭据引用和归一化规则。
@@ -711,13 +735,79 @@ profile 的 `maxCoreRecords`、`maxCoreChars`、`overlapRecords`、`overlapChars
 
 这只是元数据接口，不返回聊天正文、Key 或任务日志内容。回滚没有开放 HTTP 写接口；必须关闭应用后从本机命令行执行，避免运行中的 renderer 把旧状态立刻覆盖。
 
-### 6.3 地图、头像和背景
+### 6.3 QQ Bot 窄接口
+
+`/api/bot/*` 只供同机部署的本地 Iris 使用。服务仍绑定在
+`127.0.0.1`，但这不是一个可安全暴露到局域网或公网的认证协议。Bot 不得调用
+`/api/sync/snapshot`，也不得直接读取 `.theia-shared-intel*`、状态文件、INI 或凭据容器。
+
+| 方法 | 路径 | 数据边界 |
+| --- | --- | --- |
+| `GET` | `/api/bot/summary` | 任务/人物/归档计数与最后归档时间 |
+| `GET` | `/api/bot/ai` | 调度器容量和去密钥化的通道占用 |
+| `GET` | `/api/bot/selene` | 粗粒度 SELENE 事件计数和最近事件摘要 |
+| `GET` | `/api/bot/quests` | 最多 30 条可完成任务的 id、标题、时间、状态 |
+| `GET` | `/api/bot/people?q=` | 人物名称、最后观察时间、截断刻画和计数 |
+| `POST` | `/api/bot/journal` | 向 append-only 归档增量追加一条本人日记 |
+| `POST` | `/api/bot/check-in` | 原子更新当天状态，并镜像为归档状态行 |
+| `POST` | `/api/bot/quests/:id/complete` | 在状态写锁内完成一个现存任务 |
+
+`POST /api/bot/journal` 接收：
+
+```json
+{ "content": "今天把导出数据重新整理了一遍。" }
+```
+
+服务端限制 `content` 为 8,000 个字符，生成唯一记录 id 和 `capturedAt`，固定写入
+`conversationId: "self-journal"`、`speakerRole: "self"`、`source: "手动记录"`，随后调用：
+
+成功响应还会返回 `record`（已写入的完整 `IntelItem`）和 `archiveUpdatedAt`。Iris 必须校验
+`record.conversationId === "self-journal"` 且 `record.speakerRole === "self"`，不能把仅有 HTTP 201
+视为日记已经落盘。运行中的 THEIA 前端通过 `/api/sync/intel/changes?since=<watermark>` 读取这类
+append-only 增量，因此不需要为一条日记重新下载完整聊天归档；遇到 snapshot/compaction 边界时响应
+`requiresReload: true`，客户端应等待下一次完整水合或显式刷新。
+
+```js
+saveSharedIntelDelta({ upserts: [record], deleteIds: [] })
+```
+
+这条路径不会下载或重写整个归档。请求成功仅返回 `{ "id", "capturedAt" }`。
+
+`POST /api/bot/check-in` 接收的可选字段为：
+
+```json
+{
+  "mood": 3,
+  "sleepHours": 7.5,
+  "medication": "reduced",
+  "alcohol": "low",
+  "mainFocus": "写代码",
+  "note": "晚上有点累"
+}
+```
+
+合法枚举为 `mood: 1..5`、`medication: yes|no|reduced|unknown`、
+`alcohol: none|low|high|unknown`；睡眠为 0..24 小时，按半小时规范化。保存 id 为
+`self-checkin-YYYY-MM-DD`，同一天更新覆盖相同 id 而不是创建第二个状态。共享状态的
+读取、变换和写入都在 `sharedStateWriteQueue` 与 `sharedStatePath.lock` 内进行；随后同 id
+的归档镜像经 delta writer upsert，因此桌面端、浏览器端和 Bot 不会用整份快照互相覆盖。
+
+`/api/bot/selene` 的 `latestEvents` 故意排除精确 `location`、`locationConsent`、
+`sourceFile` 和未筛选的 `values`。`/api/bot/ai` 同样排除 provider URL、模型请求正文和一切
+credential/key 字段。人物接口不会返回证据原文或 avatar URL。
+
+QQ 侧 owner 绑定、`.env` 变量、待发送通知队列和命令格式由
+[`QQ_BOT.zh-CN.md`](QQ_BOT.zh-CN.md) 约束。
+
+### 6.4 地图、头像和背景
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/settings/background` | 保存不超过 20 MiB 的 data URL 资产 |
 | `GET` | `/api/settings/background/:id` | 读取本地背景/头像资产 |
 | `GET` | `/api/media/avatar?src=` | 受白名单限制的 QQ/微信头像代理和缓存 |
+| `GET` | `/api/media/avatar/local?id=` | 读取 THEIA 已保存且经签名校验的 MNEMO 本地头像 |
+| `GET` | `/api/mnemo/status` | MNEMO agent、inbox 和最近错误的无正文状态 |
 | `GET` | `/api/map/tiles/:z/:x/:y.png` | 公共 OSM 瓦片代理，z 0-19 |
 | `GET` | `/api/map/search?q=&provider=` | 公共地理搜索，provider 为 balanced/nominatim/photon |
 | `GET` | `/api/map/config` | 地图设置、可选服务、署名、policy URL 和使用说明 |

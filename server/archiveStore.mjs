@@ -48,6 +48,14 @@ function compactItem(item) {
   return stored
 }
 
+// A connected chat-export directory is authoritative only for that directory.
+// It must never erase notes created by THEIA or Iris while a large archive body
+// is deferred in the renderer. Explicit delta deletes remain the supported
+// deletion path for these records.
+function isLocalManualRecord(item) {
+  return typeof item?.sourceFile === 'string' && item.sourceFile.startsWith('theia://')
+}
+
 function archivePayload(value) {
   if (Array.isArray(value)) return { updatedAt: null, sourceFingerprint: null, items: value }
   if (!value || typeof value !== 'object' || !Array.isArray(value.items)) return null
@@ -375,6 +383,9 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
       const item = compactItem(value)
       if (item) next.set(item.id, item)
     }
+    for (const [id, item] of state.items) {
+      if (isLocalManualRecord(item) && !next.has(id)) next.set(id, item)
+    }
     const operations = []
     const writeSnapshot = loadedFromLegacy || knownSegments.length === 0
     if (writeSnapshot) {
@@ -467,6 +478,42 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
   async function loadSnapshot() {
     await reload()
     return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, items: [...state.items.values()] }
+  }
+
+  /**
+   * Return only operations written after a known archive watermark.  This is
+   * intentionally derived from delta segments, so a renderer can pick up a
+   * journal entry or SELENE import without downloading a million-row snapshot.
+   * A snapshot/compaction boundary asks the caller to do a full refresh.
+   */
+  async function loadChanges({ since, limit = 2_000 } = {}) {
+    await reload()
+    const watermark = typeof since === 'string' && Number.isFinite(Date.parse(since)) ? since : null
+    if (!watermark) return { requiresReload: true, updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, upserts: [], deleteIds: [] }
+    const max = Math.max(1, Math.min(20_000, Math.floor(Number(limit) || 2_000)))
+    const upserts = new Map()
+    const deleteIds = new Set()
+    for (const name of knownSegments) {
+      const info = knownSegmentInfo.get(name)
+      if (!info || !info.updatedAt || info.updatedAt <= watermark) continue
+      if (info.kind === 'snapshot') {
+        return { requiresReload: true, updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, upserts: [], deleteIds: [] }
+      }
+      const segment = await readSegment(resolve(directory, name), info.checksum)
+      for (const operation of segment.operations) {
+        if (operation?.op === 'delete' && typeof operation.id === 'string') {
+          deleteIds.add(operation.id)
+          upserts.delete(operation.id)
+        } else if (operation?.op === 'upsert' && operation.item?.id) {
+          upserts.set(operation.item.id, compactItem(operation.item))
+          deleteIds.delete(operation.item.id)
+        }
+        if (upserts.size + deleteIds.size > max) {
+          return { requiresReload: true, updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, upserts: [], deleteIds: [] }
+        }
+      }
+    }
+    return { requiresReload: false, updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, upserts: [...upserts.values()].filter(Boolean), deleteIds: [...deleteIds] }
   }
 
   async function loadMeta() {
@@ -571,5 +618,5 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
     }
   }
 
-  return { commit, commitDelta, compact, loadMeta, loadSnapshot, loadConversationIndex, loadConversationPage, migrate, verifyIntegrity }
+  return { commit, commitDelta, compact, loadMeta, loadSnapshot, loadChanges, loadConversationIndex, loadConversationPage, migrate, verifyIntegrity }
 }
