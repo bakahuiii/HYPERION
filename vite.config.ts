@@ -4,6 +4,13 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   base: './',
   plugins: [react()],
+  // The desktop development shell creates Vite in Electron's main process.
+  // Pinning the small browser dependency set avoids a broad optimizer crawl
+  // before the first window can become interactive.
+  optimizeDeps: {
+    include: ['react', 'react-dom/client', 'react/jsx-runtime', 'lucide-react', 'leaflet'],
+    noDiscovery: true,
+  },
   server: {
     watch: {
       // Imported chat archives, avatar caches and Electron's Chromium profile

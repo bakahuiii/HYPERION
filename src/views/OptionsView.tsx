@@ -1,4 +1,4 @@
-import { CheckCircle2, FilePenLine, Palette, SlidersHorizontal, Trash2, X } from 'lucide-react'
+import { CheckCircle2, FilePenLine, MessagesSquare, Palette, RefreshCw, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AiProviderPool } from '../components/AiProviderPool'
 import { StoragePanel } from '../components/StoragePanel'
@@ -6,6 +6,7 @@ import { MapProviderSettings } from '../components/MapProviderSettings'
 import { loadStorageOverview, type StorageOverview } from '../lib/storageOverview'
 import { defaultPromptInstructions } from '../lib/storage'
 import { AI_CONCURRENCY_OPTIONS, normalizeAiConcurrency } from '../lib/aiConcurrency'
+import { loadMnemoSyncStatus, requestMnemoFullImport, type MnemoSyncStatus } from '../lib/mnemoSync'
 import type { AiSettings } from '../types'
 
 interface OptionsViewProps {
@@ -24,12 +25,37 @@ function formatFeedbackTime(value: string) {
   return date.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
 }
 
+function formatMnemoTime(value: string | null | undefined) {
+  if (!value) return '尚未完成'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '尚未完成'
+  return date.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
+}
+
+function formatMnemoCount(value: number | null | undefined) {
+  return typeof value === 'number' && value >= 0 ? value.toLocaleString('zh-CN') : '等待读取'
+}
+
+function mnemoStateLabel(status: MnemoSyncStatus | null) {
+  const state = status?.reconciliation?.state
+  if (state === 'syncing') return '正在全量导入'
+  if (state === 'checking') return '正在核对数量'
+  if (state === 'ready') return '已核对'
+  if (state === 'error') return '需要处理'
+  if (state === 'disabled') return '未启用'
+  if (status?.agent?.runtimeState === 'waiting') return '等待微信本地数据'
+  if (status?.agent?.runtimeState === 'error') return '连接异常'
+  return '等待 MNEMO 就绪'
+}
+
 export function OptionsView({ settings, onSettingsChange, onAppearance, personCount, questCount, onClearPeople, onClearQuests }: OptionsViewProps) {
   const [storage, setStorage] = useState<StorageOverview | null>(null)
   const [storageOpen, setStorageOpen] = useState(false)
   const [feedbackOpen, setFeedbackOpen] = useState(false)
   const [promptKind, setPromptKind] = useState<keyof AiSettings['promptInstructions']>('task')
   const [storageMessage, setStorageMessage] = useState('正在读取本机存储概览…')
+  const [mnemoStatus, setMnemoStatus] = useState<MnemoSyncStatus | null>(null)
+  const [mnemoMessage, setMnemoMessage] = useState('正在读取 MNEMO 状态…')
   const storageRequestRef = useRef<AbortController | null>(null)
   const refreshStorage = useCallback(async () => {
     storageRequestRef.current?.abort()
@@ -62,6 +88,43 @@ export function OptionsView({ settings, onSettingsChange, onAppearance, personCo
     }
   }, [refreshStorage, storageOpen])
 
+  const refreshMnemo = useCallback(async () => {
+    try {
+      const status = await loadMnemoSyncStatus()
+      setMnemoStatus(status)
+      setMnemoMessage('')
+    } catch (error) {
+      setMnemoMessage(error instanceof Error ? error.message : '无法读取 MNEMO 状态。')
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    let timer = 0
+    const refresh = async () => {
+      await refreshMnemo()
+      if (cancelled) return
+      const active = ['awaiting-agent', 'checking', 'syncing'].includes(mnemoStatus?.reconciliation?.state ?? '')
+      timer = window.setTimeout(() => { void refresh() }, active ? 2_000 : 10_000)
+    }
+    void refresh()
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [mnemoStatus?.reconciliation?.state, refreshMnemo])
+
+  const startMnemoFullImport = async () => {
+    setMnemoMessage('正在启动 MNEMO 全量导入…')
+    try {
+      const status = await requestMnemoFullImport()
+      setMnemoStatus(status)
+      setMnemoMessage('')
+    } catch (error) {
+      setMnemoMessage(error instanceof Error ? error.message : 'MNEMO 全量导入无法启动。')
+    }
+  }
+
   const promptInstructions: AiSettings['promptInstructions'] = { ...defaultPromptInstructions, ...(settings.promptInstructions ?? {}) }
   const automaticTriggerMode = ['time', 'message-count', 'either'].includes(String(settings.autoTriggerMode))
     ? settings.autoTriggerMode
@@ -93,6 +156,8 @@ export function OptionsView({ settings, onSettingsChange, onAppearance, personCo
   }
   const feedbackReasonLabels: Record<AiSettings['feedback'][number]['reason'], string> = { useful: '有用', expired: '已过期', ownership: '归属错误', completed: '已完成', 'not-actionable': '不构成任务', incorrect: '内容错误', other: '其他' }
   const feedbackEntries = [...(settings.feedback ?? [])].sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime())
+  const mnemoBusy = ['checking', 'syncing'].includes(mnemoStatus?.reconciliation?.state ?? '')
+  const mnemoError = mnemoStatus?.reconciliation?.lastError || mnemoStatus?.agent?.lastError || mnemoMessage
 
   const clearPeople = () => {
     if (!personCount) return
@@ -109,6 +174,21 @@ export function OptionsView({ settings, onSettingsChange, onAppearance, personCo
     <section className="options-section"><div className="options-heading"><div><Palette size={18} /><div><h3>界面外观</h3><p>配色、背景图片、缩放、模糊与显示名称。</p></div></div><button type="button" className="primary-button" onClick={onAppearance}><Palette size={16} />编辑外观</button></div></section>
     <AiProviderPool globalConcurrency={normalizeAiConcurrency(settings.concurrency)} onGlobalConcurrencyChange={(concurrency) => updateSettings({ concurrency })} />
     <MapProviderSettings />
+    <section className="options-section mnemo-sync-section">
+      <div className="options-heading">
+        <div><MessagesSquare size={18} /><div><h3>MNEMO 聊天接入</h3><p>启动时自动核对本机消息总量与 HYPERION 已归档的 MNEMO 记录；不一致时会自动重新导入。</p></div></div>
+        <button type="button" className="primary-button" onClick={() => void startMnemoFullImport()} disabled={!mnemoStatus?.enabled || mnemoBusy}>
+          <RefreshCw size={16} className={mnemoBusy ? 'is-spinning' : undefined} />{mnemoBusy ? '正在全量导入' : '强制全量导入'}
+        </button>
+      </div>
+      <div className="mnemo-sync-summary" aria-live="polite">
+        <div><span>当前状态</span><strong>{mnemoStateLabel(mnemoStatus)}</strong></div>
+        <div><span>MNEMO 本地消息</span><strong>{formatMnemoCount(mnemoStatus?.mnemoRecordCount)}</strong></div>
+        <div><span>HYPERION 已归档</span><strong>{formatMnemoCount(mnemoStatus?.archiveRecordCount)}</strong></div>
+        <div><span>最近完成</span><strong>{formatMnemoTime(mnemoStatus?.reconciliation?.completedAt || mnemoStatus?.agent?.lastSyncAt)}</strong></div>
+      </div>
+      <p className={mnemoError ? 'mnemo-sync-message is-error' : 'mnemo-sync-message'}>{mnemoError || mnemoStatus?.agent?.lastEvent || '正在等待 MNEMO 提供本机消息总量。'}</p>
+    </section>
     <section className="options-section"><div className="options-heading"><div><SlidersHorizontal size={18} /><div><h3>提炼策略</h3><p>这里决定分析范围、时效和筛选偏好；下面的模型提示词只细化各工作流的表达。并发只作用于不同会话，同一会话始终按时间顺序处理。</p></div></div></div><div className="ai-controls"><label><span>分析模式</span><select value={settings.mode} onChange={(event) => updateSettings({ mode: event.target.value as AiSettings['mode'] })}><option value="balanced">明确事项与提醒</option><option value="action">行动优先</option><option value="planning">长期规划</option><option value="review">复盘与整理</option></select></label><label><span>历史事项范围</span><select value={settings.recencyPolicy} onChange={(event) => updateSettings({ recencyPolicy: event.target.value as AiSettings['recencyPolicy'] })}><option value="strict">严格：更快淘汰短时事项</option><option value="balanced">平衡：保留仍有效安排</option><option value="broad">宽泛：更多历史长期事项</option></select></label><label><span>并发会话</span><select value={normalizeAiConcurrency(settings.concurrency)} onChange={(event) => updateSettings({ concurrency: Number(event.target.value) })}>{AI_CONCURRENCY_OPTIONS.map((value) => <option key={value} value={value}>{value} 个会话</option>)}</select></label></div><label className="ai-instructions"><span>任务筛选偏好 <small>自动保存，下一次提炼立即按此要求执行</small></span><textarea value={settings.instructions} onChange={(event) => updateSettings({ instructions: event.target.value })} rows={4} placeholder="例如：优先保留约会、约见、预约、报名、课程、截止和需回复事项；日期不明确时留空。" /></label><div className="feedback-memory"><div><strong>候选磨合记录</strong><span>已保存 {settings.feedback?.length ?? 0} 条保留或忽略反馈；下一次提炼会参考最近的偏好。</span></div><div className="feedback-actions"><button type="button" className="secondary-button" onClick={() => setFeedbackOpen(true)} disabled={!settings.feedback?.length}>查看记录</button><button type="button" className="icon-button" title="清空全部磨合记录" aria-label="清空全部磨合记录" onClick={() => updateSettings({ feedback: [] })} disabled={!settings.feedback?.length}><Trash2 size={15} /></button></div></div></section>
     <section className="options-section"><div className="options-heading"><div><SlidersHorizontal size={18} /><div><h3>增量自动提炼</h3><p>只处理发生变化的会话；首次全库提炼后，后续请求只包含新增消息和必要上下文。</p></div></div></div><div className="ai-controls"><label className="auto-switch"><input type="checkbox" checked={settings.autoEnabled} onChange={(event) => updateSettings({ autoEnabled: event.target.checked })} /><span>自动提炼增量记录</span></label><label><span>触发条件</span><select value={automaticTriggerMode} onChange={(event) => updateSettings({ autoTriggerMode: event.target.value as AiSettings['autoTriggerMode'] })} disabled={!settings.autoEnabled}><option value="either">时间或数量满足其一</option><option value="time">仅按时间</option><option value="message-count">仅按新增消息数</option></select></label><label><span>时间间隔（小时）</span><input type="number" min="1" max="720" value={automaticIntervalHours} onChange={(event) => updateSettings({ intervalHours: Number(event.target.value) })} disabled={!settings.autoEnabled || automaticTriggerMode === 'message-count'} /></label><label><span>新增消息阈值</span><input type="number" min="1" max="10000" value={automaticMessageThreshold} onChange={(event) => updateSettings({ incrementalMessageCount: Number(event.target.value) })} disabled={!settings.autoEnabled || automaticTriggerMode === 'time'} /></label></div></section>
     <section className="options-section prompt-editor-section"><div className="options-heading"><div><FilePenLine size={18} /><div><h3>模型提示词</h3><p>任务提炼、人物证据、人物归并和任务建议各有独立提示词。默认文本已回填到旧配置；编辑后会自动保存到 INI 并在下次对应请求生效。</p></div></div></div><div className="prompt-tabs">{(Object.keys(promptLabels) as Array<keyof AiSettings['promptInstructions']>).map((key) => <button type="button" key={key} className={promptKind === key ? 'is-active' : ''} onClick={() => setPromptKind(key)}>{promptLabels[key]}</button>)}</div><label className="ai-instructions prompt-instructions"><span>{promptLabels[promptKind]} 工作要求 <small>这是工作流细化要求，不替代上方筛选策略</small></span><textarea value={promptInstructions[promptKind]} onChange={(event) => updatePrompt(promptKind, event.target.value)} rows={7} /></label><details className="prompt-guard"><summary>固定核验规则（同时发给模型）</summary><p>{promptGuards[promptKind]}</p></details></section>

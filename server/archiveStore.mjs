@@ -50,6 +50,35 @@ function compactItem(item) {
   return stored
 }
 
+function isMnemoRecord(item) {
+  return (typeof item?.id === 'string' && item.id.startsWith('mnemo:'))
+    || (typeof item?.sourceFile === 'string' && item.sourceFile.startsWith('mnemo://'))
+}
+
+function countMnemoRecords(items) {
+  let count = 0
+  for (const item of items) if (isMnemoRecord(item)) count += 1
+  return count
+}
+
+function archiveItemsEqual(left, right) {
+  if (left === right) return true
+  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false
+  const skipSourceFile = isMnemoRecord(left) && isMnemoRecord(right)
+  const leftKeys = Object.keys(left).filter((key) => !skipSourceFile || key !== 'sourceFile')
+  const rightKeys = Object.keys(right).filter((key) => !skipSourceFile || key !== 'sourceFile')
+  if (leftKeys.length !== rightKeys.length) return false
+  for (const key of leftKeys) {
+    if (!Object.hasOwn(right, key)) return false
+    const leftValue = left[key]
+    const rightValue = right[key]
+    if (leftValue === rightValue) continue
+    if (!leftValue || !rightValue || typeof leftValue !== 'object' || typeof rightValue !== 'object') return false
+    if (JSON.stringify(leftValue) !== JSON.stringify(rightValue)) return false
+  }
+  return true
+}
+
 // A connected chat-export directory is authoritative only for that directory.
 // It must never erase notes created by HYPERION or Iris while a large archive body
 // is deferred in the renderer. Explicit delta deletes remain the supported
@@ -306,10 +335,14 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
   }
 
   function archiveMeta(metadata) {
+    const mnemoCount = Number(metadata?.mnemoRecordCount)
     return {
       updatedAt: typeof metadata?.updatedAt === 'string' ? metadata.updatedAt : null,
       sourceFingerprint: typeof metadata?.sourceFingerprint === 'string' ? metadata.sourceFingerprint : null,
       recordCount: Math.max(0, Number(metadata?.recordCount) || 0),
+      // Older archives did not index their MNEMO subset. Keep that state
+      // explicit so startup never mistakes an unknown count for zero.
+      mnemoRecordCount: Number.isInteger(mnemoCount) && mnemoCount >= 0 ? mnemoCount : null,
       schemaVersion: 1,
       metadataVersion: Number(metadata?.metadataVersion) || ARCHIVE_METADATA_VERSION,
       storageEngine: 'append-only-jsonl-gzip',
@@ -338,7 +371,7 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
     retainState()
     const names = await listSegments()
     if (!force && state && sameNames(names, knownSegments)) return state
-    const next = { updatedAt: null, sourceFingerprint: null, items: new Map() }
+    const next = { updatedAt: null, sourceFingerprint: null, items: new Map(), mnemoRecordCount: 0 }
     const nextSegmentInfo = new Map()
     const metadata = await readArchiveMetadata(metadataPath)
     const manifest = metadataSegments(metadata)
@@ -364,6 +397,7 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
         loadedFromLegacy = true
       }
     }
+    next.mnemoRecordCount = countMnemoRecords(next.items.values())
     state = next
     knownSegments = names
     knownSegmentInfo = nextSegmentInfo
@@ -383,6 +417,7 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
       updatedAt: state.updatedAt,
       sourceFingerprint: state.sourceFingerprint,
       recordCount: state.items.size,
+      mnemoRecordCount: state.mnemoRecordCount,
       segmentCount: knownSegments.length,
       metadataVersion: ARCHIVE_METADATA_VERSION,
       ...(conversationIndex ? { conversationIndex } : {}),
@@ -394,6 +429,12 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
       },
       rollbackSource: loadedFromLegacy ? legacyCompressedPath : undefined,
     }), { encoding: 'utf8', mode: 0o600 })
+  }
+
+  async function metadataNeedsMnemoCount() {
+    const metadata = await readArchiveMetadata(metadataPath)
+    const count = Number(metadata?.mnemoRecordCount)
+    return !Number.isInteger(count) || count < 0
   }
 
   async function migrate() {
@@ -483,14 +524,15 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
     const updatedAt = monotonicTimestamp(state.updatedAt)
     const sourceFingerprint = typeof payload?.sourceFingerprint === 'string' ? payload.sourceFingerprint : null
     if (!operations.length && sourceFingerprint === state.sourceFingerprint) {
+      if (await metadataNeedsMnemoCount()) await writeMetadata()
       releaseStateWhenIdle()
-      return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
+      return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, mnemoRecordCount: state.mnemoRecordCount }
     }
     sequence += 1
     const info = await writeSegment(directory, sequence, { kind: writeSnapshot ? 'snapshot' : 'delta', updatedAt, sourceFingerprint }, operations)
     knownSegments.push(info.name)
     knownSegmentInfo.set(info.name, info)
-    state = { updatedAt, sourceFingerprint, items: next }
+    state = { updatedAt, sourceFingerprint, items: next, mnemoRecordCount: countMnemoRecords(next.values()) }
     loadedFromLegacy = false
     integrity = { status: 'verified', unindexedSegmentCount: 0 }
     conversationIndex = null
@@ -498,7 +540,7 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
     // Replacing a large archive with a small one should reclaim its old
     // segments immediately; retaining a giant delete delta defeats removal.
     if (knownSegments.length >= Math.max(2, Math.floor(compactionSegments)) || operations.length >= Math.max(10_000, state.items.size)) await compact()
-    const result = { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
+    const result = { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, mnemoRecordCount: state.mnemoRecordCount }
     releaseStateWhenIdle()
     return result
   }
@@ -529,7 +571,7 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
     const effectiveUpserts = []
     for (const item of requestedUpserts.values()) {
       const current = next.get(item.id)
-      if (!current || JSON.stringify(current) !== JSON.stringify(item)) {
+      if (!current || !archiveItemsEqual(current, item)) {
         next.set(item.id, item)
         effectiveUpserts.push(item)
       }
@@ -547,20 +589,30 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
       ? (typeof payload.sourceFingerprint === 'string' ? payload.sourceFingerprint : null)
       : state.sourceFingerprint
     if (!operations.length && sourceFingerprint === state.sourceFingerprint) {
+      if (await metadataNeedsMnemoCount()) await writeMetadata()
       releaseStateWhenIdle()
-      return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
+      return { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, mnemoRecordCount: state.mnemoRecordCount }
     }
     sequence += 1
     const info = await writeSegment(directory, sequence, { kind: writeSnapshot ? 'snapshot' : 'delta', updatedAt, sourceFingerprint }, operations)
     knownSegments.push(info.name)
     knownSegmentInfo.set(info.name, info)
-    state = { updatedAt, sourceFingerprint, items: next }
+    let mnemoRecordCount = state.mnemoRecordCount
+    for (const id of effectiveDeleteIds) {
+      if (isMnemoRecord(state.items.get(id))) mnemoRecordCount -= 1
+    }
+    for (const item of effectiveUpserts) {
+      const previous = state.items.get(item.id)
+      if (isMnemoRecord(previous)) mnemoRecordCount -= 1
+      if (isMnemoRecord(item)) mnemoRecordCount += 1
+    }
+    state = { updatedAt, sourceFingerprint, items: next, mnemoRecordCount: Math.max(0, mnemoRecordCount) }
     loadedFromLegacy = false
     integrity = { status: 'verified', unindexedSegmentCount: 0 }
     conversationIndex = null
     await writeMetadata()
     if (knownSegments.length >= Math.max(2, Math.floor(compactionSegments))) await compact()
-    const result = { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size }
+    const result = { updatedAt: state.updatedAt, sourceFingerprint: state.sourceFingerprint, recordCount: state.items.size, mnemoRecordCount: state.mnemoRecordCount }
     releaseStateWhenIdle()
     return result
   }
@@ -624,6 +676,7 @@ export function createAppendOnlyArchiveStore({ directory, metadataPath, legacyCo
       updatedAt: state.updatedAt,
       sourceFingerprint: state.sourceFingerprint,
       recordCount: state.items.size,
+      mnemoRecordCount: state.mnemoRecordCount,
       metadataVersion: ARCHIVE_METADATA_VERSION,
       segmentCount: knownSegments.length,
       integrity,

@@ -23,7 +23,7 @@ function object(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : null
 }
 
-function normalizeRecord(value, accountId, sourceFile) {
+function normalizeRecord(value, accountId) {
   const input = object(value)
   if (!input) return null
   const id = text(input.id, 420)
@@ -42,7 +42,10 @@ function normalizeRecord(value, accountId, sourceFile) {
     summary,
     content,
     source: '微信导出',
-    sourceFile: `mnemo://${accountId}/${sourceFile}`,
+    // Batches are immutable transport envelopes, but a new full export gets
+    // new envelope paths. Keeping transport paths out of record identity
+    // makes a forced export idempotent instead of rewriting the whole archive.
+    sourceFile: `mnemo://${accountId}`,
     conversationId,
     conversationName: text(input.conversationName, 240) || conversationId,
     conversationKind: kind,
@@ -77,10 +80,9 @@ export function normalizeMnemoDocument(value, options = {}) {
     || input.records.length > 10_000
     || deleteCandidates.length > 10_000
   ) return null
-  const sourceFile = text(options.sourceFile, 700)
   const records = new Map()
   for (const candidate of input.records) {
-    const record = normalizeRecord(candidate, accountId, sourceFile)
+    const record = normalizeRecord(candidate, accountId)
     if (record) records.set(record.id, record)
   }
   const deleteIds = new Set()
@@ -183,8 +185,9 @@ export function createMnemoInboxWatcher(options) {
     lastError: null,
   }
 
-  async function scan() {
+  async function scan(options = {}) {
     if (scanPromise) return scanPromise
+    const ignoreSettle = options?.ignoreSettle === true
     scanPromise = (async () => {
       try {
         if (!(await stat(root)).isDirectory()) throw new Error('HYPERION MNEMO inbox is not a directory')
@@ -199,7 +202,7 @@ export function createMnemoInboxWatcher(options) {
           const previous = state.files[relativePath]
           const fingerprint = `${candidate.details.size}:${Math.floor(candidate.details.mtimeMs)}`
           if (previous && `${previous.size}:${Math.floor(previous.mtimeMs)}` === fingerprint) continue
-          if (candidate.details.size > maximumFileBytes || now - candidate.details.mtimeMs < settleMs) {
+          if (candidate.details.size > maximumFileBytes || (!ignoreSettle && now - candidate.details.mtimeMs < settleMs)) {
             pendingFiles += 1
             continue
           }
@@ -261,9 +264,9 @@ export function createMnemoInboxWatcher(options) {
   }
 
   return {
-    async start() {
-      await scan()
-      if (!timer) {
+    async start(options = {}) {
+      if (options?.initialScan !== false) await scan()
+      if (options?.watch !== false && !timer) {
         timer = setInterval(() => { void scan() }, intervalMs)
         timer.unref?.()
       }

@@ -59,6 +59,29 @@ test('delta commits append only changed records and preserve deletions', async (
   assert.equal((await readdir(scope.directory)).filter((name) => name.endsWith('.jsonl.gz')).length, 2)
 })
 
+test('archives MNEMO counts in metadata and ignores transport envelope changes', async (t) => {
+  const scope = await fixture({ compactionSegments: 20 })
+  t.after(() => rm(scope.root, { recursive: true, force: true }))
+  const initial = await scope.store.commitDelta({
+    upserts: [
+      { id: 'mnemo:wxid_owner:messages:1', sourceFile: 'mnemo://wxid_owner/old-batch', content: 'Hello' },
+      { id: 'journal-1', sourceFile: 'hyperion://self-journal', content: 'Keep this note' },
+    ],
+    deleteIds: [],
+  })
+  assert.equal(initial.mnemoRecordCount, 1)
+  assert.equal((await scope.store.loadMeta()).mnemoRecordCount, 1)
+
+  const repeated = await scope.store.commitDelta({
+    expectedUpdatedAt: initial.updatedAt,
+    upserts: [{ id: 'mnemo:wxid_owner:messages:1', sourceFile: 'mnemo://wxid_owner/new-batch', content: 'Hello' }],
+    deleteIds: [],
+  })
+  assert.equal(repeated.updatedAt, initial.updatedAt)
+  assert.equal(repeated.mnemoRecordCount, 1)
+  assert.equal((await readdir(scope.directory)).filter((name) => name.endsWith('.jsonl.gz')).length, 1)
+})
+
 test('authoritative chat snapshots preserve local manual records until an explicit delta delete', async (t) => {
   const scope = await fixture({ compactionSegments: 20 })
   t.after(() => rm(scope.root, { recursive: true, force: true }))

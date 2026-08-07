@@ -89,11 +89,26 @@ let sharedStateMigrationStatus = { state: 'pending', migrated: false }
 let archiveMigrationStatus = { state: 'pending', migrated: false }
 const seleneInboxWatchers = new Map()
 const mnemoInboxWatchers = new Map()
+let mnemoArchiveRecordCount = null
+let mnemoFullImportPromise = null
+let mnemoReconciliationPromise = null
+let queuedMnemoReconciliationReason = null
+let mnemoReconciliation = {
+  state: 'awaiting-agent',
+  reason: null,
+  expectedRecordCount: null,
+  archiveRecordCount: null,
+  startedAt: null,
+  completedAt: null,
+  lastError: null,
+}
 const mnemoAgent = createMnemoAgentController({
   workspace: runtimePaths.workspace,
   outboxDirectory: mnemoInboxDirectoryPath,
   archiveDirectory: mnemoExportDirectoryPath,
   avatarDirectory: avatarCacheDirectoryPath,
+  onReady: () => scheduleMnemoReconciliation('startup'),
+  onSync: () => scheduleMnemoReconciliation('incremental'),
 })
 const aiDebugMaxBytes = 8 * 1024 * 1024
 const aiDebugRotationCount = 3
@@ -472,12 +487,14 @@ function migrateLegacySharedIntel() {
 function saveSharedIntel(payload) {
   // The archive can be large. Serializing writes prevents two browser/desktop
   // clients from competing for the same temporary file during startup.
+  mnemoArchiveRecordCount = null
   const write = sharedIntelWriteQueue.then(() => writeSharedIntel(payload))
   sharedIntelWriteQueue = write.catch(() => undefined)
   return write
 }
 
 function saveSharedIntelDelta(payload) {
+  mnemoArchiveRecordCount = null
   const write = sharedIntelWriteQueue.then(() => writeSharedIntelDelta(payload))
   sharedIntelWriteQueue = write.catch(() => undefined)
   return write
@@ -656,22 +673,79 @@ function mnemoWatcherStatePath(directory) {
   return `${mnemoInboxStatePath}.${suffix}.json`
 }
 
+function nonNegativeCount(value) {
+  const count = Number(value)
+  return Number.isInteger(count) && count >= 0 ? count : null
+}
+
+async function loadMnemoArchiveRecordCount(expectedCount = null) {
+  if (mnemoArchiveRecordCount !== null) return mnemoArchiveRecordCount
+  await sharedIntelWriteQueue
+  const metadata = await loadSharedIntelMeta()
+  const indexedCount = nonNegativeCount(metadata?.mnemoRecordCount)
+  if (indexedCount !== null) {
+    mnemoArchiveRecordCount = indexedCount
+    return indexedCount
+  }
+  // Archives created before the MNEMO counter contained only the imported
+  // message archive. A matching total is enough to keep this compatibility
+  // path cheap; the next archive write persists the exact subset counter.
+  const totalCount = nonNegativeCount(metadata?.recordCount)
+  if (expectedCount !== null && totalCount === expectedCount) {
+    mnemoArchiveRecordCount = totalCount
+    return totalCount
+  }
+  return null
+}
+
+function setMnemoReconciliation(update) {
+  mnemoReconciliation = { ...mnemoReconciliation, ...update }
+  return mnemoReconciliation
+}
+
+function expectedMnemoRecordCount() {
+  const count = Number(mnemoAgent.status().totalRecordCount)
+  return Number.isInteger(count) && count >= 0 ? count : null
+}
+
+function mnemoStatusPayload() {
+  const agent = mnemoAgent.status()
+  const archiveRecordCount = mnemoArchiveRecordCount ?? mnemoReconciliation.archiveRecordCount ?? null
+  return {
+    enabled: agent.enabled,
+    agent,
+    reconciliation: { ...mnemoReconciliation, archiveRecordCount },
+    mnemoRecordCount: expectedMnemoRecordCount(),
+    archiveRecordCount,
+  }
+}
+
 async function importMnemoInboxRecords(records, metadata = {}) {
   const deleteIds = Array.isArray(metadata?.deleteIds)
     ? metadata.deleteIds.filter((id) => typeof id === 'string' && id.startsWith('mnemo:'))
     : []
   const write = sharedIntelWriteQueue.then(async () => {
     const saved = await writeSharedIntelDelta({ upserts: records, deleteIds })
-    return { importedRecords: records.length, deletedRecords: deleteIds.length, archiveRecordCount: Number(saved?.recordCount) || 0 }
+    mnemoArchiveRecordCount = nonNegativeCount(saved?.mnemoRecordCount) ?? mnemoArchiveRecordCount
+    return {
+      importedRecords: records.length,
+      deletedRecords: deleteIds.length,
+      archiveRecordCount: Number(saved?.recordCount) || 0,
+      mnemoRecordCount: mnemoArchiveRecordCount,
+    }
   })
   sharedIntelWriteQueue = write.catch(() => undefined)
   return write
 }
 
-async function startMnemoInboxSync() {
+async function startMnemoInboxSync(options = {}) {
   const directories = await availableMnemoInboxDirectories()
   for (const directory of directories) {
-    if (mnemoInboxWatchers.has(directory)) continue
+    const existing = mnemoInboxWatchers.get(directory)
+    if (existing) {
+      await existing.start(options)
+      continue
+    }
     const watcher = createMnemoInboxWatcher({
       directory,
       statePath: mnemoWatcherStatePath(directory),
@@ -681,15 +755,128 @@ async function startMnemoInboxSync() {
       logger: (level, message) => console[level === 'warn' ? 'warn' : 'log'](`[HYPERION] ${message}`),
     })
     mnemoInboxWatchers.set(directory, watcher)
-    await watcher.start()
+    await watcher.start(options)
   }
   return [...mnemoInboxWatchers.values()]
 }
 
+async function scanMnemoInboxImmediately() {
+  const watchers = await startMnemoInboxSync({ initialScan: false, watch: false })
+  await Promise.all(watchers.map((watcher) => watcher.scan({ ignoreSettle: true })))
+  await sharedIntelWriteQueue
+  return watchers
+}
+
+async function runMnemoFullImport(reason) {
+  const expectedBeforeImport = expectedMnemoRecordCount()
+  setMnemoReconciliation({
+    state: 'syncing',
+    reason,
+    expectedRecordCount: expectedBeforeImport,
+    archiveRecordCount: mnemoArchiveRecordCount ?? mnemoReconciliation.archiveRecordCount ?? null,
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    lastError: null,
+  })
+  try {
+    const { result } = await mnemoAgent.forceSync()
+    await scanMnemoInboxImmediately()
+    const expectedRecordCount = expectedMnemoRecordCount()
+    const archiveRecordCount = await loadMnemoArchiveRecordCount(expectedRecordCount)
+    const completedAt = new Date().toISOString()
+    if (expectedRecordCount !== archiveRecordCount) {
+      setMnemoReconciliation({
+        state: 'error',
+        reason,
+        expectedRecordCount,
+        archiveRecordCount,
+        completedAt,
+        lastError: `MNEMO reported ${expectedRecordCount} messages, but HYPERION archived ${archiveRecordCount}.`,
+      })
+    } else {
+      setMnemoReconciliation({ state: 'ready', reason, expectedRecordCount, archiveRecordCount, completedAt, lastError: null })
+    }
+    return { ...mnemoStatusPayload(), import: result }
+  } catch (error) {
+    setMnemoReconciliation({
+      state: 'error',
+      reason,
+      completedAt: new Date().toISOString(),
+      lastError: error instanceof Error ? error.message : String(error),
+    })
+    throw error
+  }
+}
+
+function requestMnemoFullImport(reason = 'manual') {
+  if (mnemoFullImportPromise) return mnemoFullImportPromise
+  mnemoFullImportPromise = runMnemoFullImport(reason)
+  mnemoFullImportPromise.catch((error) => console.warn(`[HYPERION] MNEMO full import failed: ${error instanceof Error ? error.message : String(error)}`))
+  mnemoFullImportPromise.finally(() => { mnemoFullImportPromise = null }).catch(() => undefined)
+  return mnemoFullImportPromise
+}
+
+async function scheduleMnemoReconciliation(reason) {
+  const expectedRecordCount = expectedMnemoRecordCount()
+  if (mnemoFullImportPromise) return mnemoFullImportPromise
+  if (mnemoReconciliationPromise) {
+    queuedMnemoReconciliationReason = reason
+    return mnemoReconciliationPromise
+  }
+  if (expectedRecordCount === null) {
+    setMnemoReconciliation({ state: 'awaiting-agent', reason, expectedRecordCount: null, lastError: null })
+    return Promise.resolve(mnemoReconciliation)
+  }
+  mnemoReconciliationPromise = (async () => {
+    setMnemoReconciliation({
+      state: 'checking',
+      reason,
+      expectedRecordCount,
+      archiveRecordCount: mnemoArchiveRecordCount,
+      startedAt: new Date().toISOString(),
+      completedAt: null,
+      lastError: null,
+    })
+    const currentArchiveRecordCount = await loadMnemoArchiveRecordCount(expectedRecordCount)
+    if (currentArchiveRecordCount === expectedRecordCount) {
+      setMnemoReconciliation({ state: 'ready', reason, expectedRecordCount, archiveRecordCount: currentArchiveRecordCount, completedAt: new Date().toISOString(), lastError: null })
+      return mnemoReconciliation
+    }
+    await scanMnemoInboxImmediately()
+    const archiveRecordCount = await loadMnemoArchiveRecordCount(expectedRecordCount)
+    if (archiveRecordCount === expectedRecordCount) {
+      setMnemoReconciliation({ state: 'ready', reason, expectedRecordCount, archiveRecordCount, completedAt: new Date().toISOString(), lastError: null })
+      return mnemoReconciliation
+    }
+    return requestMnemoFullImport('startup-mismatch')
+  })()
+  try {
+    return await mnemoReconciliationPromise
+  } catch (error) {
+    setMnemoReconciliation({ state: 'error', reason, completedAt: new Date().toISOString(), lastError: error instanceof Error ? error.message : String(error) })
+    throw error
+  } finally {
+    mnemoReconciliationPromise = null
+    const queuedReason = queuedMnemoReconciliationReason
+    queuedMnemoReconciliationReason = null
+    if (queuedReason) void scheduleMnemoReconciliation(queuedReason)
+  }
+}
+
 async function startMnemoIntegration() {
   await mkdir(mnemoInboxDirectoryPath, { recursive: true, mode: 0o700 })
+  // MNEMO emits an event after every completed local export. Starting the
+  // watcher idle avoids parsing historic full-export envelopes on the same
+  // Electron event loop before the archive count has been reconciled.
+  await startMnemoInboxSync({ initialScan: false, watch: false })
   const agent = await mnemoAgent.start()
-  await startMnemoInboxSync()
+  if (!agent.enabled) {
+    // A disabled agent cannot emit a reconciliation event, but explicitly
+    // supplied private MNEMO batches remain a supported offline import path.
+    await startMnemoInboxSync({ initialScan: false, watch: true })
+    await scanMnemoInboxImmediately()
+    setMnemoReconciliation({ state: 'disabled', reason: null, lastError: null })
+  }
   return agent
 }
 
@@ -4094,16 +4281,25 @@ export const server = http.createServer(async (request, response) => {
   if (requestPath === '/api/mnemo/status' && request.method === 'GET') {
     const directories = configuredMnemoInboxDirectories()
     const watcherStatuses = [...mnemoInboxWatchers.values()].map((watcher) => watcher.status())
-    const agent = mnemoAgent.status()
+    const status = mnemoStatusPayload()
+    const agent = status.agent
     sendJson(response, 200, {
-      enabled: agent.enabled,
-      agent,
+      ...status,
       directoryCount: watcherStatuses.length,
       directories: watcherStatuses,
       configuredDirectories: directories,
-      lastError: agent.lastError ?? watcherStatuses.find((item) => item.lastError)?.lastError ?? null,
+      lastError: status.reconciliation.lastError ?? agent.lastError ?? watcherStatuses.find((item) => item.lastError)?.lastError ?? null,
       lastSuccessAt: watcherStatuses.map((item) => item.lastSuccessAt).filter(Boolean).sort().at(-1) ?? null,
     })
+    return
+  }
+  if (requestPath === '/api/mnemo/import' && request.method === 'POST') {
+    if (!mnemoAgent.status().enabled) {
+      sendJson(response, 409, { error: 'MNEMO integration is disabled' })
+      return
+    }
+    void requestMnemoFullImport('manual')
+    sendJson(response, 202, mnemoStatusPayload())
     return
   }
   if (requestPath === '/api/bot/quests' && request.method === 'GET') {
@@ -4725,7 +4921,7 @@ export function startAiProxy() {
         seleneInboxWatchers.clear()
         for (const watcher of mnemoInboxWatchers.values()) watcher.stop()
         mnemoInboxWatchers.clear()
-        mnemoAgent.stop()
+        void mnemoAgent.stop().catch(() => undefined)
         void finishRecoverySession(serviceSessionPath).catch(() => undefined)
       })
       void withFileLock(`${sharedStatePath}.lock`, () => migrateSharedStateFile(sharedStatePath, migrationDirectoryPath))
