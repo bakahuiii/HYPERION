@@ -1135,11 +1135,6 @@ h1 { font-size: 26.5px; letter-spacing: .03em; }
 .intel-time-filter label { min-width: 132px; }
 .intel-time-filter input { min-width: 0; width: 100%; }
 .intel-time-filter .icon-button { flex: 0 0 auto; width: 33px; height: 33px; }
-.archive-structure { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; margin: 0 0 2px; border: 1px solid var(--line); background: var(--line); }
-.archive-stage { display: grid; min-width: 0; gap: 5px; padding: 12px 13px; background: color-mix(in srgb, var(--surface-strong) 76%, transparent); }
-.archive-stage > span { color: var(--faint); font-size: 9.5px; }
-.archive-stage > strong { color: var(--gold); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 15.5px; font-weight: 500; }
-.archive-stage > small { min-height: 28px; color: var(--muted); font-size: 9.5px; line-height: 1.55; }
 
 .appearance-modal { width: min(880px, 100%); }
 .appearance-body { display: grid; gap: 20px; padding: 22px 25px 25px; }
@@ -1279,8 +1274,6 @@ h1 { font-size: 26.5px; letter-spacing: .03em; }
   .background-option > label, .background-upload, .background-clear { grid-column: auto; }
   .options-section { padding: 17px; }
   .options-heading, .intel-analysis-brief { align-items: stretch; flex-direction: column; }
-  .archive-structure { grid-template-columns: 1fr; }
-  .archive-stage > small { min-height: 0; }
   .options-heading .primary-button { width: 100%; }
   .people-analysis-bar { align-items: stretch; flex-direction: column; }
   .people-analysis-bar .primary-button { width: 100%; }

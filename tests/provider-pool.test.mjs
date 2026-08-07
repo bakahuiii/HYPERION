@@ -76,6 +76,18 @@ test('atomic archive writes serialize concurrent writers and clean temporary fil
   }
 })
 
+test('atomic archive writes reclaim a lock from an exited writer immediately', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-atomic-stale-lock-'))
+  const lockPath = join(root, 'archive.lock')
+  try {
+    await writeFile(lockPath, '2147483647\n', { mode: 0o600 })
+    assert.equal(await withFileLock(lockPath, async () => 'acquired'), 'acquired')
+    assert.deepEqual(await readdir(root), [])
+  } finally {
+    await cleanupRuntimeRoot(root)
+  }
+})
+
 function sendJson(response, status, payload, headers = {}) {
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...headers })
   response.end(JSON.stringify(payload))

@@ -1,4 +1,4 @@
-import { mkdir, open, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
@@ -13,6 +13,24 @@ function sleep(delayMs) {
 
 function isTransientRenameError(error) {
   return transientRenameCodes.has(error?.code)
+}
+
+function processIsRunning(processId) {
+  try {
+    process.kill(processId, 0)
+    return true
+  } catch (error) {
+    return error?.code === 'EPERM'
+  }
+}
+
+async function lockOwnerExited(path) {
+  try {
+    const owner = Number.parseInt((await readFile(path, 'utf8')).trim(), 10)
+    return Number.isSafeInteger(owner) && owner > 0 && !processIsRunning(owner)
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -49,7 +67,7 @@ export async function writeFileAtomically(path, data, options) {
 async function removeLockIfStale(path) {
   try {
     const details = await stat(path)
-    if (Date.now() - details.mtimeMs <= staleLockMs) return false
+    if (Date.now() - details.mtimeMs <= staleLockMs && !await lockOwnerExited(path)) return false
     await unlink(path)
     return true
   } catch (error) {

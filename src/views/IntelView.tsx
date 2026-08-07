@@ -352,7 +352,6 @@ export function IntelView({ active, items, archiveLoadError, archive, candidates
         timelineEnd={timelineEnd}
         analysisMessageCount={analysisMessages.length}
         analysisConversationCount={analysisConversationCount}
-        archive={archive}
         attachmentRef={attachmentRef}
         attachmentFiles={attachmentFiles}
         aiBusy={aiBusy}
