@@ -15,7 +15,7 @@ MNEMO reads the active local WeChat process to obtain the per-database keys need
 When more than one account directory exists, MNEMO automatically selects the account with the most recently updated local database. Set `HYPERION_MNEMO_ACCOUNT` to an account directory to select a different one deliberately:
 
 ```powershell
-$env:HYPERION_MNEMO_HOME = (Resolve-Path '..\..\WECHAT-Exporter').Path
+$env:HYPERION_MNEMO_HOME = (Resolve-Path '..\..\MNEMO').Path
 $env:HYPERION_MNEMO_ACCOUNT = '<wechat-data-root>\wxid_example'
 ```
 

@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { createMnemoAgentController } from '../server/mnemoAgent.mjs'
 import { createMnemoInboxWatcher, MNEMO_DELTA_SCHEMA, normalizeMnemoDocument } from '../server/mnemoInbox.mjs'
 
 function document(records = [record()]) {
@@ -25,6 +26,25 @@ function record() {
     speaker: 'Friend', messageType: 'text', speakerRole: 'other', capturedAt: '2026-08-07T01:00:00.000Z', status: 'new',
   }
 }
+
+test('finds the sibling MNEMO agent from a source workspace', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'hyperion-mnemo-agent-'))
+  const workspace = join(root, 'HYPERION', 'source')
+  const inheritedHome = process.env.HYPERION_MNEMO_HOME
+  const inheritedLegacyHome = process.env.THEIA_MNEMO_HOME
+  delete process.env.HYPERION_MNEMO_HOME
+  delete process.env.THEIA_MNEMO_HOME
+  context.after(async () => {
+    if (inheritedHome === undefined) delete process.env.HYPERION_MNEMO_HOME
+    else process.env.HYPERION_MNEMO_HOME = inheritedHome
+    if (inheritedLegacyHome === undefined) delete process.env.THEIA_MNEMO_HOME
+    else process.env.THEIA_MNEMO_HOME = inheritedLegacyHome
+    await rm(root, { recursive: true, force: true })
+  })
+
+  const controller = createMnemoAgentController({ workspace })
+  assert.equal(controller.status().script, join(root, 'MNEMO', 'python', 'mnemo_agent.py'))
+})
 
 test('normalizes MNEMO batches to the HYPERION archive record shape', () => {
   const normalized = normalizeMnemoDocument(document(), { sourceFile: 'MNEMO-v1-1/records.json' })
