@@ -6,9 +6,14 @@ HYPERION 是一个本地优先的个人现实任务图工具。它将聊天记�
 
 HYPERION 启动时会自动管理本机 MNEMO 微信适配器。保持本机微信桌面版已登录后，MNEMO 仅在本机检测当前账号数据库、创建只读快照并持续把增量记录交给 HYPERION；不需要 GUI、目录授权或手工密钥捕获，也不联网发送密钥、正文或头像。没有可用微信数据库时会静默等待，只有归档或批次数据异常才会显示错误。只有在你启动模型提炼后，选中的归档记录才会发送到你配置的模型服务。
 
-> 当前源码版本：`0.6.0`。Windows x64 NSIS 安装器、便携版与源码发布包分别生成；安装器和便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js，任务、设置、聊天归档和日志保存在 `%APPDATA%\\HYPERION`。重要数据请定期备份。
+> 当前源码版本：`0.7.0`。Windows x64 NSIS 安装器、便携版与源码发布包分别生成；安装器和便携版自带 Electron 与 Node.js 运行时，无需另行安装 Node.js，任务、设置、聊天归档和日志保存在 `%APPDATA%\\HYPERION`。重要数据请定期备份。
 
 ## 更新日志
+
+**0.7.0**
+
+- THEIA 正式更名为 HYPERION；已有浏览器状态和桌面运行数据会迁移到 HYPERION 命名空间，且不会覆盖已存在的目标数据。
+- MNEMO 持续维护本地微信归档；初次完整归档后，可按时间、消息数量或任一条件自动触发增量提炼。
 
 **0.6.0**
 
@@ -71,6 +76,19 @@ HYPERION 启动时会自动管理本机 MNEMO 微信适配器。保持本机微�
 不要只看“Node 20 LTS 或更高”。当前依赖中的 Electron 43 和 OpenAI JavaScript SDK 7 要求 Node.js 22，因此 `22.12.0` 才是本项目的实际最低版本。
 
 ## 快速开始
+
+### Windows 命令行安装
+
+在 PowerShell 中执行。首次安装 `winget` 包后请重新打开 PowerShell，再继续执行后续命令：
+
+```powershell
+winget install Git.Git
+winget install OpenJS.NodeJS.LTS
+git clone https://github.com/bakahuiii/HYPERION.git
+cd HYPERION
+npm install
+npm run desktop
+```
 
 ### 从源码工作区启动
 

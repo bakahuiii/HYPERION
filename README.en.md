@@ -6,9 +6,14 @@ HYPERION is a local-first personal task-atlas application. It turns conversation
 
 HYPERION automatically manages the local MNEMO WeChat adapter at startup. With the local WeChat desktop app signed in, MNEMO detects the current account database, creates read-only snapshots, and continuously delivers deltas to HYPERION. It waits silently when no local database is ready and reports only archive or batch-data anomalies. Keys, message bodies, and avatars never leave the machine through MNEMO. Records leave the machine only when the user enables model analysis with a configured provider.
 
-> Current source version: `0.6.0`. Windows x64 NSIS and portable builds bundle Electron and Node.js. Tasks, settings, conversation archives, and logs are stored under `%APPDATA%\HYPERION` in an installed build. Back up important data regularly.
+> Current source version: `0.7.0`. Windows x64 NSIS and portable builds bundle Electron and Node.js. Tasks, settings, conversation archives, and logs are stored under `%APPDATA%\HYPERION` in an installed build. Back up important data regularly.
 
 ## Changelog
+
+**0.7.0**
+
+- THEIA is now HYPERION. Existing browser state and desktop runtime data migrate into the HYPERION namespace without overwriting an existing destination.
+- MNEMO continues to maintain the local WeChat archive. After the initial full archive, incremental analysis can trigger by time, message count, or either condition.
 
 **0.6.0**
 
@@ -70,6 +75,19 @@ See [Release Notes](docs/RELEASE_NOTES.md) for the full history.
 Node.js 20 is not the actual supported baseline. Vite 8 and Electron 43 require Node.js `22.12.0` or newer.
 
 ## Quick Start
+
+### Windows command-line installation
+
+Run these commands in PowerShell. After installing packages with `winget` for the first time, open a new PowerShell window before continuing:
+
+```powershell
+winget install Git.Git
+winget install OpenJS.NodeJS.LTS
+git clone https://github.com/bakahuiii/HYPERION.git
+cd HYPERION
+npm install
+npm run desktop
+```
 
 ### Source workspace
 
